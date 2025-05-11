@@ -73,7 +73,7 @@ std::vector<Node*> a_star(GridMap& grid, Node* start, Node* goal) {
                 continue;  // 如果已经访问过，跳过该节点
             }
 
-            float tentative_g = current->g + 1;  // 假设每一步的成本为1
+            float tentative_g = current->g + 1.f;  // 假设每一步的成本为1
 
             // 只更新邻居，如果找到了更短的路径
             if (tentative_g < neighbor->g || neighbor->g == INFINITY) {
