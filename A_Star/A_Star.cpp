@@ -5,19 +5,24 @@
 #include <map>
 #include <queue>
 
-Node::Node(int x, int y) : x(x), y(y), g(INFINITY), h(0), f(INFINITY), parent(nullptr) {}
+Node::Node(int x, int y)
+    : x(x), y(y), g(INFINITY), h(0), f(INFINITY), parent(nullptr), grid_value(0) {}
 
 bool Node::operator<(const Node& other) const {
     return f > other.f;  // 优先队列是最小堆，f值越小优先级越高
 }
 
-GridMap::GridMap(int w, int h) : width(w), height(h) {
-    grid = std::vector<std::vector<int>>(
-        height, std::vector<int>(width, 0));  // 0表示空地，1表示障碍物, 默认构造全是空地
+GridMap::GridMap(int w, int h) : width_(w), height_(h) {
+    nodes_.resize(h, std::vector<Node>(w, Node(0, 0)));
+    for (int i = 0; i < h; ++i) {
+        for (int j = 0; j < w; ++j) {
+            nodes_[i][j] = Node(i, j);  // 初始化节点坐标
+        }
+    }
 }
 
 bool GridMap::is_valid(int x, int y) {
-    return x >= 0 && x < width && y >= 0 && y < height && grid[y][x] != 1;
+    return x >= 0 && x < width_ && y >= 0 && y < height_ && nodes_[x][y].grid_value != 1;
 }
 
 std::vector<Node*> GridMap::get_neighbors(Node* current) {

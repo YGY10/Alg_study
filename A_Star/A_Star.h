@@ -9,7 +9,8 @@
 class Node {
    public:
     int x, y;
-    float g, h, f;  // g: 从起点到该节点的实际成本，h: 启发式成本，f: 总成本
+    float g, h, f;   // g: 从起点到该节点的实际成本，h: 启发式成本，f: 总成本
+    int grid_value;  // 0表示空地，1表示障碍物
     Node* parent;
 
     Node(int x, int y);
@@ -18,8 +19,8 @@ class Node {
 
 class GridMap {
    public:
-    int width, height;
-    std::vector<std::vector<int>> grid;
+    int width_, height_;
+    std::vector<std::vector<Node>> nodes_;
 
     GridMap(int w, int h);
     bool is_valid(int x, int y);
