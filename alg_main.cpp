@@ -3,11 +3,12 @@
 
 int main() {
     GridMap grid_map(3, 3);
-    Node* start = new Node(2, 0);
-    Node* goal = new Node(0, 2);
-    grid_map.grid[0][0] = 1;  // 设置障碍物
-    grid_map.grid[0][1] = 1;  // 设置障碍物
-    grid_map.grid[2][2] = 1;  // 设置障碍物
+    Node* start = &grid_map.nodes_[0][2];  // 起点
+    Node* goal = &grid_map.nodes_[2][0];   // 终点
+    grid_map.nodes_[0][0].grid_value = 1;  // 设置障碍物
+    grid_map.nodes_[0][1].grid_value = 1;  // 设置障碍物
+    grid_map.nodes_[2][2].grid_value = 1;  // 设置障碍物
+    grid_map.nodes_[2][1].grid_value = 1;  // 设置障碍物
 
     std::cout << "start: (" << start->x << ", " << start->y << ")" << std::endl;
     std::cout << "goal: (" << goal->x << ", " << goal->y << ")" << std::endl;

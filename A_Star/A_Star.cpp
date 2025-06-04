@@ -16,13 +16,13 @@ GridMap::GridMap(int w, int h) : width_(w), height_(h) {
     nodes_.resize(h, std::vector<Node>(w, Node(0, 0)));
     for (int i = 0; i < h; ++i) {
         for (int j = 0; j < w; ++j) {
-            nodes_[i][j] = Node(i, j);  // 初始化节点坐标
+            nodes_[i][j] = Node(j, i);  // 初始化节点坐标
         }
     }
 }
 
 bool GridMap::is_valid(int x, int y) {
-    return x >= 0 && x < width_ && y >= 0 && y < height_ && nodes_[x][y].grid_value != 1;
+    return x >= 0 && x < width_ && y >= 0 && y < height_ && nodes_[y][x].grid_value != 1;
 }
 
 std::vector<Node*> GridMap::get_neighbors(Node* current) {
@@ -34,7 +34,7 @@ std::vector<Node*> GridMap::get_neighbors(Node* current) {
         int nx = current->x + dx[i];
         int ny = current->y + dy[i];
         if (is_valid(nx, ny)) {
-            neighbors.push_back(new Node(nx, ny));
+            neighbors.push_back(&nodes_[nx][ny]);
         }
     }
     return neighbors;
@@ -46,13 +46,11 @@ float heuristic(Node* a, Node* b) {
 
 std::vector<Node*> a_star(GridMap& grid, Node* start, Node* goal) {
     std::priority_queue<Node*> open_list;
-    std::map<std::pair<int, int>, Node*> all_nodes;
     std::map<std::pair<int, int>, bool> closed_list;  // 用于标记已访问的节点
 
     start->g = 0;
     start->f = heuristic(start, goal);
     open_list.push(start);
-    all_nodes[{start->x, start->y}] = start;
 
     while (!open_list.empty()) {
         Node* current = open_list.top();
@@ -86,12 +84,7 @@ std::vector<Node*> a_star(GridMap& grid, Node* start, Node* goal) {
                 neighbor->g = tentative_g;
                 neighbor->h = heuristic(neighbor, goal);
                 neighbor->f = neighbor->g + neighbor->h;
-
-                // 如果邻居不在 open_list 中，加入它
-                if (all_nodes.find({neighbor->x, neighbor->y}) == all_nodes.end()) {
-                    open_list.push(neighbor);
-                    all_nodes[{neighbor->x, neighbor->y}] = neighbor;
-                }
+                open_list.push(neighbor);  // 将邻居添加到开放列表
             }
         }
     }
