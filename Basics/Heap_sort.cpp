@@ -5,7 +5,7 @@
 #include <iostream>
 #include <vector>
 
-// 下城调整，构建最大堆
+// 下沉调整，构建最大堆
 void heapify(std::vector<double>& orign_vector, int n, int i) {
     int largest = i;  // 初始化最大元素为根节点
     int left = 2 * i + 1;
