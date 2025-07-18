@@ -3,7 +3,7 @@
 // Python headers must be included before any system headers, since
 // they define _POSIX_C_SOURCE
 #include <Python.h>
-
+#undef hypot
 #include <algorithm>
 #include <array>
 #include <cstdint>  // <cstdint> requires c++11 support
