@@ -3,9 +3,9 @@
 #include <random>
 #include <vector>
 #include "../eigen-3.4.0/Eigen/Dense"
-#include "../plot/matplotlibcpp.h"
+//#include "../plot/matplotlibcpp.h"
 
-namespace plt = matplotlibcpp;
+//namespace plt = matplotlibcpp;
 
 // 卡尔曼滤波器类（1D）
 class KalmanFilter {
@@ -143,16 +143,16 @@ int main() {
                   << "\n";
     }
 
-    plt::figure_size(800, 600);
-    plt::plot(time, true_vals, "g-");       // green line for true position
-    plt::plot(time, measured_vals, "r.");   // red dots for measurements
-    plt::plot(time, estimated_vals, "b-");  // blue line for estimates
-    plt::xlabel("Step");
-    plt::ylabel("Position");
-    plt::title("Kalman Filter Position Tracking");
-    plt::legend();
-    plt::grid(true);
-    plt::show();
+    // plt::figure_size(800, 600);
+    // plt::plot(time, true_vals, "g-");       // green line for true position
+    // plt::plot(time, measured_vals, "r.");   // red dots for measurements
+    // plt::plot(time, estimated_vals, "b-");  // blue line for estimates
+    // plt::xlabel("Step");
+    // plt::ylabel("Position");
+    // plt::title("Kalman Filter Position Tracking");
+    // plt::legend();
+    // plt::grid(true);
+    // plt::show();
 
     return 0;
 }
