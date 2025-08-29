@@ -1,16 +1,22 @@
+#include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <vector>
 
 template <typename T>
 class Point {
    public:
+    Point() : x_(static_cast<T>(0.0)), y_(static_cast<T>(0.0)) {}
     Point(const T& x, const T& y) : x_(x), y_(y) {}
     T DistanceTo(const Point<T>& other_point) const {
         return std::hypot(x_ - other_point.x_, y_ - other_point.y_);
     }
     const T& x() const { return x_; }
     const T& y() const { return y_; }
+    Point<T> operator-(const Point<T>& other_point) const {
+        return Point<T>(x_ - other_point.x_, y_ - other_point.y_);
+    }
 
    private:
     T x_ = static_cast<T>(0.0);
@@ -83,7 +89,8 @@ class Polygon {
             cx += point.x();
             cy += point.y();
         }
-        cx /= static_cast<T>(num_points_) cy /= static_cast<T>(num_points_);
+        cx /= static_cast<T>(num_points_);
+        cy /= static_cast<T>(num_points_);
         center_ = Point<T>(cx, cy);
         area_ = static_cast<T>(0.0);
         for (int i = 1; i < num_points_; ++i) {
@@ -126,12 +133,12 @@ class Polygon {
         }
     }
 
-    bool IsPointOnBoundary(const Point<T>& point) {
+    bool IsPointOnBoundary(const Point<T>& point) const {
         return std::any_of(lines_.begin(), lines_.end(),
-                           [&](const Line<T>& line) { return line.IsPointIn(point); })
+                           [&](const Line<T>& line) { return line.IsPointIn(point); });
     }
 
-    bool IsPointIn(const Point<T>& point) {
+    bool IsPointIn(const Point<T>& point) const {
         // 如果点在边界上，那么认为点在多边形内
         if (IsPointOnBoundary(point)) {
             return true;
@@ -160,7 +167,7 @@ class Polygon {
         return static_cast<bool>(c & 1);
     }
     T DistanceTo(const Point<T>& other_point) const {
-        if (IsPointIn(point)) {
+        if (IsPointIn(other_point)) {
             return static_cast<T>(0.0);
         }
         T distance = std::numeric_limits<T>::infinity();
@@ -190,7 +197,7 @@ int main() {
     Line<double> l1(p2, p3);
     std::cout << l1.DistanceTo(p1) << std::endl;
     Polygon<double> poly({p1, p2, p3});
-    std::cout << poly.DistanceTo(p1) << std::endl;
+    std::cout << poly.IsPointIn(p1) << std::endl;
     Point<double> p4(1.0, 1.0);
     std::cout << poly.IsPointIn(p4) << std::endl;
     return 0;
