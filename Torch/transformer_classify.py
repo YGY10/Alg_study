@@ -74,3 +74,4 @@ class PositionalEncoderBlock(nn.Module):
         return input + self.pe[:, :input.size(1)]
 
 # 分类模型
+class TransformerClassifier(nn.Module):
