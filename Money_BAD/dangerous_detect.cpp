@@ -101,7 +101,7 @@ print("C++ embedded sys.path =", sys.path)
     std::array<float, 3> lane_y = {7.f, 3.5f, 0.f};
     // 测试 Actor
     Actor A{0.f, 5.f, 1.f, 0.f};           // 从 (0,0) 朝 +x 方向走
-    Actor B{5.f, 5.f, 2.f, 0.f};       // 从 (5,5) 朝 -y 方向走
+    Actor B{20.f, 5.f, 2.f, 3.14};       // 从 (5,5) 朝 -y 方向走
 
     Vec2 collision_pose;
     bool collide = dangerous_detect(A, B, collision_pose);
