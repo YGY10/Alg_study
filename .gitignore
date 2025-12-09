@@ -3,6 +3,7 @@
 *.exe
 temp_test.cpp
 temp_test.py
+test.py
 /libtorch
 __pycache__/
 *.zip
