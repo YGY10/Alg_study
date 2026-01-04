@@ -1,8 +1,5 @@
 import math
-
-
-def normalize_angle(angle):
-    return math.atan2(math.sin(angle), math.cos(angle))
+from SimulationTool.Common.common import normalize_angle
 
 
 class VehicleKModel:
