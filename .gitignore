@@ -5,5 +5,6 @@ temp_test.cpp
 temp_test.py
 test.py
 /libtorch
+/LeetCode
 __pycache__/
 *.zip

@@ -3,27 +3,29 @@ from SimulationTool.Common.common import TrajPoint
 
 
 class RuleTrajectoryPlanner:
-    """
-    基于全局参考线的 Rule-Based 局部轨迹规划器
-    """
-
-    def __init__(self, horizon=30, ds=1.0, base_speed=2.0):
+    def __init__(self, horizon=40, ds=0.2, base_speed=2.0):
         self.horizon = horizon
         self.ds = ds
         self.base_speed = base_speed
-        self.last_ref_idx = 0  # 保证 s 单调
+
+        self.last_traj = None
+        self.last_ref_idx = 0
+
+        # ⭐ 新增：避障决策记忆
+        # +1 = 左绕，-1 = 右绕，None = 尚未决定 / 不在避障
+        self.avoid_side = None
 
     # -------------------------------------------------
-    def find_nearest_forward_index(self, ego, path):
-        """
-        在全局参考线中找最近的前向点（不回头）
-        """
+    def find_nearest_forward_index(self, state, path):
         min_dist = float("inf")
         best_idx = self.last_ref_idx
 
-        for i in range(self.last_ref_idx, len(path)):
-            dx = path[i].x - ego.x
-            dy = path[i].y - ego.y
+        search_range = 100
+        end = min(self.last_ref_idx + search_range, len(path))
+
+        for i in range(self.last_ref_idx, end):
+            dx = path[i].x - state.x
+            dy = path[i].y - state.y
             d = dx * dx + dy * dy
             if d < min_dist:
                 min_dist = d
@@ -35,60 +37,101 @@ class RuleTrajectoryPlanner:
     # -------------------------------------------------
     def compute_lateral_offset(self, ego, obstacles):
         """
-        非常简单的 rule-based 避障：给一个横向偏移量
+        ⭐ 改进版 rule-based 避障（带决策记忆）
         """
-        offset = 0.0
+        target_offset = 0.0
         target_speed = self.base_speed
+
+        obstacle_detected = False
 
         for obs in obstacles:
             dx = obs.x - ego.x
             dy = obs.y - ego.y
 
-            # 只关心前方近距离障碍
-            if 0 < dx < 10.0 and abs(dy) < 2.0:
-                offset = 2.5 if dy <= 0 else -2.5
-                target_speed = 1.0
+            if 0 < dx < 12.0 and abs(dy) < 2.0:
+                obstacle_detected = True
+
+                # ===== 第一次遇到障碍：做一次决策 =====
+                if self.avoid_side is None:
+                    self.avoid_side = 1 if dy <= 0 else -1
+
+                target_offset = 2.8 * self.avoid_side
+                target_speed = 1.2
                 break
 
-        return offset, target_speed
+        # ===== 障碍物清除：允许恢复直行 =====
+        if not obstacle_detected:
+            self.avoid_side = None
+
+        return target_offset, target_speed
+
+    # -------------------------------------------------
+    def find_stitching_point(self, ego):
+        if self.last_traj is None or len(self.last_traj) < 2:
+            return ego, "Initial"
+
+        min_dist = float("inf")
+        best_idx = 0
+
+        for i, p in enumerate(self.last_traj):
+            dx = p.x - ego.x
+            dy = p.y - ego.y
+            d = dx * dx + dy * dy
+            if d < min_dist:
+                min_dist = d
+                best_idx = i
+
+        return self.last_traj[best_idx], "Stitched"
 
     # -------------------------------------------------
     def plan(self, ego, nav_path, obstacles):
-        """
-        核心规划函数
-        """
-        traj = []
+        if not nav_path:
+            return []
 
-        if nav_path is None or len(nav_path) == 0:
-            return traj
+        # ===== 1. 轨迹拼接 =====
+        start_state, stitching_status = self.find_stitching_point(ego)
 
-        # ===== 1. 找到全局参考线起点 =====
-        ref_idx = self.find_nearest_forward_index(ego, nav_path)
+        # ===== 2. 参考线索引 =====
+        ref_idx = self.find_nearest_forward_index(start_state, nav_path)
 
-        # ===== 2. 计算横向偏移策略 =====
-        lateral_offset, target_speed = self.compute_lateral_offset(ego, obstacles)
+        # ===== 3. 避障决策（已稳定）=====
+        target_offset, target_speed = self.compute_lateral_offset(ego, obstacles)
 
+        # ===== 4. 当前 offset（连续性）=====
+        ref_start = nav_path[ref_idx]
+        dx_s = start_state.x - ref_start.x
+        dy_s = start_state.y - ref_start.y
+        current_offset = (
+            -math.sin(ref_start.yaw) * dx_s + math.cos(ref_start.yaw) * dy_s
+        )
+
+        # ===== 5. 生成轨迹 =====
+        new_traj = []
         t = 0.0
 
-        # ===== 3. 沿参考线生成局部轨迹 =====
         for i in range(self.horizon):
             idx = min(ref_idx + i, len(nav_path) - 1)
-            ref = nav_path[idx]
+            ref_pt = nav_path[idx]
 
-            # 法向方向
-            nx = -math.sin(ref.yaw)
-            ny = math.cos(ref.yaw)
+            weight = min(i / 5.0, 1.0)
+            planned_offset = current_offset * (1.0 - weight) + target_offset * weight
 
-            # 横向偏移（平滑比例）
-            ratio = min(i / 10.0, 1.0)
-            x = ref.x + ratio * lateral_offset * nx
-            y = ref.y + ratio * lateral_offset * ny
+            nx, ny = -math.sin(ref_pt.yaw), math.cos(ref_pt.yaw)
+            x = ref_pt.x + planned_offset * nx
+            y = ref_pt.y + planned_offset * ny
 
-            traj.append(
+            if i > 0:
+                dx = x - new_traj[-1].x
+                dy = y - new_traj[-1].y
+                yaw = math.atan2(dy, dx)
+            else:
+                yaw = ref_pt.yaw
+
+            new_traj.append(
                 TrajPoint(
                     x=x,
                     y=y,
-                    yaw=ref.yaw,
+                    yaw=yaw,
                     v=target_speed,
                     t=t,
                 )
@@ -96,4 +139,10 @@ class RuleTrajectoryPlanner:
 
             t += self.ds / max(target_speed, 0.1)
 
-        return traj
+        print(
+            f"[Planner] Status: {stitching_status} | "
+            f"Start_y: {new_traj[0].y:.3f} | Offset: {target_offset}"
+        )
+
+        self.last_traj = new_traj
+        return new_traj

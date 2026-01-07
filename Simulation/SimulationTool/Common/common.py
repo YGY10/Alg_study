@@ -3,6 +3,12 @@ import math
 
 
 @dataclass
+class Vec2D:
+    x: float = 0.0
+    y: float = 0.0
+
+
+@dataclass
 class TrajPoint:
     x: float
     y: float
@@ -10,6 +16,7 @@ class TrajPoint:
     v: float = 0.0
     t: float = 0.0
     s: float = 0.0
+    l: float = 0.0
 
 
 def normalize_angle(a):
