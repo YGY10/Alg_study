@@ -8,3 +8,4 @@ test.py
 /LeetCode
 __pycache__/
 *.zip
+st_frenet_traj_log.csv
