@@ -5,7 +5,7 @@ import numpy as np
 
 def load_blocks(csv_path):
     """
-    解析格式：
+    解析格式：W
     time, 0.200
     header...
     data...
@@ -66,8 +66,8 @@ def plot_time_window(csv_path, t_start, t_end, draw_ego=True):
     plt.figure(figsize=(8, 6))
 
     for b, c in zip(sel, colors):
-        xs = [r["x"] for r in b["rows"]]
-        ys = [r["y"] for r in b["rows"]]
+        xs = [r["x"] for r in b["rows"][:10]]
+        ys = [r["y"] for r in b["rows"][:10]]
 
         plt.plot(xs, ys, color=c, alpha=0.8, label=f"t={b['time']:.2f}s")
 
@@ -91,7 +91,7 @@ if __name__ == "__main__":
     # ===== 示例：画 0 ~ 1 秒内所有规划轨迹 =====
     plot_time_window(
         CSV_PATH,
-        t_start=0.2,
-        t_end=0.5,
+        t_start=0.0,
+        t_end=5,
         draw_ego=True,
     )

@@ -29,10 +29,10 @@ scope_xy.add_channel("ego", color="blue")
 # ===============================
 navi_pathgenerator = NavigationPathGenerator(2)
 navi_trajectory = navi_pathgenerator.generate_straight_traj(
-    Vec2D(0.0, 3.5), Vec2D(200, 3.5), 5.0
+    Vec2D(0.0, 3.5), Vec2D(200, 3.5), 16.0
 )
 
-ego = VehicleKModel(x=0.0, y=0.0, yaw=0.0, v=3.0)
+ego = VehicleKModel(x=0.0, y=0.0, yaw=0.0, v=15.0)
 
 # 障碍物
 obs1 = VehicleKModel(x=15.0, y=0.0, yaw=0.0, v=0.0)
@@ -48,8 +48,8 @@ vis = VehicleVisualizer(scale=30.0)
 # ===============================
 # 仿真参数
 # ===============================
-dt = 0.05
-sim_time = 0.5
+dt = 0.1
+sim_time = 20
 steps = int(sim_time / dt)
 t = 0.0
 
@@ -58,6 +58,8 @@ t = 0.0
 # 主仿真循环
 # ===============================
 for step in range(steps):
+    print("\n" + "=" * 80)
+    print(f"[STEP {step}] START  t = {t:.2f}s")
     # ===== 1. Planner：从导航线生成局部轨迹 =====
     local_traj = planner.plan(ego, navi_trajectory, obstacles, step * dt)
 
@@ -84,6 +86,7 @@ for step in range(steps):
     vis.clock.tick(1.0 / dt)
 
     t += dt
+    print("=" * 80 + "\n")
 
 
 print("Simulation finished. Close windows to exit.")
