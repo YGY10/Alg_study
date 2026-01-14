@@ -14,7 +14,7 @@ class VehicleKModel:
         yaw=0.0,
         v=0.0,
         wheelbase=2.7,
-        dt=0.05,
+        dt=0.1,
         length=4.5,
         width=1.8,
     ):

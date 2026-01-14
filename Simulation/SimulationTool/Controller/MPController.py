@@ -91,10 +91,9 @@ class MPCController:
 
         delta = float(u.value[0, 0]) if u.value is not None else self.last_delta
 
-        print(
-            f"[MPC] e_y: {e_y:.4f} | e_yaw: {math.degrees(e_yaw):.2f}° | Delta: {math.degrees(delta):.2f}°"
-        )
-
         self.last_delta = delta
         accel = 1.0 * (traj[idx].v - ego.v)
+        print(
+            f"[Control] 输出 a={accel:.2f},e_y: {e_y:.4f} | e_yaw: {math.degrees(e_yaw):.2f}° | Delta: {math.degrees(delta):.2f}°"
+        )
         return accel, delta, e_y

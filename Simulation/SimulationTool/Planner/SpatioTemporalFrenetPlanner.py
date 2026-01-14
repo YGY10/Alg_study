@@ -3,6 +3,7 @@ import numpy as np
 import csv
 import os
 from SimulationTool.Common.common import TrajPoint
+from SimulationTool.SimModel.vehicle_model import VehicleKModel
 
 
 # ===============================
@@ -46,7 +47,7 @@ class STFrenetPlanner:
         self.T_samples = [10.0]
         self.dt = 0.2
         self.plan_dt = 0.1
-
+        self.max_stitch_time = 1
         self.last_traj = None
         self.last_plan_time = None
         self.last_lon_coef = None
@@ -108,7 +109,7 @@ class STFrenetPlanner:
     # =================================================
     # 主入口
     # =================================================
-    def plan(self, ego, ref_path, obstacles, sim_time):
+    def plan(self, ego: VehicleKModel, ref_path, obstacles, sim_time):
         if not ref_path:
             self._reset_warm_start()
             return []
@@ -118,10 +119,11 @@ class STFrenetPlanner:
         # ===== ① 选择规划起点 =====
         t_now, planning_ego, use_warm_start = self._select_planning_start(ego, ref_path)
         print(
-            f"  t_now={t_now:.1f}, start x={planning_ego.x:.2f}, y = {planning_ego.y:.2f}, WarmStart={int(use_warm_start)}"
+            f"[Plan] 规划起点 x={planning_ego.x:.2f}, y = {planning_ego.y:.2f}, WarmStart={int(use_warm_start)}"
         )
+        print(f"[Plan] 自车实际状态 x={ego.x}, y={ego.y}, v={ego.v}")
 
-        # ===== ② 轨迹拼接（只在 warmstart 时）=====
+        # ===== ② 轨迹拼接 =====
         stitched_traj = None
         if use_warm_start:
             stitched_traj = self._try_stitch_trajectory(planning_ego, obstacles)
@@ -132,8 +134,8 @@ class STFrenetPlanner:
                 f"t_end={stitched_traj[-1].t:.2f}"
             )
 
-            print("[Stitch] First stitched points:")
-            for i in range(min(3, len(stitched_traj))):
+            print("[Stitch] 拼接的点:")
+            for i in range(len(stitched_traj)):
                 p = stitched_traj[i]
                 print(f"  S{i}: x={p.x:.3f}, y={p.y:.3f}, " f"v={p.v:.2f}, t={p.t:.2f}")
         else:
@@ -148,7 +150,7 @@ class STFrenetPlanner:
             replan_start = stitched_traj[-1]
         else:
             replan_start = planning_ego
-
+        print(f"[Plan] 补齐位置 x={replan_start.x}, y={replan_start.y}")
         # ===== ④ 规划补齐段 =====
         best_traj_full, best_lon, best_lat, best_T_lat = self._search_best_trajectory(
             replan_start, ref_path, obstacles, use_warm_start
@@ -161,6 +163,7 @@ class STFrenetPlanner:
         if stitched_traj:
             # 重定时补规划段
             dt0 = stitched_traj[-1].t
+            best_traj_full = best_traj_full[1:]
             for p in best_traj_full:
                 p.t += dt0
             best_traj_full = stitched_traj + best_traj_full
@@ -284,6 +287,8 @@ class STFrenetPlanner:
             tq = t0 + k * self.dt
             if tq > traj[-1].t + 1e-9:
                 break
+            if tq - t0 > self.max_stitch_time:
+                break
             p = self._interp_trajpoint_by_time(traj, tq)
             # retime to start at 0
             out.append(
@@ -343,8 +348,8 @@ class STFrenetPlanner:
 
     def _post_process_and_log(self, traj_full, ego, sim_time, use_warm_start, t_now):
         if traj_full and len(traj_full) >= 5:
-            print("[ST-Frenet] First three points:")
-            for i in range(3):
+            print("[ST-Frenet] 规划结果:")
+            for i in range(15):
                 p = traj_full[i]
                 print(f"  P{i}: x={p.x:.3f}, y={p.y:.3f}, " f"v={p.v:.2f}, t={p.t:.2f}")
             print(f"  Ego: x={ego.x:.3f}, y={ego.y:.3f}")
@@ -368,8 +373,9 @@ class STFrenetPlanner:
         t_now = self.plan_dt
 
         if self.warm_start_mode == "STITCH":
-            t0 = self._find_time_on_last_traj(ego)
+            t0 = t_now
             planning_ego = self._interp_trajpoint_by_time(self.last_traj, t0)
+            print("[WarmStart] 拼接")
             return t_now, planning_ego, True
 
         if self.warm_start_mode == "POLY":
@@ -383,6 +389,7 @@ class STFrenetPlanner:
         return 0.0, ego, False
 
     def _search_best_trajectory(self, ego, ref_path, obstacles, use_warm_start):
+        # 搜索起点
         if use_warm_start:
             s0 = ego.s
             l0 = ego.l
@@ -480,7 +487,7 @@ class STFrenetPlanner:
         traj = []
         t = 0.0
         while t <= T + 1e-9:
-            l = np.polyval(lat, t) if t <= T_lat else l_target
+            l = np.polyval(lat, min(t, T_lat))
             s = np.polyval(lon, t)
             v = max(0.0, np.polyval(lon_d, t))
             ref = self.find_ref_by_s(ref_path, s)
@@ -535,7 +542,14 @@ class STFrenetPlanner:
         return False
 
     def compute_cost(self, traj, l_target):
-        return 10.0 * abs(l_target) + 0.1 * len(traj)
+        l_end = traj[-1].l
+        l_mean = np.mean([abs(p.l) for p in traj])
+
+        return (
+            10.0 * abs(l_target)
+            + 20.0 * abs(l_end)  # 强烈要求终点回 0
+            + 5.0 * l_mean  # 长时间偏离惩罚
+        )
 
     def find_nearest_s(self, ego, ref_path):
         return min(ref_path, key=lambda p: (p.x - ego.x) ** 2 + (p.y - ego.y) ** 2).s

@@ -6,7 +6,6 @@ class VehicleVisualizer:
     def __init__(
         self,
         screen_size=(1000, 800),
-        scale=20.0,  # 1 m = 20 px
         bg_color=(30, 30, 30),
     ):
         pygame.init()
@@ -17,20 +16,29 @@ class VehicleVisualizer:
         self.font = pygame.font.SysFont("Arial", 14)
 
         self.W, self.H = screen_size
-        self.scale = scale
+
+        # ===== 几何硬约束 =====
+        # 显示范围：[-30, +30] m
+        self.view_half_range = 80.0
+        self.scale = self.W / (2.0 * self.view_half_range)
+
         self.bg_color = bg_color
 
-        # 屏幕中心（世界视窗中心）
+        # 屏幕中心
         self.origin_x = self.W // 2
         self.origin_y = self.H // 2
 
-        # 相机（世界坐标）
+        # 相机（世界坐标）——始终等于自车
         self.camera_x = 0.0
         self.camera_y = 0.0
 
+        # 网格 / 刻度
+        self.grid_world = 10.0
+        self.tick_world = 10.0
+
         # 颜色
-        self.vehicle_color = (50, 200, 255)  # 自车
-        self.obstacle_color = (255, 180, 60)  # 障碍物
+        self.vehicle_color = (50, 200, 255)
+        self.obstacle_color = (255, 180, 60)
         self.heading_color = (255, 80, 80)
         self.axis_color = (200, 200, 200)
         self.grid_color = (70, 70, 70)
@@ -47,61 +55,92 @@ class VehicleVisualizer:
     # ===============================
     # 世界网格
     # ===============================
-    def draw_grid(self, grid_world=5.0):
-        world_left = self.camera_x - self.origin_x / self.scale
-        world_right = self.camera_x + self.origin_x / self.scale
-        world_bottom = self.camera_y - self.origin_y / self.scale
-        world_top = self.camera_y + self.origin_y / self.scale
+    def draw_grid(self):
+        world_left = self.camera_x - self.view_half_range
+        world_right = self.camera_x + self.view_half_range
+        world_bottom = self.camera_y - self.view_half_range
+        world_top = self.camera_y + self.view_half_range
 
-        x = math.floor(world_left / grid_world) * grid_world
+        x = math.floor(world_left / self.grid_world) * self.grid_world
         while x <= world_right:
             sx1, sy1 = self.world_to_screen(x, world_bottom)
             sx2, sy2 = self.world_to_screen(x, world_top)
             pygame.draw.line(self.screen, self.grid_color, (sx1, sy1), (sx2, sy2), 1)
-            x += grid_world
+            x += self.grid_world
 
-        y = math.floor(world_bottom / grid_world) * grid_world
+        y = math.floor(world_bottom / self.grid_world) * self.grid_world
         while y <= world_top:
             sx1, sy1 = self.world_to_screen(world_left, y)
             sx2, sy2 = self.world_to_screen(world_right, y)
             pygame.draw.line(self.screen, self.grid_color, (sx1, sy1), (sx2, sy2), 1)
-            y += grid_world
+            y += self.grid_world
 
     # ===============================
-    # 图像框坐标轴（左 / 下）
+    # 世界坐标轴（x=0, y=0）
     # ===============================
-    def draw_frame_axes(self, tick_world=5.0):
-        world_left = self.camera_x - self.origin_x / self.scale
-        world_right = self.camera_x + self.origin_x / self.scale
-        world_bottom = self.camera_y - self.origin_y / self.scale
-        world_top = self.camera_y + self.origin_y / self.scale
+    def draw_frame_axes(self):
+        # ========= 世界原点在屏幕中的位置 =========
+        sx0, sy0 = self.world_to_screen(0.0, 0.0)
 
-        # Y 轴（左）
-        pygame.draw.line(self.screen, self.axis_color, (0, 0), (0, self.H), 2)
-        # X 轴（下）
+        # ---------- Y 轴（x = 0） ----------
+        if 0 <= sx0 <= self.W:
+            x_axis_x = sx0
+        elif sx0 < 0:
+            x_axis_x = 0
+        else:
+            x_axis_x = self.W
+
         pygame.draw.line(
-            self.screen, self.axis_color, (0, self.H - 1), (self.W, self.H - 1), 2
+            self.screen,
+            self.axis_color,
+            (x_axis_x, 0),
+            (x_axis_x, self.H),
+            2,
         )
 
+        # ---------- X 轴（y = 0） ----------
+        if 0 <= sy0 <= self.H:
+            y_axis_y = sy0
+        elif sy0 < 0:
+            y_axis_y = 0
+        else:
+            y_axis_y = self.H
+
+        pygame.draw.line(
+            self.screen,
+            self.axis_color,
+            (0, y_axis_y),
+            (self.W, y_axis_y),
+            2,
+        )
+
+        # ========= 刻度（世界坐标） =========
+        world_left = self.camera_x - self.view_half_range
+        world_right = self.camera_x + self.view_half_range
+        world_bottom = self.camera_y - self.view_half_range
+        world_top = self.camera_y + self.view_half_range
+
         # X 轴刻度
-        x = math.ceil(world_left / tick_world) * tick_world
+        x = math.ceil(world_left / self.tick_world) * self.tick_world
         while x <= world_right:
-            sx, _ = self.world_to_screen(x, world_bottom)
+            sx, sy = self.world_to_screen(x, 0.0)
             pygame.draw.line(
-                self.screen, self.axis_color, (sx, self.H - 6), (sx, self.H), 1
+                self.screen, self.axis_color, (sx, y_axis_y - 5), (sx, y_axis_y + 5), 1
             )
-            label = self.font.render(f"{x:.1f}", True, self.text_color)
-            self.screen.blit(label, (sx - 12, self.H - 22))
-            x += tick_world
+            label = self.font.render(f"{x:.0f}", True, self.text_color)
+            self.screen.blit(label, (sx - 10, y_axis_y + 8))
+            x += self.tick_world
 
         # Y 轴刻度
-        y = math.ceil(world_bottom / tick_world) * tick_world
+        y = math.ceil(world_bottom / self.tick_world) * self.tick_world
         while y <= world_top:
-            _, sy = self.world_to_screen(world_left, y)
-            pygame.draw.line(self.screen, self.axis_color, (0, sy), (6, sy), 1)
-            label = self.font.render(f"{y:.1f}", True, self.text_color)
-            self.screen.blit(label, (8, sy - 7))
-            y += tick_world
+            sx, sy = self.world_to_screen(0.0, y)
+            pygame.draw.line(
+                self.screen, self.axis_color, (x_axis_x - 5, sy), (x_axis_x + 5, sy), 1
+            )
+            label = self.font.render(f"{y:.0f}", True, self.text_color)
+            self.screen.blit(label, (x_axis_x + 8, sy - 7))
+            y += self.tick_world
 
     # ===============================
     # 画自车
@@ -119,9 +158,6 @@ class VehicleVisualizer:
         )
         pygame.draw.line(self.screen, self.heading_color, start, end, 3)
 
-    # ===============================
-    # 画障碍物车辆
-    # ===============================
     def draw_obstacle(self, vehicle):
         corners = vehicle.corners()
         pts = [self.world_to_screen(x, y) for x, y in corners]
@@ -134,7 +170,7 @@ class VehicleVisualizer:
         pygame.draw.lines(self.screen, color, False, pts, 2)
 
     # ===============================
-    # 主循环（支持多车）
+    # 单步刷新
     # ===============================
     def run_step(self, ego_vehicle, trajectory=None, obstacles=None):
         if obstacles is None:
@@ -142,82 +178,26 @@ class VehicleVisualizer:
         if trajectory is None:
             trajectory = []
 
-        # -------- 必须：处理事件 --------
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
                 raise SystemExit
 
-        # 相机跟随自车
+        # ===== 相机严格居中自车 =====
         self.camera_x = ego_vehicle.x
         self.camera_y = ego_vehicle.y
 
         self.screen.fill(self.bg_color)
 
-        # 背景
-        self.draw_grid(grid_world=5.0)
-        self.draw_frame_axes(tick_world=5.0)
+        self.draw_grid()
+        self.draw_frame_axes()
 
-        # 障碍物
         for obs in obstacles:
             self.draw_obstacle(obs)
 
-        # 轨迹
         if trajectory:
             self.draw_path([(p.x, p.y) for p in trajectory])
 
-        # 自车
         self.draw_vehicle(ego_vehicle)
 
-        # -------- 必须：刷新屏幕 --------
         pygame.display.flip()
-
-    def run(
-        self,
-        ego_vehicle,
-        obstacles=None,
-        update_callback=None,
-        path_provider=None,
-        fps=60,
-    ):
-        if obstacles is None:
-            obstacles = []
-
-        running = True
-        while running:
-            dt = self.clock.tick(fps) / 1000.0
-
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
-
-            # 更新自车（控制器）
-            if update_callback:
-                update_callback(ego_vehicle, dt)
-
-            # 相机只跟随自车
-            self.camera_x = ego_vehicle.x
-            self.camera_y = ego_vehicle.y
-
-            self.screen.fill(self.bg_color)
-
-            # 背景
-            self.draw_grid(grid_world=5.0)
-            self.draw_frame_axes(tick_world=5.0)
-
-            # 障碍物
-            for obs in obstacles:
-                self.draw_obstacle(obs)
-
-            # ===== 关键新增：画规划路径 =====
-            if path_provider:
-                path = path_provider(ego_vehicle, obstacles)
-                if path:
-                    self.draw_path(path)
-
-            # 自车
-            self.draw_vehicle(ego_vehicle)
-
-            pygame.display.flip()
-
-        pygame.quit()

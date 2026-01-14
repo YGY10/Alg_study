@@ -29,21 +29,22 @@ scope_xy.add_channel("ego", color="blue")
 # ===============================
 navi_pathgenerator = NavigationPathGenerator(2)
 navi_trajectory = navi_pathgenerator.generate_straight_traj(
-    Vec2D(0.0, 3.5), Vec2D(200, 3.5), 16.0
+    Vec2D(0.0, 0.0), Vec2D(200, 0.0), 10.0
 )
 
-ego = VehicleKModel(x=0.0, y=0.0, yaw=0.0, v=15.0)
+ego = VehicleKModel(x=0.0, y=0.0, yaw=0.0, v=10.0)
 
 # 障碍物
 obs1 = VehicleKModel(x=15.0, y=0.0, yaw=0.0, v=0.0)
-obstacles = []
+obs2 = VehicleKModel(x=25.0, y=3.5, yaw=0.0, v=0.0)
+obstacles = [obs1]
 
 # Planner + Controller
 # planner = RuleTrajectoryPlanner(horizon=30, ds=1.0, base_speed=2.0)
 planner = STFrenetPlanner()
 controller = MPCController()
 
-vis = VehicleVisualizer(scale=30.0)
+vis = VehicleVisualizer()
 
 # ===============================
 # 仿真参数
