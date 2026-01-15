@@ -100,7 +100,7 @@ class STFrenetPlanner:
             f"[Plan] 规划起点 x={planning_ego.x:.2f}, y = {planning_ego.y:.2f}, WarmStart={int(use_warm_start)}"
         )
         print(
-            f"[Plan] 自车实际状态 x={ego.x}, y={ego.y}, v={ego.v:.2f}, yaw={math.degrees(ego.yaw):.2f}"
+            f"[Plan] 自车实际状态 x={ego.x:.2f}, y={ego.y:.2f}, v={ego.v:.2f}, yaw={math.degrees(ego.yaw):.2f}"
         )
 
         # ===== ② 轨迹拼接 =====
@@ -398,8 +398,8 @@ class STFrenetPlanner:
             for i in range(min(15, len(traj_full))):
                 p = traj_full[i]
                 print(
-                    f"  P{i}: x={p.x:.3f}, y={p.y:.3f}, "
-                    f"v={p.v:.2f}, t={p.t:.2f}, s={p.s:.2f}, l={p.l:.2f}, dl={p.dl:.2f}, ddl={p.ddl:.2f}"
+                    f"  P{i}: x={p.x:.2f} y={p.y:.2f} yaw={math.degrees(p.yaw):.2f} "
+                    f"v={p.v:.2f} t={p.t:.2f}, s={p.s:.2f} l={p.l:.2f} dl={p.dl:.2f} ddl={p.ddl:.2f}"
                 )
             print(f"  Ego: x={ego.x:.3f}, y={ego.y:.3f}")
 
@@ -496,6 +496,7 @@ class STFrenetPlanner:
             traj, lon, lat, T_lat = self.generate_traj(
                 s0, v0, l0, dl0, ddl0, l_target, v_target, T, ref_path
             )
+            traj = fill_yaw_by_xy(traj)
             print(f"[SearchBest] l_target={l_target:.1f}, T={T:.2f}")
             if self.check_collision(traj, obstacles):
                 print("[SearchBest] Danger continue")
@@ -760,3 +761,17 @@ def quartic_poly(p0, v0, a0, v1, a1, T):
     )
     b = np.array([p0, v0, a0, v1, a1])
     return np.linalg.solve(A, b)
+
+
+def fill_yaw_by_xy(traj):
+    if len(traj) < 2:
+        return traj
+
+    for i in range(len(traj) - 1):
+        dx = traj[i + 1].x - traj[i].x
+        dy = traj[i + 1].y - traj[i].y
+        traj[i].yaw = math.atan2(dy, dx)
+
+    # 最后一个点，沿用前一个
+    traj[-1].yaw = traj[-2].yaw
+    return traj
