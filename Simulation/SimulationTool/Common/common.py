@@ -16,7 +16,10 @@ class TrajPoint:
     v: float = 0.0
     t: float = 0.0
     s: float = 0.0
+    ds: float = 0.0
     l: float = 0.0
+    dl: float = 0.0
+    ddl: float = 0.0
 
 
 def normalize_angle(a):

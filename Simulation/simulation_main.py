@@ -35,13 +35,13 @@ navi_trajectory = navi_pathgenerator.generate_straight_traj(
 ego = VehicleKModel(x=0.0, y=0.0, yaw=0.0, v=10.0)
 
 # 障碍物
-obs1 = VehicleKModel(x=15.0, y=0.0, yaw=0.0, v=0.0)
-obs2 = VehicleKModel(x=25.0, y=3.5, yaw=0.0, v=0.0)
-obstacles = [obs1]
+obs1 = VehicleKModel(x=20.0, y=0.0, yaw=0.0, v=0.0)
+obs2 = VehicleKModel(x=40.0, y=0.0, yaw=0.0, v=0.0)
+obstacles = [obs1, obs2]
 
 # Planner + Controller
 # planner = RuleTrajectoryPlanner(horizon=30, ds=1.0, base_speed=2.0)
-planner = STFrenetPlanner()
+planner = STFrenetPlanner(ego_length=ego.length, ego_width=ego.width)
 controller = MPCController()
 
 vis = VehicleVisualizer()

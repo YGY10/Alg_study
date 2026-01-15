@@ -1,16 +1,28 @@
 import torch
+import torch.nn as nn
+import numpy as np
 
 
-class NNPlanner:
-    def __init__(self, model=None):
-        self.model = model  # 先 None
+class NNPlanner(nn.Module):
+    def __init__(self, in_dim, out_dim=2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, out_dim),
+        )
 
-    def plan(self, ego, obstacles, goal):
+    def forward(self, x):
+        return self.net(x)
+
+    def propose(self, features_np):
         """
-        返回一条局部轨迹（占位）
+        features_np: np.ndarray, shape = (in_dim,)
+        return: (l_target, T)
         """
-        # TODO: 后面换成神经网络
-        path = []
-        for i in range(1, 20):
-            path.append((ego.x + i * 1.0, ego.y))
-        return path
+        x = torch.from_numpy(features_np).float().unsqueeze(0)
+        with torch.no_grad():
+            y = self.forward(x)[0]
+        return float(y[0]), float(y[1])
