@@ -30,7 +30,7 @@ def sample_episode():
         placed = False
         for _ in range(max_tries):
             x = random.uniform(25.0, 65.0)
-            y = random.uniform(-1.5, 1.5)
+            y = random.uniform(-2.5, 0.5)
             cand = VehicleKModel(x=x, y=y, yaw=0.0, v=0.0)
 
             too_close = False
@@ -60,7 +60,7 @@ def sample_episode():
 
 
 if __name__ == "__main__":
-    for episode in range(20):
+    for episode in range(1):
         print("\n" + "#" * 20)
         print(f"### EPISODE {episode}")
         print("#" * 20)

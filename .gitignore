@@ -9,3 +9,4 @@ test.py
 __pycache__/
 *.zip
 st_frenet_traj_log.csv
+nn_dataset.csv

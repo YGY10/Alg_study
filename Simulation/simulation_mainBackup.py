@@ -6,7 +6,7 @@ from SimulationTool.VisualizeTool.visualize import VehicleVisualizer
 from SimulationTool.Controller.MPController import MPCController
 from SimulationTool.Common.common import TrajPoint, Vec2D
 from SimulationTool.Planner.SpatioTemporalFrenetPlanner import STFrenetPlanner
-from SimulationTool.Planner.NNPlanner import NNPlanner
+from Simulation.SimulationTool.NNPlanner.Model.NNPlanner import NNPlanner
 from SimulationTool.VisualizeTool.RTScope import RealtimeScope2D
 from SimulationTool.Navigation.Navigation import NavigationPathGenerator
 

@@ -5,7 +5,7 @@ import os
 from SimulationTool.Common.common import TrajPoint
 from SimulationTool.SimModel.vehicle_model import VehicleKModel
 from typing import List
-from SimulationTool.Planner.NNPlanner import NNPlanner
+from SimulationTool.NNPlanner.Model.NNPlanner import NNPlanner
 from SimulationTool.Planner.trajectory_features import extract_nn_features
 
 
@@ -87,7 +87,9 @@ class STFrenetPlanner:
     # =================================================
     # 主入口
     # =================================================
-    def plan(self, ego: VehicleKModel, ref_path, obstacles, sim_time):
+    def plan(
+        self, ego: VehicleKModel, ref_path, obstacles: List[VehicleKModel], sim_time
+    ):
         if not ref_path:
             self._reset_warm_start()
             return []
@@ -102,6 +104,10 @@ class STFrenetPlanner:
         print(
             f"[Plan] 自车实际状态 x={ego.x:.2f}, y={ego.y:.2f}, v={ego.v:.2f}, yaw={math.degrees(ego.yaw):.2f}"
         )
+        for i, obs in enumerate(obstacles):
+            dx = obs.x - ego.x
+            dy = obs.y - ego.y
+            print(f"[Plan] 障碍[{i}] dx={dx:.2f}, dy={dy:.2f}")
 
         # ===== ② 轨迹拼接 =====
         stitched_traj = None
@@ -472,8 +478,10 @@ class STFrenetPlanner:
 
         # 候选轨迹，NNPlanner优先
         candidates = []
-        nn_candidates = self._nn_proposal(frenet_ego, ref_path, obstacles)
-        candidates += nn_candidates
+        nn_l = self._nn_proposal(frenet_ego, ref_path, obstacles)
+        for l in nn_l:
+            for T in self.T_samples:
+                candidates.append((l, T))
         # 原本规则采样（兜底）
         for l_target in self.l_samples:
             for T in self.T_samples:
@@ -497,7 +505,7 @@ class STFrenetPlanner:
                 s0, v0, l0, dl0, ddl0, l_target, v_target, T, ref_path
             )
             traj = fill_yaw_by_xy(traj)
-            print(f"[SearchBest] l_target={l_target:.1f}, T={T:.2f}")
+            print(f"[SearchBest] l_target={l_target:.1f}, T={T:.2f}", end=" ")
             if self.check_collision(traj, obstacles):
                 print("[SearchBest] Danger continue")
                 continue
@@ -507,7 +515,7 @@ class STFrenetPlanner:
                 best_cost = cost
                 best = (traj, lon, lat, T_lat)
                 self.last_choice = (l_target, T)
-                picked_from_nn = (l_target, T) in nn_candidates
+                picked_from_nn = l_target in nn_l
 
         print("[Planner] pick from NN:", picked_from_nn)
         return best, frenet_ego
@@ -519,18 +527,13 @@ class STFrenetPlanner:
             return []
 
         feats = extract_nn_features(ego, ref_path, obstacles)
-        l_nn, T_nn = self.nn_planner.propose(feats)
+        l_nn = self.nn_planner.propose(feats)
         # 基本裁剪，防止网络输出爆炸
         l_nn = float(np.clip(l_nn, -4.0, 4.0))
-        T_nn = float(np.clip(T_nn, 2.0, 10.0))
-
+        l_pred = [l_nn, l_nn + 0.5, l_nn - 0.5]
         # 让 NN 提议排在前面 + 给一点扰动增强鲁棒性
-        print(f"[NNPlanner] proposal l={l_nn:.2f}, T={T_nn:.2f}")
-        return [
-            (l_nn, T_nn),
-            (l_nn + 0.5, T_nn),
-            (l_nn - 0.5, T_nn),
-        ]
+        print(f"[NNPlanner] proposal l_candidates={l_pred}")
+        return l_pred
 
     def _interp_traj_at_time(self, traj, t):
         for i in range(len(traj) - 1):
@@ -663,27 +666,62 @@ class STFrenetPlanner:
         self.last_T_lat = None
         self.last_l_target = None
 
-    def check_collision(self, traj, obstacles):
+    def check_collision(self, traj: List[TrajPoint], obstacles: List[VehicleKModel]):
         ego_half_l = self.ego_length / 2.0
         ego_half_w = self.ego_width / 2.0
 
         for p in traj:
+            cp = math.cos(p.yaw)
+            sp = math.sin(p.yaw)
+
             for o in obstacles:
-                # 只检查前方障碍（非常重要）
-                if o.x < p.x - self.ego_length:
+                # === 1. 相对位置（world → ego frame） ===
+                dx = o.x - p.x
+                dy = o.y - p.y
+
+                # 转到轨迹点坐标系
+                x_rel = cp * dx + sp * dy
+                y_rel = -sp * dx + cp * dy
+
+                # === 2. 简单前方过滤（沿轨迹方向）===
+                # 比你原来的 x 判断“物理正确”
+                if x_rel < -ego_half_l:
                     continue
 
-                dx = abs(p.x - o.x)
-                dy = abs(p.y - o.y)
+                # === 3. 相对 yaw ===
+                yaw_rel = o.yaw - p.yaw
+                c = math.cos(yaw_rel)
+                s = math.sin(yaw_rel)
 
                 obs_half_l = o.length / 2.0
                 obs_half_w = o.width / 2.0
 
-                if dx < obs_half_l + ego_half_l and dy < obs_half_w + ego_half_w:
-                    print(
-                        f"[Collision] 冲突轨迹点x={p.x:.2f} y={p.y:.2f}  障碍物x={o.x:.2f} y={o.y:.2f}"
-                    )
-                    return True
+                # === 4. SAT：ego 轴 ===
+                if abs(x_rel) > ego_half_l + abs(c) * obs_half_l + abs(s) * obs_half_w:
+                    continue
+                if abs(y_rel) > ego_half_w + abs(s) * obs_half_l + abs(c) * obs_half_w:
+                    continue
+
+                # === 5. SAT：obstacle 轴 ===
+                if (
+                    abs(c * x_rel + s * y_rel)
+                    > abs(c) * ego_half_l + abs(s) * ego_half_w + obs_half_l
+                ):
+                    continue
+                if (
+                    abs(-s * x_rel + c * y_rel)
+                    > abs(s) * ego_half_l + abs(c) * ego_half_w + obs_half_w
+                ):
+                    continue
+
+                # === 6. 确认碰撞 ===
+                print(
+                    f"[Collision] traj(x={p.x:.2f}, y={p.y:.2f}, yaw={math.degrees(p.yaw):.1f}°) "
+                    f"obs(x={o.x:.2f}, y={o.y:.2f}, yaw={math.degrees(o.yaw):.1f}°)",
+                    end=" ",
+                )
+                return True
+
         return False
 
     def compute_cost(self, traj, l_target):
