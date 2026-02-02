@@ -1,13 +1,14 @@
 import csv
 import random
 
-CSV_PATH = "./Simulation/nn_dataset_with_epi.csv"
+CSV_PATH = "./nn_dataset.csv"
 TRAIN_RATIO = 0.8
 
 # 读取 CSV 到内存（保留整行）
 rows = []
 with open(CSV_PATH, "r", newline="") as f:
     reader = csv.reader(f)
+    header = next(reader, None)
     for row in reader:
         if row:
             rows.append(row)

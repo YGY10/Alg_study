@@ -4,10 +4,12 @@ from SimulationTool.Common.common import Vec2D
 from SimulationTool.Navigation.Navigation import NavigationPathGenerator
 from simulation_main import run_episode
 
+EPI_OFFSET = 200
+
 
 def sample_episode():
     # ===== ego =====
-    ego_v = random.uniform(6.0, 12.0)
+    ego_v = random.uniform(10.0, 12.0)
     ego = VehicleKModel(x=0.0, y=0.0, yaw=0.0, v=ego_v)
 
     # ===== reference line =====
@@ -18,19 +20,52 @@ def sample_episode():
         ego_v,
     )
 
-    # ===== obstacles (方案A：最小间距拒绝采样) =====
+    # ===== lane config =====
+    lane_centers = [-3.5, 0.0, 3.5]
+    lane_half_width = 0.8
+
+    # ===== obstacle count =====
+    r = random.random()
+    if r < 0.33:
+        num_obs = 0
+    elif r < 0.66:
+        num_obs = 1
+
+    else:
+        num_obs = 2
+
+    print(f"[SamEpi] r={r:.2f}  num_obs={num_obs}")
+
+    # ===== x range (分层) =====
+    r_x = random.random()
+    if r_x < 0.33:
+        x_range = (75.0, 105.0)  # 很远
+    elif r_x < 0.66:
+        x_range = (40.0, 70.0)
+    else:
+        x_range = (20.0, 40.0)
+    print(f"[SamEpi] r_x={r_x:.2f}  x_range={x_range}")
+    # ===== choose blocked lanes =====
+    blocked_lanes = []
+    if num_obs == 1:
+        blocked_lanes = random.sample(lane_centers, 1)
+    elif num_obs == 2:
+        blocked_lanes = random.sample(lane_centers, 2)
+
+    print(f"[SamEpi] blocked_lanes={blocked_lanes}, x_range={x_range}")
+
+    # ===== generate obstacles =====
     obstacles = []
     max_tries = 200
 
-    # 与 planner 的 AABB 碰撞模型保持一致的安全间距
-    margin_x = 8.0  # m
-    margin_y = 2.0  # m
+    margin_x = 6.0
+    margin_y = 2.0
 
-    for k in range(2):
+    for lane_y in blocked_lanes:
         placed = False
         for _ in range(max_tries):
-            x = random.uniform(25.0, 65.0)
-            y = random.uniform(-2.5, 0.5)
+            x = random.uniform(*x_range)
+            y = random.uniform(lane_y - lane_half_width, lane_y + lane_half_width)
             cand = VehicleKModel(x=x, y=y, yaw=0.0, v=0.0)
 
             too_close = False
@@ -41,7 +76,6 @@ def sample_episode():
                 half_l = cand.length / 2.0 + o.length / 2.0 + margin_x
                 half_w = cand.width / 2.0 + o.width / 2.0 + margin_y
 
-                # AABB 过近判定
                 if dx < half_l and dy < half_w:
                     too_close = True
                     break
@@ -52,9 +86,7 @@ def sample_episode():
                 break
 
         if not placed:
-            # 实在放不下就少放一个，宁缺勿滥
-            print("[Warn] Failed to place obstacle with safe distance")
-            break
+            print("[Warn] Failed to place obstacle in lane", lane_y)
 
     return ego, obstacles, navi_traj
 
@@ -66,25 +98,15 @@ if __name__ == "__main__":
         print("#" * 20)
 
         ego, obstacles, navi_traj = sample_episode()
-        # =================================
-        print("[Episode Config]")
-        print(f"  Ego:")
-        print(f"    v = {ego.v:.2f} m/s")
 
+        print("[Episode Config]")
+        print(f"  Ego v = {ego.v:.2f} m/s")
         print(f"  Obstacles ({len(obstacles)}):")
         for i, obs in enumerate(obstacles):
             print(f"    [{i}] x={obs.x:.2f}, y={obs.y:.2f}, v={obs.v:.2f}")
-
-        p0 = navi_traj[0]
-        p1 = navi_traj[-1]
-        print(
-            f"  Reference Line:"
-            f" start=({p0.x:.1f}, {p0.y:.1f}),"
-            f" end=({p1.x:.1f}, {p1.y:.1f})"
-        )
-        print("-" * 20)
-        # =================================
+        epi_uni = episode + EPI_OFFSET
         run_episode(
+            epi_uni,
             ego,
             obstacles,
             navi_traj,

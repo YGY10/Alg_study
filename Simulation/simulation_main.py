@@ -11,13 +11,15 @@ from SimulationTool.VisualizeTool.RTScope import RealtimeScope2D
 from SimulationTool.Navigation.Navigation import NavigationPathGenerator
 
 
-def run_episode(ego, obstacles, navi_trajectory, sim_time=20.0, dt=0.1):
+def run_episode(episode, ego, obstacles, navi_trajectory, sim_time=20.0, dt=0.1):
     # scope_xy = RealtimeScope2D("Trajectory Tracking", "x", "y")
     # scope_xy.add_channel("reference", color="green", linestyle="--")
     # scope_xy.add_channel("ego", color="blue")
 
-    nn_planner = NNPlanner(in_dim=11)
-    nn_planner.load("/home/yihang/Documents/Alg_study/Simulation/nn_l_only.pth")
+    nn_planner = NNPlanner(in_dim=10)
+    nn_planner.load(
+        "/home/yihang/Documents/Alg_study/Simulation/SimulationTool/nnplanner_two_head.pth"
+    )
     planner = STFrenetPlanner(
         ego_length=ego.length, ego_width=ego.width, nn_planner=nn_planner
     )
@@ -31,7 +33,7 @@ def run_episode(ego, obstacles, navi_trajectory, sim_time=20.0, dt=0.1):
         print("\n" + "=" * 80)
         print(f"[STEP {step}] START  t = {t:.2f}s")
 
-        local_traj = planner.plan(ego, navi_trajectory, obstacles, step * dt)
+        local_traj = planner.plan(ego, navi_trajectory, obstacles, episode, step * dt)
         a, delta, e_y = controller.compute_control(ego, local_traj, dt)
         ego.update(a, delta)
 

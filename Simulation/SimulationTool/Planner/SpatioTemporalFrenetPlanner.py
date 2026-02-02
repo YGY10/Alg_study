@@ -6,7 +6,12 @@ from SimulationTool.Common.common import TrajPoint
 from SimulationTool.SimModel.vehicle_model import VehicleKModel
 from typing import List
 from SimulationTool.NNPlanner.Model.NNPlanner import NNPlanner
-from SimulationTool.Planner.trajectory_features import extract_nn_features
+from SimulationTool.Planner.trajectory_features import (
+    extract_nn_features,
+    init_nn_dataset,
+    log_nn_sample,
+    normalize_features,
+)
 
 
 # ===============================
@@ -15,7 +20,7 @@ from SimulationTool.Planner.trajectory_features import extract_nn_features
 class STFrenetPlanner:
     def __init__(self, ego_length, ego_width, nn_planner: NNPlanner):
         self.l_samples = [-3.5, 0.0, 3.5]
-        self.T_samples = [10.0]
+        self.T_samples = [6]
         self.dt = 0.2
         self.plan_dt = 0.1
         self.max_stitch_time = 1
@@ -34,8 +39,7 @@ class STFrenetPlanner:
         self.nn_planner = nn_planner
         self.last_choice = None
         self.last_l_target = None
-        self.nn_dataset_path = "nn_dataset.csv"
-        self._init_nn_dataset()
+        init_nn_dataset("nn_dataset.csv")
 
     def _init_log_file(self):
         if not os.path.exists(self.log_path):
@@ -88,7 +92,12 @@ class STFrenetPlanner:
     # 主入口
     # =================================================
     def plan(
-        self, ego: VehicleKModel, ref_path, obstacles: List[VehicleKModel], sim_time
+        self,
+        ego: VehicleKModel,
+        ref_path,
+        obstacles: List[VehicleKModel],
+        epi,
+        sim_time,
     ):
         if not ref_path:
             self._reset_warm_start()
@@ -114,9 +123,8 @@ class STFrenetPlanner:
         if use_warm_start:
             stitched_traj = self._try_stitch_trajectory(planning_ego, obstacles)
         if stitched_traj:
-            print("[Stitch] Use previous trajectory segment")
             print(
-                f"[Stitch] points={len(stitched_traj)}, "
+                f"[Stitch] Use previous trajectory segment points={len(stitched_traj)}, "
                 f"t_end={stitched_traj[-1].t:.2f}"
             )
 
@@ -141,23 +149,20 @@ class STFrenetPlanner:
             replan_start = planning_ego
         print(f"[Plan] 补齐位置 x={replan_start.x}, y={replan_start.y}")
         # ===== ④ 规划补齐段 =====
-        best, frenet_ego = self._search_best_trajectory(
+        best, frenet_ego, label = self._search_best_trajectory(
             replan_start, ref_path, obstacles, use_warm_start
         )
         if self.last_choice is not None:
             self.last_l_target = self.last_choice[0]
         else:
             self.last_l_target = None
-        # 记录样本
+        # 记录数据样本
         # ======================================================
-        if self.last_choice is not None:
-            feats = extract_nn_features(
-                frenet_ego,
-                ref_path,
-                obstacles,
-            )
-            label_l, label_T = self.last_choice
-            self._log_nn_sample(feats, label_l, label_T)
+        feats = extract_nn_features(
+            frenet_ego,
+            obstacles,
+        )
+        # log_nn_sample("nn_dataset.csv", epi, sim_time, feats, label)
         # ======================================================
 
         best_traj_full, best_lon, best_lat, best_T_lat = best
@@ -243,21 +248,6 @@ class STFrenetPlanner:
     # =================================================
     # 工具函数（保持不变）
     # =================================================
-    def _log_nn_sample(self, features, label_l, label_T):
-        assert len(features) == self.nn_planner.net[0].in_features
-        row = list(features.astype(float)) + [float(label_l), float(label_T)]
-        with open(self.nn_dataset_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(row)
-
-    def _init_nn_dataset(self):
-        if not os.path.exists(self.nn_dataset_path):
-            with open(self.nn_dataset_path, "w", newline="") as f:
-                writer = csv.writer(f)
-                # 不写 header 也可以，训练时自己约定顺序
-                # writer.writerow(["f0", "f1", ..., "label_l", "label_T"])
-                pass
-
     def _interp_trajpoint_by_time(self, traj, t_query):
         # traj: list[TrajPoint] with increasing p.t
         if t_query <= traj[0].t:
@@ -401,7 +391,7 @@ class STFrenetPlanner:
     def _post_process_and_log(self, traj_full, ego, sim_time, use_warm_start, t_now):
         if traj_full and len(traj_full) >= 5:
             print("[ST-Frenet] 规划结果:")
-            for i in range(min(15, len(traj_full))):
+            for i in range(min(3, len(traj_full))):
                 p = traj_full[i]
                 print(
                     f"  P{i}: x={p.x:.2f} y={p.y:.2f} yaw={math.degrees(p.yaw):.2f} "
@@ -447,6 +437,7 @@ class STFrenetPlanner:
         self, ego: TrajPoint, ref_path, obstacles, use_warm_start
     ):
         self.last_choice = None
+        label = []
         # 搜索起点
         if use_warm_start:
             s0 = ego.s
@@ -478,25 +469,27 @@ class STFrenetPlanner:
 
         # 候选轨迹，NNPlanner优先
         candidates = []
-        nn_l = self._nn_proposal(frenet_ego, ref_path, obstacles)
+        nn_l, has_nn = self._nn_proposal(frenet_ego, ref_path, obstacles)
         for l in nn_l:
             for T in self.T_samples:
                 candidates.append((l, T))
         # 原本规则采样（兜底）
-        for l_target in self.l_samples:
-            for T in self.T_samples:
-                candidates.append((l_target, T))
-        uniq = []
-        seen = set()
-        for l_target, T in candidates:
-            key = (round(float(l_target), 3), round(float(T), 3))
-            if key in seen:
-                continue
-            seen.add(key)
-            uniq.append((float(l_target), float(T)))
-        candidates = uniq
+        # tmp = [0]
+        # for l_target in tmp:
+        #     for T in self.T_samples:
+        #         candidates.append((l_target, T))
+        # uniq = []
+        # seen = set()
+        # for l_target, T in candidates:
+        #     key = (round(float(l_target), 3), round(float(T), 3))
+        #     if key in seen:
+        #         continue
+        #     seen.add(key)
+        #     uniq.append((float(l_target), float(T)))
+        # candidates = uniq
         print("[Planner] candidates:", candidates)
         picked_from_nn = False
+        target_lane_is_danger = False
         for l_target, T in candidates:
             ref_end = self.find_ref_by_s(ref_path, s0 + v0 * T)
             v_target = ref_end.v
@@ -506,34 +499,44 @@ class STFrenetPlanner:
             )
             traj = fill_yaw_by_xy(traj)
             print(f"[SearchBest] l_target={l_target:.1f}, T={T:.2f}", end=" ")
-            if self.check_collision(traj, obstacles):
-                print("[SearchBest] Danger continue")
-                continue
+            # if self.check_collision(traj, obstacles):
+            #     if abs(l_target) < 1e-1:
+            #         target_lane_is_danger = True
+            #     print("[SearchBest] Danger continue")
+            #     continue
 
             cost = self.compute_cost(traj, l_target)
             if cost < best_cost:
                 best_cost = cost
                 best = (traj, lon, lat, T_lat)
                 self.last_choice = (l_target, T)
-                picked_from_nn = l_target in nn_l
-
-        print("[Planner] pick from NN:", picked_from_nn)
-        return best, frenet_ego
+                picked_from_nn = has_nn and l_target in nn_l
+        label = [target_lane_is_danger, self.last_choice[0]]
+        print("[Planner] pick from NN:", picked_from_nn, "Label:", label)
+        return best, frenet_ego, label
 
     def _nn_proposal(
         self, ego: TrajPoint, ref_path: List[TrajPoint], obstacles: List[VehicleKModel]
     ):
         if self.nn_planner is None:
-            return []
+            return [0.0], True
 
-        feats = extract_nn_features(ego, ref_path, obstacles)
-        l_nn = self.nn_planner.propose(feats)
+        feats = extract_nn_features(ego, obstacles)
+        feats_normalize = normalize_features(feats)
+        p, l_target_nn = self.nn_planner.propose(feats_normalize)
+        if p < 0.3:
+            print(f"[NNPlanner] p={p:.2f} → NO NN proposal")
+            return [0.0], True
+        if self.last_l_target is None:
+            print(" [NNPlanner] last target is None")
+            return [0.0], True
+        l_nn = [l_target_nn]
         # 基本裁剪，防止网络输出爆炸
-        l_nn = float(np.clip(l_nn, -4.0, 4.0))
-        l_pred = [l_nn, l_nn + 0.5, l_nn - 0.5]
+        l_nn = np.clip(l_nn, -4.0, 4.0).tolist()
         # 让 NN 提议排在前面 + 给一点扰动增强鲁棒性
-        print(f"[NNPlanner] proposal l_candidates={l_pred}")
-        return l_pred
+
+        print(f"[NNPlanner] proposal p={p:.2f} l_candidates={l_nn}")
+        return l_nn, True
 
     def _interp_traj_at_time(self, traj, t):
         for i in range(len(traj) - 1):
@@ -685,7 +688,7 @@ class STFrenetPlanner:
 
                 # === 2. 简单前方过滤（沿轨迹方向）===
                 # 比你原来的 x 判断“物理正确”
-                if x_rel < -ego_half_l:
+                if x_rel < -ego_half_l or x_rel > 50:
                     continue
 
                 # === 3. 相对 yaw ===
