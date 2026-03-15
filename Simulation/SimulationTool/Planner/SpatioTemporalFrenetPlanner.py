@@ -6,6 +6,7 @@ from SimulationTool.Common.common import TrajPoint
 from SimulationTool.SimModel.vehicle_model import VehicleKModel
 from typing import List
 from SimulationTool.NNPlanner.Model.NNPlanner import NNPlanner
+from SimulationTool.Prediction.Logger.motion_logger import log_motion_frame
 from SimulationTool.Planner.trajectory_features import (
     extract_nn_features,
     init_nn_dataset,

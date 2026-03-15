@@ -37,16 +37,30 @@ class VehicleKModel:
         self.max_speed = 35.0  # 上限速度
         self.min_speed = -5.0  # 下限速度
 
-    def update(self, a, delta):
-        delta = max(-self.max_steer, min(self.max_steer, delta))
-        # 更新车辆状态
+    def update(self, a=None, delta=None):
+        """
+        a: 加速度 (m/s^2)，None 表示不控制
+        delta: 转角 (rad)，None 表示不控制
+        """
+
+        # ===== 1. 位置更新（一定发生）=====
         self.x += self.v * math.cos(self.yaw) * self.dt
         self.y += self.v * math.sin(self.yaw) * self.dt
-        self.yaw += self.v / self.wheelbase * math.tan(delta) * self.dt
-        # 归一化到-pi, pi中
-        self.yaw = normalize_angle(self.yaw)
-        self.v += a * self.dt
-        self.v = max(self.min_speed, min(self.max_speed, self.v))
+
+        # ===== 2. 有控制输入 =====
+        if a is not None and delta is not None:
+            delta = max(-self.max_steer, min(self.max_steer, delta))
+
+            self.yaw += self.v / self.wheelbase * math.tan(delta) * self.dt
+            self.yaw = normalize_angle(self.yaw)
+
+            self.v += a * self.dt
+            self.v = max(self.min_speed, min(self.max_speed, self.v))
+
+        # ===== 3. 无控制输入 =====
+        else:
+            # yaw、v 都不变，只直线前进
+            pass
 
     def state(self):
         # 返回当前车辆状态（元组）

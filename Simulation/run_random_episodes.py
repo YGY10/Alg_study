@@ -5,6 +5,9 @@ from SimulationTool.Navigation.Navigation import NavigationPathGenerator
 from simulation_main import run_episode
 
 EPI_OFFSET = 200
+# 障碍物随机参数
+OBS_V_RANGE = (5.0, 10.0)
+OBS_YAW_RANGE = (-0.2, 0.2)
 
 
 def sample_episode():
@@ -66,7 +69,9 @@ def sample_episode():
         for _ in range(max_tries):
             x = random.uniform(*x_range)
             y = random.uniform(lane_y - lane_half_width, lane_y + lane_half_width)
-            cand = VehicleKModel(x=x, y=y, yaw=0.0, v=0.0)
+            v = random.uniform(*OBS_V_RANGE)
+            yaw = random.uniform(*OBS_YAW_RANGE)
+            cand = VehicleKModel(x=x, y=y, yaw=yaw, v=v)
 
             too_close = False
             for o in obstacles:
@@ -110,6 +115,6 @@ if __name__ == "__main__":
             ego,
             obstacles,
             navi_traj,
-            sim_time=10.0,
+            sim_time=20.0,
             dt=0.1,
         )

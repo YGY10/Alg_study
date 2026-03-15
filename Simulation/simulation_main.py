@@ -1,6 +1,6 @@
 import pygame
 import math
-
+from typing import List
 from SimulationTool.SimModel.vehicle_model import VehicleKModel
 from SimulationTool.VisualizeTool.visualize import VehicleVisualizer
 from SimulationTool.Controller.MPController import MPCController
@@ -11,7 +11,14 @@ from SimulationTool.VisualizeTool.RTScope import RealtimeScope2D
 from SimulationTool.Navigation.Navigation import NavigationPathGenerator
 
 
-def run_episode(episode, ego, obstacles, navi_trajectory, sim_time=20.0, dt=0.1):
+def run_episode(
+    episode,
+    ego: VehicleKModel,
+    obstacles: List[VehicleKModel],
+    navi_trajectory,
+    sim_time=20.0,
+    dt=0.1,
+):
     # scope_xy = RealtimeScope2D("Trajectory Tracking", "x", "y")
     # scope_xy.add_channel("reference", color="green", linestyle="--")
     # scope_xy.add_channel("ego", color="blue")
@@ -36,7 +43,8 @@ def run_episode(episode, ego, obstacles, navi_trajectory, sim_time=20.0, dt=0.1)
         local_traj = planner.plan(ego, navi_trajectory, obstacles, episode, step * dt)
         a, delta, e_y = controller.compute_control(ego, local_traj, dt)
         ego.update(a, delta)
-
+        for obs in obstacles:
+            obs.update()
         # scope_xy.update("ego", ego.x, ego.y)
 
         ref_idx = min(
