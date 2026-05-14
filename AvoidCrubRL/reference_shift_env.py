@@ -129,9 +129,25 @@ class ReferenceShiftEnv:
             r_safe_bonus = 0.0
 
         # 3) 非危险区尽量别乱偏
-        danger_weight = np.exp(-0.5 * (self.ref_to_boundary_dist / 1.5) ** 2)
-        stay_weight = 1.0 - danger_weight
-        r_offset = -6.0 * float(np.mean(stay_weight * (l_offset**2)))
+        # 3) 非危险区域尽量别乱偏
+        non_danger_mask = self.ref_to_boundary_dist > 1.8
+        transition_mask = (self.ref_to_boundary_dist > 1.2) & (
+            self.ref_to_boundary_dist <= 1.8
+        )
+
+        if np.any(non_danger_mask):
+            # 明显安全的地方，不该有太大偏移
+            r_offset_far = -6.0 * float(np.mean(l_offset[non_danger_mask] ** 2))
+        else:
+            r_offset_far = 0.0
+
+        if np.any(transition_mask):
+            # 过渡区轻一点惩罚，避免策略突然开始乱偏
+            r_offset_mid = -2.0 * float(np.mean(l_offset[transition_mask] ** 2))
+        else:
+            r_offset_mid = 0.0
+
+        r_offset = r_offset_far + r_offset_mid
 
         # 4) 平滑性
         dl = np.diff(l_offset)
@@ -180,6 +196,8 @@ class ReferenceShiftEnv:
             "r_hard": r_hard,
             "r_safe_area": r_safe_area,
             "r_safe_bonus": r_safe_bonus,
+            "r_offset_far": r_offset_far,
+            "r_offset_mid": r_offset_mid,
             "r_offset": r_offset,
             "r_smooth": r_smooth,
             "r_curv": r_curv,
@@ -269,16 +287,15 @@ class ReferenceShiftEnv:
         plt.figure(self.fig2.number)
         plt.cla()
 
-        plt.plot(self.s_ref, basis_debug["l_total"], linewidth=2, label="l_total")
-        plt.plot(self.s_ref, basis_debug["l_global"], linewidth=2, label="l_global")
-        plt.plot(self.s_ref, basis_debug["l_local"], linewidth=2, label="l_local")
+        plt.plot(self.s_ref, basis_debug["l_raw"], linewidth=1.5, label="l_raw")
+        plt.plot(self.s_ref, basis_debug["l_total"], linewidth=2.5, label="l_smooth")
         plt.axhline(0.0, linestyle="--", color="black", alpha=0.5)
 
         plt.grid(True)
         plt.legend()
         plt.xlabel("s")
         plt.ylabel("l")
-        plt.title("Multi-scale Basis Offset")
+        plt.title("Per-point Offset")
 
         self.fig1.canvas.draw_idle()
         self.fig2.canvas.draw_idle()

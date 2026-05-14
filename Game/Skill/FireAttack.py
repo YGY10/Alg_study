@@ -11,18 +11,19 @@ class FireAttack(Skill):
         self.damage_ratio = 1.6
         self.def_reduce_ratio = 0.6  # 对方智力减伤比例
 
-    def on_action(self, caster, allies, enemies, round_id=None):
+    def on_action(self, caster, allies, enemies, round_id=None, battle=None):
 
         # 概率触发判断
-        if not self.trigger_check():
-            return
+        if not self.trigger_check(battle):
+            return False
 
         # 选择存活目标
         targets = [e for e in enemies if e.alive]
         if not targets:
-            return
+            return False
 
-        target = random.choice(targets)
+        rng = battle.rng if battle is not None else random
+        target = rng.choice(targets)
 
         # 谋略伤害公式
         damage = (
@@ -32,16 +33,19 @@ class FireAttack(Skill):
 
         damage = max(0, int(damage))
 
-        # 扣血
         target.hp -= damage
 
         print(
             f"{caster.name} 触发【{self.name}】对 {target.name} 造成 {damage} 点谋略伤害"
         )
 
+        self.record_trigger(caster, round_id)
         self.record_damage(caster, damage)
 
         if target.hp <= 0:
             target.hp = 0
             target.alive = False
             print(f"{target.name} 被击杀")
+            self.record_kill(caster)
+
+        return True

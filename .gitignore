@@ -1,4 +1,5 @@
 /output
+/outputs
 /.vscode
 *.exe
 temp_test.cpp
@@ -10,3 +11,22 @@ __pycache__/
 *.zip
 st_frenet_traj_log.csv
 nn_dataset.csv
+# SparseDriveV2 datasets / maps / downloaded assets
+SparseDriveV2/download/
+SparseDriveV2/ckpt/
+
+# Study outputs
+SparseDriveV2study/outputs/
+
+# Large model / tensor / map files
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.npy
+*.npz
+*.gpkg
+
+# Python cache
+__pycache__/
+*.pyc

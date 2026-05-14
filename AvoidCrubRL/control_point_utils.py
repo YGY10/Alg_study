@@ -1,142 +1,116 @@
 import numpy as np
 
 
-def smooth_signal(y, num_iter=3):
+def smoothstep(x):
+    x = np.clip(x, 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
+
+
+def build_parametric_offset_profile(
+    s_ref,
+    l_peak,
+    s_rise_start,
+    s_rise_end,
+    s_fall_end,
+):
     """
-    一个轻量平滑器，避免控制点插值后出现折感
+    生成一个：
+    0 -> 平滑抬升 -> 平台 -> 平滑回归 -> 0
+    的横向偏移曲线
     """
-    y = y.copy()
-    for _ in range(num_iter):
-        y_new = y.copy()
-        y_new[1:-1] = 0.25 * y[:-2] + 0.5 * y[1:-1] + 0.25 * y[2:]
-        y = y_new
-    return y
+    s_ref = np.asarray(s_ref, dtype=float)
+    l = np.zeros_like(s_ref)
 
+    # 防止非法顺序
+    s0 = s_ref[0]
+    s1 = s_ref[-1]
 
-def gaussian_basis(s_ref, centers, sigma):
-    basis_list = []
-    for c in centers:
-        phi = np.exp(-0.5 * ((s_ref - c) / sigma) ** 2)
-        basis_list.append(phi)
-    return np.stack(basis_list, axis=0)  # [num_basis, N]
+    s_rise_start = np.clip(s_rise_start, s0, s1)
+    s_rise_end = np.clip(s_rise_end, s_rise_start + 1e-3, s1)
+    s_fall_end = np.clip(s_fall_end, s_rise_end + 1e-3, s1)
 
+    # 1) rise
+    mask_rise = (s_ref >= s_rise_start) & (s_ref <= s_rise_end)
+    if np.any(mask_rise):
+        x = (s_ref[mask_rise] - s_rise_start) / max(s_rise_end - s_rise_start, 1e-6)
+        l[mask_rise] = l_peak * smoothstep(x)
 
-def normalize_basis_rows(basis):
-    row_sum = np.sum(basis, axis=1, keepdims=True) + 1e-8
-    return basis / row_sum
+    # 2) hold
+    mask_hold = (s_ref > s_rise_end) & (s_ref <= s_fall_end)
+    l[mask_hold] = l_peak
+
+    # 3) fall
+    # 这里把回归安排到最后 20% 路程里
+    s_return_start = s_fall_end
+    s_return_end = s_return_start + 0.18 * (s1 - s0)
+    s_return_end = min(s_return_end, s1)
+
+    mask_fall = (s_ref > s_return_start) & (s_ref <= s_return_end)
+    if np.any(mask_fall):
+        x = (s_ref[mask_fall] - s_return_start) / max(
+            s_return_end - s_return_start, 1e-6
+        )
+        l[mask_fall] = l_peak * (1.0 - smoothstep(x))
+
+    return l
 
 
 def build_l_from_basis_coeffs(s_ref, coeffs):
     """
-    coeffs 前4维: global coeffs
-    coeffs 后8维: local coeffs
-
-    输出:
-        l: 每个 s_ref 点对应的横向偏移
-        debug: 便于可视化/调试
+    coeffs = [a0, a1, a2, a3, a4]
+    解释为：
+      a0 -> l_peak
+      a1 -> s_rise_start
+      a2 -> s_rise_end
+      a3 -> s_fall_end
+      a4 -> hold_ratio / shape辅助
     """
     coeffs = np.asarray(coeffs, dtype=float).reshape(-1)
-    assert len(coeffs) == 12, "当前版本要求 action_dim=12 (4 global + 8 local)"
+    assert len(coeffs) == 5, "parameterization 版本要求 action_dim=5"
 
-    global_coeffs = coeffs[:4]
-    local_coeffs = coeffs[4:]
-
+    s_ref = np.asarray(s_ref, dtype=float)
     s0 = s_ref[0]
     s1 = s_ref[-1]
     s_len = max(s1 - s0, 1e-6)
 
-    # -------------------------
-    # 1) Global basis: 4个宽基函数
-    # -------------------------
-    global_centers = np.linspace(s0, s1, 4)
-    global_sigma = 0.28 * s_len
-    global_basis = gaussian_basis(s_ref, global_centers, global_sigma)
-    global_basis = normalize_basis_rows(global_basis)
+    a0, a1, a2, a3, a4 = coeffs
 
-    # -------------------------
-    # 2) Local basis: 8个窄基函数
-    # -------------------------
-    local_centers = np.linspace(s0, s1, 8)
-    local_sigma = 0.10 * s_len
-    local_basis = gaussian_basis(s_ref, local_centers, local_sigma)
-    local_basis = normalize_basis_rows(local_basis)
+    # 1) 最大偏移：允许左右，但你当前场景主要需要向左避让
+    l_peak = np.clip(a0, -4.0, 4.0)
 
-    # -------------------------
-    # 3) local 分量缩小一点，避免乱补
-    # -------------------------
-    local_scale = 0.45
+    # 2) 把几个参数映射到 s 范围
+    #   这里不用直接把网络输出当绝对s，而是当比例更稳
+    p1 = np.clip((a1 + 2.0) / 4.0, 0.08, 0.58)
+    p2 = np.clip((a2 + 2.0) / 4.0, 0.18, 0.76)
+    p3 = np.clip((a3 + 2.0) / 4.0, 0.28, 0.90)
+    hold_ratio = np.clip((a4 + 2.0) / 4.0, 0.05, 0.32)
 
-    l_global = np.sum(global_coeffs[:, None] * global_basis, axis=0)
-    l_local = np.sum(local_coeffs[:, None] * local_basis, axis=0) * local_scale
+    # 排序，保证时序合理
+    p_start = min(p1, p2, p3)
+    p_mid = np.clip(sorted([p1, p2, p3])[1], p_start + 0.05, 0.90)
+    p_end = np.clip(max(p1, p2, p3), p_mid + 0.05, 0.98)
 
-    l = l_global + l_local
+    s_rise_start = s0 + p_start * s_len
+    s_rise_end = s0 + p_mid * s_len
 
-    # 再做一点整体平滑
-    l = smooth_signal(l, num_iter=4)
+    # 平台长度
+    hold_len = hold_ratio * s_len
+    s_fall_end = min(s_rise_end + hold_len, s0 + p_end * s_len)
+
+    l_total = build_parametric_offset_profile(
+        s_ref=s_ref,
+        l_peak=l_peak,
+        s_rise_start=s_rise_start,
+        s_rise_end=s_rise_end,
+        s_fall_end=s_fall_end,
+    )
 
     debug = {
-        "global_coeffs": global_coeffs,
-        "local_coeffs": local_coeffs,
-        "global_centers": global_centers,
-        "local_centers": local_centers,
-        "l_global": l_global,
-        "l_local": l_local,
-        "l_total": l,
+        "l_raw": l_total.copy(),
+        "l_total": l_total,
+        "l_peak": l_peak,
+        "s_rise_start": s_rise_start,
+        "s_rise_end": s_rise_end,
+        "s_fall_end": s_fall_end,
     }
-    return l, debug
-
-
-def build_l_from_control_points(s_ref, ctrl_values):
-    """
-    用控制点生成整条 l(s)
-    改成固定“前密后疏”控制点分布
-    """
-    num_ctrl = len(ctrl_values)
-
-    if num_ctrl == 8:
-        ctrl_s_ratio = np.array([0.0, 0.06, 0.12, 0.22, 0.36, 0.55, 0.78, 1.0])
-
-    elif num_ctrl == 12:
-        ctrl_s_ratio = np.array(
-            [0.00, 0.04, 0.08, 0.13, 0.20, 0.28, 0.38, 0.50, 0.64, 0.78, 0.90, 1.00]
-        )
-
-    elif num_ctrl == 18:
-        ctrl_s_ratio = np.array(
-            [
-                0.00,
-                0.03,
-                0.06,
-                0.09,
-                0.12,
-                0.16,
-                0.20,
-                0.25,
-                0.30,
-                0.36,
-                0.43,
-                0.50,
-                0.58,
-                0.67,
-                0.76,
-                0.85,
-                0.93,
-                1.00,
-            ]
-        )
-
-    else:
-        # 其它情况先退回均匀分布
-        ctrl_s_ratio = np.linspace(0.0, 1.0, num_ctrl)
-
-    ctrl_s = s_ref[0] + ctrl_s_ratio * (s_ref[-1] - s_ref[0])
-
-    # 先把控制点本身压顺
-    ctrl_values_smooth = smooth_signal(ctrl_values, num_iter=2)
-
-    # 再插值成整条曲线
-    l = np.interp(s_ref, ctrl_s, ctrl_values_smooth)
-
-    # 再做整体平滑
-    l = smooth_signal(l, num_iter=8)
-    return l, ctrl_s
+    return l_total, debug

@@ -7,7 +7,7 @@ class ShuiYanQiJun(Skill):
     def __init__(self):
         super().__init__(name="水淹七军", skill_type=SkillType.ACTIVE, probability=0.3)
 
-        self.prepare_ratio = 12.0
+        self.prepare_ratio = 15.0
         self.preparing = False
         self.prepared_target = None
 

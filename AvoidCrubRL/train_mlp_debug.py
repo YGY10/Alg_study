@@ -19,7 +19,7 @@ class MLPPolicy(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, action_dim),
-            nn.Tanh(),  # 输出范围先压到 [-1, 1]
+            nn.Tanh(),  # 输出范围 [-1, 1]
         )
 
     def forward(self, x):
@@ -27,53 +27,28 @@ class MLPPolicy(nn.Module):
 
 
 # =========================================================
-# 2. 采样动作
+# 2. 动作采样
 # =========================================================
-def sample_action_from_policy(policy, state_tensor, action_limit, noise_std=0.3):
-    """
-    policy 输出 mean action
-    然后加高斯噪声做探索
-    """
+def sample_action_around_center(center_action, action_limit, noise_std=0.3):
+    center_action = np.asarray(center_action, dtype=np.float64).reshape(-1)
+    noise = np.random.randn(*center_action.shape) * noise_std
+    action = center_action + noise
+    action = np.clip(action, -1.0, 1.0) * action_limit
+    return action
+
+
+def sample_random_action(action_dim, action_limit):
+    return np.random.uniform(-1.0, 1.0, size=action_dim) * action_limit
+
+
+def get_policy_mean_action(policy, state_tensor):
     with torch.no_grad():
         mean_action = policy(state_tensor).cpu().numpy().reshape(-1)
-
-    noise = np.random.randn(*mean_action.shape) * noise_std
-    action = mean_action + noise
-    action = np.clip(action, -1.0, 1.0) * action_limit
-    return mean_action, action
+    return mean_action
 
 
 # =========================================================
-# 3. 用 reward 计算 loss
-# =========================================================
-def policy_loss_from_reward(policy_out, target_action, reward, action_limit):
-    """
-    最小可用 debug 版：
-    reward 越高（越不负），越值得让 policy 靠近 target_action
-    """
-    target_action_norm = torch.tensor(
-        target_action / action_limit,
-        dtype=torch.float32,
-        device=policy_out.device,
-    )
-
-    reward_tensor = torch.tensor(
-        reward,
-        dtype=torch.float32,
-        device=policy_out.device,
-    )
-
-    mse = torch.mean((policy_out.squeeze(0) - target_action_norm) ** 2)
-
-    # 当前 reward 大致在 [-6000, -50] 左右
-    weight = 1.0 + (reward_tensor + 6000.0) / 1000.0
-    weight = torch.clamp(weight, min=0.05, max=5.0)
-
-    return weight * mse
-
-
-# =========================================================
-# 4. 固定场景评估 + 渲染
+# 3. 固定场景评估 + 渲染
 # =========================================================
 def evaluate_and_render(
     policy,
@@ -87,10 +62,6 @@ def evaluate_and_render(
     alpha_limit=2.0,
     seed=42,
 ):
-    """
-    每次评估都重新创建同一个 seed 的环境，
-    保证看到的是固定场景。
-    """
     eval_env = ReferenceShiftEnv(
         num_ref_points=num_ref_points,
         num_boundary_points=num_boundary_points,
@@ -117,44 +88,55 @@ def evaluate_and_render(
     )
 
     eval_env.render(info, title_prefix=f"iter={iter_idx}, reward={reward:.2f}")
-
     return reward, info["d_min"], action, info
 
 
 # =========================================================
-# 5. 从候选动作里挑 top-k elite，并做加权平均
+# 4. 约束优先选 best
+#    先满足当前阶段的安全约束，再优化 reward
 # =========================================================
-def build_elite_target_action(candidate_actions, candidate_rewards, top_k):
-    """
-    candidate_actions: list of np.ndarray, each shape=(action_dim,)
-    candidate_rewards: list of float
+def find_best_candidate(
+    candidate_actions, candidate_rewards, candidate_infos, safe_dist
+):
+    safe_indices = [
+        i for i, info in enumerate(candidate_infos) if info["d_min"] > safe_dist
+    ]
 
-    返回：
-        elite_target_action: top-k 按 reward 加权平均后的动作
-        elite_reward_mean: top-k 的平均 reward
-        elite_best_reward: top-k 中最高 reward
-        elite_best_idx: 原候选里的最佳索引
-    """
-    rewards = np.asarray(candidate_rewards, dtype=np.float64)
-    actions = np.asarray(candidate_actions, dtype=np.float64)
+    if len(safe_indices) > 0:
+        # 有满足当前安全约束的候选：在这些里面选 reward 最好的
+        best_idx = max(safe_indices, key=lambda i: candidate_rewards[i])
+    else:
+        # 没有满足当前安全约束的：选 d_min 最大的
+        best_idx = max(
+            range(len(candidate_infos)), key=lambda i: candidate_infos[i]["d_min"]
+        )
 
-    # reward 越高越好，所以降序
-    elite_idx = np.argsort(rewards)[-top_k:]
-    elite_rewards = rewards[elite_idx]
-    elite_actions = actions[elite_idx]
+    best_action = np.asarray(candidate_actions[best_idx], dtype=np.float64)
+    best_reward = float(candidate_rewards[best_idx])
+    best_info = candidate_infos[best_idx]
+    return best_action, best_reward, best_info, best_idx
 
-    # 归一化成正权重
-    # 用 elite 内部相对差异，避免数值太夸张
-    elite_rewards_shift = elite_rewards - np.max(elite_rewards)
-    weights = np.exp(elite_rewards_shift / 50.0)  # 温度 50，可调
-    weights = weights / (np.sum(weights) + 1e-12)
 
-    elite_target_action = np.sum(elite_actions * weights[:, None], axis=0)
-    elite_reward_mean = float(np.mean(elite_rewards))
-    elite_best_reward = float(np.max(elite_rewards))
-    elite_best_idx = int(elite_idx[np.argmax(elite_rewards)])
+# =========================================================
+# 5. replay batch
+# =========================================================
+def build_replay_batch(
+    current_state, current_best_action, replay_buffer, replay_sample_k=8
+):
+    batch_states = [current_state]
+    batch_actions = [current_best_action]
 
-    return elite_target_action, elite_reward_mean, elite_best_reward, elite_best_idx
+    if len(replay_buffer) > 0:
+        k = min(replay_sample_k, len(replay_buffer))
+        idxs = np.random.choice(len(replay_buffer), size=k, replace=False)
+        for i in idxs:
+            s_i, a_i, _, _ = replay_buffer[i]
+            batch_states.append(s_i)
+            batch_actions.append(a_i)
+
+    batch_states = np.asarray(batch_states, dtype=np.float32)
+    batch_actions = np.asarray(batch_actions, dtype=np.float32)
+    return batch_states, batch_actions
 
 
 # =========================================================
@@ -162,147 +144,270 @@ def build_elite_target_action(candidate_actions, candidate_rewards, top_k):
 # =========================================================
 def main():
     # -----------------------------
-    # 训练环境：每次 reset 随机场景
+    # 场景参数
     # -----------------------------
-    train_env = ReferenceShiftEnv(
+    env_kwargs = dict(
         num_ref_points=64,
         num_boundary_points=64,
-        num_ctrl=12,
-        safe_dist=1.3,
+        num_ctrl=64,
+        safe_dist=1.3,  # 环境内部仍保留最终目标安全距离
         hard_collision_dist=0.4,
         alpha_limit=2.0,
-        seed=0,
     )
 
-    # 先拿一次 state 确定维度
-    state = train_env.reset()
-    state_dim = state.shape[0]
-    action_dim = train_env.num_ctrl
-    action_limit = train_env.alpha_limit
+    # 固定训练 / 评估场景
+    train_seed = 42
+    eval_seed = 42
+
+    # 初始化一次，拿维度
+    init_env = ReferenceShiftEnv(**env_kwargs, seed=train_seed)
+    init_state = init_env.reset()
+    state_dim = init_state.shape[0]
+    action_dim = env_kwargs["num_ctrl"]
+    action_limit = env_kwargs["alpha_limit"]
 
     print("state_dim =", state_dim)
     print("action_dim =", action_dim)
 
-    # policy
     device = torch.device("cpu")
     policy = MLPPolicy(state_dim, action_dim, hidden_dim=256).to(device)
-    optimizer = optim.Adam(policy.parameters(), lr=1e-3)
+    optimizer = optim.Adam(policy.parameters(), lr=5e-4)
 
+    # -----------------------------
     # 训练参数
+    # -----------------------------
     num_iters = 100
     render_every = 1
     sleep_sec = 0.2
 
-    # 探索参数
-    noise_std_start = 0.6
-    noise_std_min = 0.15
-    noise_decay = 0.985
-    num_candidates = 32
-    top_k = 4
+    # -----------------------------
+    # 采样参数
+    # -----------------------------
+    num_candidates = 96
+
+    # 正常情况下三采样配比
+    best_center_ratio = 0.50
+    policy_center_ratio = 0.20
+    random_ratio = 0.30
+
+    # 噪声退火
+    noise_std_start = 0.45
+    noise_std_end = 0.05
+
+    # reset 时强制全局探索噪声
+    reset_noise_std = 0.25
+
+    # 卡住判定
+    patience = 10
+    no_improve_counter = 0
+
+    # replay
+    replay_buffer = []
+    max_replay_size = 50
+    replay_sample_k = 8
+
+    # 历史最优动作
+    best_action_so_far = None
+    best_reward_so_far = -1e18
+    best_info_so_far = None
+
+    # -----------------------------
+    # 渐进式安全约束
+    # 从当前系统能做到的量级开始，逐步逼近最终 1.3
+    # -----------------------------
+    safe_dist_start = 0.20
+    safe_dist_end = env_kwargs["safe_dist"]
 
     print("\n>>> Initial policy evaluation")
     evaluate_and_render(
         policy=policy,
         action_limit=action_limit,
         iter_idx=0,
-        num_ref_points=64,
-        num_boundary_points=64,
-        num_ctrl=12,
-        safe_dist=1.3,
-        hard_collision_dist=0.4,
-        alpha_limit=2.0,
-        seed=42,
+        seed=eval_seed,
+        **env_kwargs,
     )
 
     for it in range(1, num_iters + 1):
-        noise_std_now = max(noise_std_min, noise_std_start * (noise_decay**it))
         # -------------------------
-        # 1) 随机场景
+        # 1) 固定训练场景
         # -------------------------
+        train_env = ReferenceShiftEnv(**env_kwargs, seed=train_seed)
         state = train_env.reset()
+
+        state_np = state.copy()
         state_tensor = torch.tensor(
             state, dtype=torch.float32, device=device
         ).unsqueeze(0)
 
-        # 当前 policy 输出
-        policy_out = policy(state_tensor)
+        policy_mean_action = get_policy_mean_action(policy, state_tensor)
+
+        if best_action_so_far is None:
+            best_action_so_far = policy_mean_action.copy()
 
         # -------------------------
-        # 2) 在当前 policy 附近采样很多动作
+        # 2) 基础噪声退火
+        # -------------------------
+        alpha = (it - 1) / max(1, num_iters - 1)
+        base_noise_std = noise_std_start + alpha * (noise_std_end - noise_std_start)
+
+        # -------------------------
+        # 3) 当前阶段的安全约束（schedule）
+        # -------------------------
+        current_safe_dist = safe_dist_start + alpha * (safe_dist_end - safe_dist_start)
+
+        # -------------------------
+        # 4) 长时间没提升，触发全局探索 reset
+        # -------------------------
+        if no_improve_counter >= patience:
+            use_global_explore = True
+            no_improve_counter = 0
+            noise_std = max(base_noise_std, reset_noise_std)
+            print(">>> RESET TO GLOBAL EXPLORATION")
+        else:
+            use_global_explore = False
+            noise_std = base_noise_std
+
+        # -------------------------
+        # 5) 候选采样
         # -------------------------
         candidate_actions = []
         candidate_rewards = []
         candidate_infos = []
 
-        for _ in range(num_candidates):
-            _, sampled_action = sample_action_from_policy(
-                policy,
-                state_tensor,
+        if use_global_explore:
+            # reset 时：取消 best 精修，强化 policy + random
+            num_best_center = 0
+            num_policy_center = int(num_candidates * 0.40)
+            num_random = num_candidates - num_policy_center
+        else:
+            num_best_center = int(num_candidates * best_center_ratio)
+            num_policy_center = int(num_candidates * policy_center_ratio)
+            num_random = num_candidates - num_best_center - num_policy_center
+
+        # 5.1 围绕历史 best 采样
+        for _ in range(num_best_center):
+            sampled_action = sample_action_around_center(
+                center_action=best_action_so_far,
                 action_limit=action_limit,
-                noise_std=noise_std_now,
+                noise_std=noise_std,
             )
-
             _, reward, _, info = train_env.step(sampled_action)
+            candidate_actions.append(sampled_action)
+            candidate_rewards.append(reward)
+            candidate_infos.append(info)
 
+        # 5.2 围绕当前 policy 采样
+        for _ in range(num_policy_center):
+            sampled_action = sample_action_around_center(
+                center_action=policy_mean_action,
+                action_limit=action_limit,
+                noise_std=noise_std,
+            )
+            _, reward, _, info = train_env.step(sampled_action)
+            candidate_actions.append(sampled_action)
+            candidate_rewards.append(reward)
+            candidate_infos.append(info)
+
+        # 5.3 完全随机采样
+        for _ in range(num_random):
+            sampled_action = sample_random_action(
+                action_dim=action_dim,
+                action_limit=action_limit,
+            )
+            _, reward, _, info = train_env.step(sampled_action)
             candidate_actions.append(sampled_action)
             candidate_rewards.append(reward)
             candidate_infos.append(info)
 
         # -------------------------
-        # 3) 从 top-k elite 里构造一个更稳的目标动作
+        # 6) 约束优先选 best
         # -------------------------
         (
-            elite_target_action,
-            elite_reward_mean,
-            elite_best_reward,
-            elite_best_idx,
-        ) = build_elite_target_action(
-            candidate_actions=candidate_actions,
-            candidate_rewards=candidate_rewards,
-            top_k=top_k,
+            best_action_this_iter,
+            best_reward_this_iter,
+            best_info_this_iter,
+            _,
+        ) = find_best_candidate(
+            candidate_actions,
+            candidate_rewards,
+            candidate_infos,
+            safe_dist=current_safe_dist,
         )
-        elite_best_info = candidate_infos[elite_best_idx]
 
         # -------------------------
-        # 4) 用 elite 平均动作更新 policy
+        # 7) 更新历史 best
+        # 这里仍然按 reward 更新历史 best，
+        # 因为当前 best 已经过“约束优先筛选”
         # -------------------------
-        optimizer.zero_grad()
-        loss = policy_loss_from_reward(
-            policy_out=policy_out,
-            target_action=elite_target_action,
-            reward=elite_reward_mean,
-            action_limit=action_limit,
+        if best_reward_this_iter > best_reward_so_far:
+            best_reward_so_far = best_reward_this_iter
+            best_action_so_far = best_action_this_iter.copy()
+            best_info_so_far = best_info_this_iter
+
+            replay_buffer.append(
+                (
+                    state_np.copy(),
+                    best_action_this_iter.copy(),
+                    best_reward_this_iter,
+                    best_info_this_iter["d_min"],
+                )
+            )
+            replay_buffer = replay_buffer[-max_replay_size:]
+
+            no_improve_counter = 0
+        else:
+            no_improve_counter += 1
+
+        # -------------------------
+        # 8) 当前 best + replay 一起训练
+        # -------------------------
+        batch_states, batch_actions = build_replay_batch(
+            current_state=state_np,
+            current_best_action=best_action_this_iter,
+            replay_buffer=replay_buffer,
+            replay_sample_k=replay_sample_k,
         )
+
+        batch_states_tensor = torch.tensor(
+            batch_states, dtype=torch.float32, device=device
+        )
+        batch_actions_tensor = torch.tensor(
+            batch_actions, dtype=torch.float32, device=device
+        )
+
+        optimizer.zero_grad()
+        pred_actions = policy(batch_states_tensor)
+        target_actions_norm = batch_actions_tensor / action_limit
+        loss = torch.mean((pred_actions - target_actions_norm) ** 2)
         loss.backward()
         optimizer.step()
 
         # -------------------------
-        # 5) 打印
+        # 9) 打印
         # -------------------------
         print(
             f"[train] iter={it:04d} "
-            f"noise_std={noise_std_now:.3f} "
+            f"current_safe_dist={current_safe_dist:.3f} "
+            f"noise_std={noise_std:.3f} "
             f"loss={loss.item():.4f} "
-            f"elite_mean_reward={elite_reward_mean:.3f} "
-            f"elite_best_reward={elite_best_reward:.3f} "
-            f"elite_best_d_min={elite_best_info['d_min']:.3f}"
+            f"best_reward_this_iter={best_reward_this_iter:.3f} "
+            f"best_d_min_this_iter={best_info_this_iter['d_min']:.3f} "
+            f"best_reward_so_far={best_reward_so_far:.3f} "
+            f"best_d_min_so_far={best_info_so_far['d_min'] if best_info_so_far is not None else -1:.3f} "
+            f"replay_size={len(replay_buffer)} "
+            f"no_improve_counter={no_improve_counter}"
         )
 
         # -------------------------
-        # 6) 固定场景可视化
+        # 10) 固定场景可视化
         # -------------------------
         if it % render_every == 0:
             evaluate_and_render(
                 policy=policy,
                 action_limit=action_limit,
                 iter_idx=it,
-                num_ref_points=64,
-                num_boundary_points=64,
-                num_ctrl=12,
-                safe_dist=1.3,
-                hard_collision_dist=0.4,
-                alpha_limit=2.0,
-                seed=42,
+                seed=eval_seed,
+                **env_kwargs,
             )
             time.sleep(sleep_sec)
 
