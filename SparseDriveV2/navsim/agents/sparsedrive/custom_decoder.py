@@ -15,6 +15,7 @@ def _get_clones(module, N):
     # FIXME: copy.deepcopy() is not defined on nn.module
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
+
 class CustomTransformerDecoder(nn.Module):
     def __init__(self, num_poses, d_model, d_ffn, config):
         super().__init__()
@@ -29,7 +30,7 @@ class CustomTransformerDecoder(nn.Module):
                 decoder_idx=i,
             )
             self.layers.append(decoder_layer)
-    
+
     def forward(self, feature, input):
         outputs = {}
         loss_dicts = {}
@@ -59,11 +60,11 @@ class CustomTransformerDecoderLayer(nn.Module):
             residual_mode="add",
         )
         self.p_attention = nn.MultiheadAttention(
-                config.d_model,
-                config.num_head,
-                dropout=config.dropout,
-                batch_first=True,
-            )
+            config.d_model,
+            config.num_head,
+            dropout=config.dropout,
+            batch_first=True,
+        )
         self.p_ffn = nn.Sequential(
             nn.Linear(config.d_model, config.d_ffn),
             nn.ReLU(),
@@ -87,11 +88,11 @@ class CustomTransformerDecoderLayer(nn.Module):
             batch_first=True,
         )
         self.v_attention = nn.MultiheadAttention(
-                config.d_model,
-                config.num_head,
-                dropout=config.dropout,
-                batch_first=True,
-            )
+            config.d_model,
+            config.num_head,
+            dropout=config.dropout,
+            batch_first=True,
+        )
         self.v_ffn = nn.Sequential(
             nn.Linear(config.d_model, config.d_ffn),
             nn.ReLU(),
@@ -122,11 +123,11 @@ class CustomTransformerDecoderLayer(nn.Module):
                 residual_mode="add",
             )
             self.t_attention = nn.MultiheadAttention(
-                    config.d_model,
-                    config.num_head,
-                    dropout=config.dropout,
-                    batch_first=True,
-                )
+                config.d_model,
+                config.num_head,
+                dropout=config.dropout,
+                batch_first=True,
+            )
             self.t_ffn = nn.Sequential(
                 nn.Linear(config.d_model, config.d_ffn),
                 nn.ReLU(),
@@ -149,13 +150,24 @@ class CustomTransformerDecoderLayer(nn.Module):
                     nn.Linear(d_ffn, 1),
                 )
 
-    def forward(self, path_embed, vel_embed, path_vocab, vel_vocab, traj_vocab, traj_mask,
-                camera_feature, status_encoding, targets,
+    def forward(
+        self,
+        path_embed,
+        vel_embed,
+        path_vocab,
+        vel_vocab,
+        traj_vocab,
+        traj_mask,
+        camera_feature,
+        status_encoding,
+        targets,
     ):
         num_path = path_embed.shape[1]
         num_vel = vel_embed.shape[1]
 
-        img_value = camera_feature["feature_maps"][-1].permute(0, 1, 3, 4, 2).flatten(1, 3)
+        img_value = (
+            camera_feature["feature_maps"][-1].permute(0, 1, 3, 4, 2).flatten(1, 3)
+        )
         deform_value = deformable_format(camera_feature["feature_maps"])
 
         ## ego status
@@ -163,7 +175,9 @@ class CustomTransformerDecoderLayer(nn.Module):
         vel_embed = vel_embed + status_encoding.unsqueeze(1)
 
         ## path
+        # 只取x y坐标
         path_vocab_flat = path_vocab[..., :2].flatten(-2)
+        # 每一条候选 path，拿自己的空间点，投影到多相机图像上，从对应位置附近的多尺度 feature maps 里采样视觉特征，再把采样到的信息融合回这条 path 的 embedding。
         path_embed = self.p_deform_model(
             path_embed,
             path_vocab_flat,
@@ -172,7 +186,10 @@ class CustomTransformerDecoderLayer(nn.Module):
             camera_feature,
             None,
         )
-        path_embed = path_embed + self.p_dropout1(self.p_attention(path_embed, path_embed, path_embed)[0])
+        path_embed = path_embed + self.p_dropout1(
+            self.p_attention(path_embed, path_embed, path_embed)[0]
+        )
+        # label
         path_embed = self.p_norm1(path_embed)
         path_embed = path_embed + self.p_dropout2(self.p_ffn(path_embed))
         path_embed = self.p_norm2(path_embed)
@@ -180,7 +197,9 @@ class CustomTransformerDecoderLayer(nn.Module):
 
         ## velocity
         vel_embed = vel_embed + self.v_img_attention(vel_embed, img_value, img_value)[0]
-        vel_embed = vel_embed + self.v_dropout1(self.v_attention(vel_embed, vel_embed, vel_embed)[0])
+        vel_embed = vel_embed + self.v_dropout1(
+            self.v_attention(vel_embed, vel_embed, vel_embed)[0]
+        )
         vel_embed = self.v_norm1(vel_embed)
         vel_embed = vel_embed + self.v_dropout2(self.v_ffn(vel_embed))
         vel_embed = self.v_norm2(vel_embed)
@@ -191,21 +210,75 @@ class CustomTransformerDecoderLayer(nn.Module):
         filter_traj_mask = traj_mask.clone()
 
         if num_path > self._config.path_filter_num[self.decoder_idx]:
-            topk_path_scores, topk_path_indices = torch.topk(path_scores, self._config.path_filter_num[self.decoder_idx], dim=1)
-            filter_path_embed = torch.gather(path_embed, 1, topk_path_indices.unsqueeze(-1).expand(-1, -1, path_embed.shape[-1]))
-            filter_path_vocab = torch.gather(path_vocab, 1, topk_path_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, path_vocab.shape[-2], path_vocab.shape[-1]))
-            filter_traj_vocab = torch.gather(filter_traj_vocab, 1, topk_path_indices[:, :, None, None, None].expand(-1, -1, filter_traj_vocab.shape[-3], filter_traj_vocab.shape[-2], filter_traj_vocab.shape[-1]))
-            filter_traj_mask = torch.gather(filter_traj_mask, 1, topk_path_indices[:, :, None, None].expand(-1, -1, filter_traj_mask.shape[-2], filter_traj_mask.shape[-1]))
+            topk_path_scores, topk_path_indices = torch.topk(
+                path_scores, self._config.path_filter_num[self.decoder_idx], dim=1
+            )
+            filter_path_embed = torch.gather(
+                path_embed,
+                1,
+                topk_path_indices.unsqueeze(-1).expand(-1, -1, path_embed.shape[-1]),
+            )
+            filter_path_vocab = torch.gather(
+                path_vocab,
+                1,
+                topk_path_indices.unsqueeze(-1)
+                .unsqueeze(-1)
+                .expand(-1, -1, path_vocab.shape[-2], path_vocab.shape[-1]),
+            )
+            filter_traj_vocab = torch.gather(
+                filter_traj_vocab,
+                1,
+                topk_path_indices[:, :, None, None, None].expand(
+                    -1,
+                    -1,
+                    filter_traj_vocab.shape[-3],
+                    filter_traj_vocab.shape[-2],
+                    filter_traj_vocab.shape[-1],
+                ),
+            )
+            filter_traj_mask = torch.gather(
+                filter_traj_mask,
+                1,
+                topk_path_indices[:, :, None, None].expand(
+                    -1, -1, filter_traj_mask.shape[-2], filter_traj_mask.shape[-1]
+                ),
+            )
         else:
             filter_path_embed = path_embed
             filter_path_vocab = path_vocab
 
         if num_vel > self._config.velocity_filter_num[self.decoder_idx]:
-            topk_vel_scores, topk_vel_indices = torch.topk(vel_scores, self._config.velocity_filter_num[self.decoder_idx], dim=1)
-            filter_vel_embed = torch.gather(vel_embed, 1, topk_vel_indices.unsqueeze(-1).expand(-1, -1, vel_embed.shape[-1]))
-            filter_vel_vocab = torch.gather(vel_vocab, 1, topk_vel_indices.unsqueeze(-1).expand(-1, -1, vel_vocab.shape[-1]))
-            filter_traj_vocab = torch.gather(filter_traj_vocab, 2, topk_vel_indices[:, None, :, None, None].expand(-1, filter_traj_vocab.shape[-4], -1, filter_traj_vocab.shape[-2], filter_traj_vocab.shape[-1]))
-            filter_traj_mask = torch.gather(filter_traj_mask, 2, topk_vel_indices[:, None, :, None].expand(-1, filter_traj_mask.shape[-3], -1, filter_traj_mask.shape[-1]))
+            topk_vel_scores, topk_vel_indices = torch.topk(
+                vel_scores, self._config.velocity_filter_num[self.decoder_idx], dim=1
+            )
+            filter_vel_embed = torch.gather(
+                vel_embed,
+                1,
+                topk_vel_indices.unsqueeze(-1).expand(-1, -1, vel_embed.shape[-1]),
+            )
+            filter_vel_vocab = torch.gather(
+                vel_vocab,
+                1,
+                topk_vel_indices.unsqueeze(-1).expand(-1, -1, vel_vocab.shape[-1]),
+            )
+            filter_traj_vocab = torch.gather(
+                filter_traj_vocab,
+                2,
+                topk_vel_indices[:, None, :, None, None].expand(
+                    -1,
+                    filter_traj_vocab.shape[-4],
+                    -1,
+                    filter_traj_vocab.shape[-2],
+                    filter_traj_vocab.shape[-1],
+                ),
+            )
+            filter_traj_mask = torch.gather(
+                filter_traj_mask,
+                2,
+                topk_vel_indices[:, None, :, None].expand(
+                    -1, filter_traj_mask.shape[-3], -1, filter_traj_mask.shape[-1]
+                ),
+            )
         else:
             filter_vel_embed = vel_embed
             filter_vel_vocab = vel_vocab
@@ -215,7 +288,9 @@ class CustomTransformerDecoderLayer(nn.Module):
             traj_emed = filter_path_embed.unsqueeze(2) + filter_vel_embed.unsqueeze(1)
             traj_emed = traj_emed.flatten(1, 2)
 
-            filter_traj_vocab_flat = filter_traj_vocab[..., :2].flatten(1, 2).flatten(-2)
+            filter_traj_vocab_flat = (
+                filter_traj_vocab[..., :2].flatten(1, 2).flatten(-2)
+            )
             traj_emed = self.t_deform_model(
                 traj_emed,
                 filter_traj_vocab_flat,
@@ -224,7 +299,9 @@ class CustomTransformerDecoderLayer(nn.Module):
                 camera_feature,
                 None,
             )
-            traj_emed = traj_emed + self.t_dropout1(self.t_attention(traj_emed, traj_emed, traj_emed)[0])
+            traj_emed = traj_emed + self.t_dropout1(
+                self.t_attention(traj_emed, traj_emed, traj_emed)[0]
+            )
             traj_emed = self.t_norm1(traj_emed)
             traj_emed = traj_emed + self.t_dropout2(self.t_ffn(traj_emed))
             traj_emed = self.t_norm2(traj_emed)
@@ -249,32 +326,39 @@ class CustomTransformerDecoderLayer(nn.Module):
 
             dist = dist * self._config.path_sigmas * self._config.len_path
             path_loss = F.cross_entropy(path_scores, (-dist).softmax(1))
-            loss_dict[f'path_loss_{self.decoder_idx}'] = path_loss
+            loss_dict[f"path_loss_{self.decoder_idx}"] = path_loss
 
             ## vel
             target_vel = targets["velocity"]
             dist = (vel_vocab - target_vel[:, None]).abs()
             dist = dist.sum(-1) * self._config.velocity_sigmas
             vel_loss = F.cross_entropy(vel_scores, (-dist).softmax(1))
-            loss_dict[f'velocity_loss_{self.decoder_idx}'] = vel_loss
+            loss_dict[f"velocity_loss_{self.decoder_idx}"] = vel_loss
 
             ## traj
             if self.decoder_idx == self._config.decoder_num_layers - 1:
                 ## imi
                 target_traj = targets["trajectory"]
-                dist = (filter_traj_vocab.flatten(1, 2) - target_traj[:, None])[..., :2] ** 2
+                dist = (filter_traj_vocab.flatten(1, 2) - target_traj[:, None])[
+                    ..., :2
+                ] ** 2
                 dist = dist.sum((-2, -1)) * self._config.trajectory_sigmas
                 traj_loss = F.cross_entropy(traj_scores, (-dist).softmax(1))
-                loss_dict[f'traj_loss_{self.decoder_idx}'] = traj_loss
+                loss_dict[f"traj_loss_{self.decoder_idx}"] = traj_loss
 
                 ## metric
-                trajectory = filter_traj_vocab.flatten(1,2)
+                trajectory = filter_traj_vocab.flatten(1, 2)
                 pdm_token_paths = []
                 for token_path in targets["token_path"]:
-                    pdm_token_path = token_path.replace("data_cache_navtrain", f"metric_cache_navtrain{self._config.dataset_version}")
-                    pdm_token_path_parts = pdm_token_path.split('/')
-                    pdm_token_path_parts.insert(-1, 'unknown')
-                    pdm_token_path = '/'.join(pdm_token_path_parts) + "/metric_cache.pkl"
+                    pdm_token_path = token_path.replace(
+                        "data_cache_navtrain",
+                        f"metric_cache_navtrain{self._config.dataset_version}",
+                    )
+                    pdm_token_path_parts = pdm_token_path.split("/")
+                    pdm_token_path_parts.insert(-1, "unknown")
+                    pdm_token_path = (
+                        "/".join(pdm_token_path_parts) + "/metric_cache.pkl"
+                    )
                     pdm_token_paths.append(pdm_token_path)
                 if self._config.dataset_version == "v1":
                     sub_scores = get_pdm_score_v1(trajectory, pdm_token_paths)
@@ -282,42 +366,55 @@ class CustomTransformerDecoderLayer(nn.Module):
                     sub_scores = get_pdm_score_v2(trajectory, pdm_token_paths)
                 for metric in self._config.metrics:
                     metric_pred = metric_logit[metric]
-                    metric_gt = torch.tensor(np.stack([sub_score[metric] for sub_score in sub_scores])).to(metric_pred)
+                    metric_gt = torch.tensor(
+                        np.stack([sub_score[metric] for sub_score in sub_scores])
+                    ).to(metric_pred)
                     metric_gt[metric_gt == 0.5] = 0.0
-                    metric_loss = F.binary_cross_entropy_with_logits(metric_pred, metric_gt)
-                    loss_dict[f'{metric}_loss_{self.decoder_idx}'] = metric_loss * self._config.metric_loss_weight
-        
+                    metric_loss = F.binary_cross_entropy_with_logits(
+                        metric_pred, metric_gt
+                    )
+                    loss_dict[f"{metric}_loss_{self.decoder_idx}"] = (
+                        metric_loss * self._config.metric_loss_weight
+                    )
+
         output = {}
         if self.decoder_idx == self._config.decoder_num_layers - 1:
             if self._config.dataset_version == "v1":
                 scores = (
-                    metric_logit["no_at_fault_collisions"].sigmoid() * 
-                    metric_logit["drivable_area_compliance"].sigmoid()
+                    metric_logit["no_at_fault_collisions"].sigmoid()
+                    * metric_logit["drivable_area_compliance"].sigmoid()
                 ) * (
-                    5 * metric_logit["time_to_collision_within_bound"].sigmoid() +
-                    5 * metric_logit["ego_progress"].sigmoid()  +
-                    2 * metric_logit["comfort"].sigmoid()
+                    5 * metric_logit["time_to_collision_within_bound"].sigmoid()
+                    + 5 * metric_logit["ego_progress"].sigmoid()
+                    + 2 * metric_logit["comfort"].sigmoid()
                 )
             if self._config.dataset_version == "v2":
                 scores = (
-                    metric_logit["no_at_fault_collisions"].sigmoid() * 
-                    metric_logit["drivable_area_compliance"].sigmoid() *
-                    metric_logit["driving_direction_compliance"].sigmoid() *
-                    metric_logit["traffic_light_compliance"].sigmoid()
+                    metric_logit["no_at_fault_collisions"].sigmoid()
+                    * metric_logit["drivable_area_compliance"].sigmoid()
+                    * metric_logit["driving_direction_compliance"].sigmoid()
+                    * metric_logit["traffic_light_compliance"].sigmoid()
                 ) * (
-                    5 * metric_logit["time_to_collision_within_bound"].sigmoid() +
-                    5 * metric_logit["ego_progress"].sigmoid()  +
-                    2 * metric_logit["lane_keeping"].sigmoid() +
-                    2 * metric_logit["history_comfort"].sigmoid()
+                    5 * metric_logit["time_to_collision_within_bound"].sigmoid()
+                    + 5 * metric_logit["ego_progress"].sigmoid()
+                    + 2 * metric_logit["lane_keeping"].sigmoid()
+                    + 2 * metric_logit["history_comfort"].sigmoid()
                 )
 
             bs_indices = torch.arange(scores.shape[0], device=scores.device)
             mode_indices = scores.argmax(1)
-            trajectory = filter_traj_vocab.flatten(1, 2)[bs_indices, mode_indices] 
+            trajectory = filter_traj_vocab.flatten(1, 2)[bs_indices, mode_indices]
             output["trajectory"] = trajectory
 
-        return (filter_path_embed, filter_vel_embed, filter_path_vocab, filter_vel_vocab, filter_traj_vocab, filter_traj_mask), output, loss_dict
-
-
-
-
+        return (
+            (
+                filter_path_embed,
+                filter_vel_embed,
+                filter_path_vocab,
+                filter_vel_vocab,
+                filter_traj_vocab,
+                filter_traj_mask,
+            ),
+            output,
+            loss_dict,
+        )
