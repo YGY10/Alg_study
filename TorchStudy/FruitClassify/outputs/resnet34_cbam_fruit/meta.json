@@ -1,0 +1,16 @@
+{
+  "classes": [
+    "apple",
+    "pear",
+    "pineapple"
+  ],
+  "class_to_idx": {
+    "apple": 0,
+    "pear": 1,
+    "pineapple": 2
+  },
+  "best_acc": 1.0,
+  "epochs": 10,
+  "image_size": 224,
+  "model_name": "resnet34_cbam"
+}
