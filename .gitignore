@@ -26,6 +26,8 @@ SparseDriveV2study/outputs/
 *.npy
 *.npz
 *.gpkg
+*.png
+*.jpg
 
 # Python cache
 __pycache__/
