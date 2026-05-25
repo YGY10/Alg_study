@@ -1,0 +1,8 @@
+checkpoint epoch: 20
+checkpoint val accuracy: 0.7565
+test exact accuracy: 0.7685
+test collision rate: 0.1200
+test safe rate: 0.8800
+mean regret: 119.8648
+median regret: 0.0000
+p90 regret: 997.6000
