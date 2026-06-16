@@ -33,6 +33,8 @@ class IPMProjector:
         self.map_y = None
         self.valid_mask = None
         self.confidence_map = None
+        self.expected_depth_map = None
+        self.expected_range_map = None
 
         self._build_remap_table()
 
@@ -93,6 +95,10 @@ class IPMProjector:
         self.map_x = u.reshape(bev_h, bev_w).astype(np.float32)
         self.map_y = v.reshape(bev_h, bev_w).astype(np.float32)
         self.valid_mask = valid_uv.reshape(bev_h, bev_w)
+        self.expected_depth_map = z.reshape(bev_h, bev_w).astype(np.float32)
+        self.expected_range_map = np.sqrt(
+            x * x + y * y + z * z
+        ).reshape(bev_h, bev_w).astype(np.float32)
 
         self.confidence_map = self._build_confidence_map(
             u=u,
@@ -164,27 +170,94 @@ class IPMProjector:
         conf = np.clip(conf, 0.0, 1.0).astype(np.float32)
         return conf
 
-    def project(self, image_bgr):
+    def project(
+        self,
+        image,
+        interpolation=cv2.INTER_LINEAR,
+        invalid_value=0,
+    ):
         """
-        Project camera image to BEV image.
+        Project camera image/mask/depth to BEV image.
         """
-        if image_bgr is None:
+        if image is None:
             return None
 
         bev = cv2.remap(
-            image_bgr,
+            image,
             self.map_x,
             self.map_y,
-            interpolation=cv2.INTER_LINEAR,
+            interpolation=interpolation,
             borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0),
+            borderValue=invalid_value,
         )
 
         bev[~self.valid_mask] = 0
         return bev
+
+    def project_rgb(self, image_bgr):
+        return self.project(
+            image_bgr,
+            interpolation=cv2.INTER_LINEAR,
+            invalid_value=(0, 0, 0),
+        )
+
+    def project_label(self, label_image):
+        return self.project(
+            label_image,
+            interpolation=cv2.INTER_NEAREST,
+            invalid_value=0,
+        )
+
+    def project_depth(self, depth_image):
+        return self.project(
+            depth_image,
+            interpolation=cv2.INTER_LINEAR,
+            invalid_value=0,
+        )
 
     def get_valid_mask(self):
         return self.valid_mask
 
     def get_confidence_map(self):
         return self.confidence_map
+
+    def get_ground_consistency_mask(
+        self,
+        depth_bev,
+        abs_tolerance_m=1.2,
+        rel_tolerance=0.08,
+    ):
+        """
+        Keep BEV pixels whose measured depth matches the expected ground depth.
+
+        This suppresses vertical objects/buildings that otherwise get smeared by
+        ground-plane IPM.
+        """
+        if depth_bev is None:
+            return self.valid_mask.copy()
+
+        depth = depth_bev.astype(np.float32)
+        expected_z = self.expected_depth_map
+        expected_range = self.expected_range_map
+
+        if depth.shape != expected_z.shape:
+            depth = cv2.resize(
+                depth,
+                (expected_z.shape[1], expected_z.shape[0]),
+                interpolation=cv2.INTER_LINEAR,
+            )
+
+        tolerance_z = np.maximum(abs_tolerance_m, rel_tolerance * expected_z)
+        tolerance_range = np.maximum(abs_tolerance_m, rel_tolerance * expected_range)
+
+        matches_z = np.abs(depth - expected_z) <= tolerance_z
+        matches_range = np.abs(depth - expected_range) <= tolerance_range
+
+        mask = (
+            self.valid_mask
+            & (depth > 1e-3)
+            & (expected_z > 1e-3)
+            & (matches_z | matches_range)
+        )
+
+        return mask

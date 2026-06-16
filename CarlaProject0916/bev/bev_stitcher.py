@@ -297,6 +297,135 @@ class BEVStitcher:
 
         return stitched
 
+    def stitch_labels(self, label_images, valid_masks, confidence_maps=None):
+        """
+        Fuse semantic label BEV maps.
+
+        Labels are categorical, so this uses winner-takes-highest-weight
+        instead of weighted averaging.
+        """
+        bev_w, bev_h = self.bev_grid.get_size()
+
+        fused = np.zeros((bev_h, bev_w), dtype=np.uint8)
+        best_w = np.zeros((bev_h, bev_w), dtype=np.float32)
+
+        for camera_name in self.camera_configs.keys():
+            labels = label_images.get(camera_name)
+            valid = valid_masks.get(camera_name)
+
+            if labels is None:
+                continue
+
+            if labels.shape[0] != bev_h or labels.shape[1] != bev_w:
+                labels = cv2.resize(
+                    labels,
+                    (bev_w, bev_h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+
+            weight = self._build_camera_weight(
+                camera_name=camera_name,
+                bev_image=labels,
+                valid_mask=valid,
+                confidence_maps=confidence_maps,
+            )
+            weight = weight * self._semantic_label_priority(labels)
+
+            take = weight > best_w
+            fused[take] = labels[take].astype(np.uint8)
+            best_w[take] = weight[take]
+
+        fused[best_w <= 1e-4] = 0
+        return fused
+
+    @staticmethod
+    def _semantic_label_priority(labels):
+        priority = np.ones(labels.shape, dtype=np.float32)
+        priority[labels == 0] = 0.0
+        priority[labels == 7] = 5.0   # road
+        priority[labels == 14] = 4.5  # ground, used as road-like surface in Town10HD
+        priority[labels == 6] = 6.0   # road line
+        priority[labels == 8] = 4.0   # sidewalk
+        priority[labels == 10] = 2.0  # vehicle
+        priority[labels == 4] = 2.0   # pedestrian
+        return priority
+
+    def stitch_depth(self, depth_images, valid_masks, confidence_maps=None):
+        """
+        Fuse projected depth maps in meters.
+        """
+        bev_w, bev_h = self.bev_grid.get_size()
+
+        acc_depth = np.zeros((bev_h, bev_w), dtype=np.float32)
+        acc_w = np.zeros((bev_h, bev_w), dtype=np.float32)
+
+        for camera_name in self.camera_configs.keys():
+            depth = depth_images.get(camera_name)
+            valid = valid_masks.get(camera_name)
+
+            if depth is None:
+                continue
+
+            if depth.shape[0] != bev_h or depth.shape[1] != bev_w:
+                depth = cv2.resize(
+                    depth,
+                    (bev_w, bev_h),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+
+            depth = depth.astype(np.float32)
+            depth_valid = depth > 1e-3
+
+            weight = self._build_camera_weight(
+                camera_name=camera_name,
+                bev_image=depth,
+                valid_mask=valid,
+                confidence_maps=confidence_maps,
+            )
+            weight = weight * depth_valid.astype(np.float32)
+
+            acc_depth += depth * weight
+            acc_w += weight
+
+        fused = np.zeros((bev_h, bev_w), dtype=np.float32)
+        observed = acc_w > 1e-6
+        fused[observed] = acc_depth[observed] / acc_w[observed]
+        return fused
+
+    def _build_camera_weight(
+        self,
+        camera_name,
+        bev_image,
+        valid_mask,
+        confidence_maps=None,
+    ):
+        bev_w, bev_h = self.bev_grid.get_size()
+
+        soft_valid = self._make_soft_valid_mask(valid_mask, bev_image)
+
+        angle_w = self.angle_weight_maps.get(camera_name)
+        if angle_w is None:
+            return np.zeros((bev_h, bev_w), dtype=np.float32)
+
+        if confidence_maps is not None:
+            conf = confidence_maps.get(camera_name)
+
+            if conf is None:
+                conf = np.ones((bev_h, bev_w), dtype=np.float32)
+            else:
+                if conf.shape[0] != bev_h or conf.shape[1] != bev_w:
+                    conf = cv2.resize(
+                        conf,
+                        (bev_w, bev_h),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                conf = np.clip(conf.astype(np.float32), 0.0, 1.0)
+        else:
+            conf = np.ones((bev_h, bev_w), dtype=np.float32)
+
+        weight = soft_valid * angle_w * self.distance_weight * conf
+        return np.power(np.clip(weight, 0.0, 1.0), 1.10).astype(np.float32)
+
 
 
     def draw_debug_grid(self, bev_bgr):

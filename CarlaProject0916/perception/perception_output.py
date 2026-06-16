@@ -22,6 +22,10 @@ class BEVPerceptionInput:
     # 255 = 有观测，0 = 低可信/无观测
     observed_mask: Optional[np.ndarray] = None
 
+    # Optional CARLA supervision BEV maps.
+    semantic_bev: Optional[np.ndarray] = None
+    depth_bev: Optional[np.ndarray] = None
+
 
 @dataclass
 class BEVPerceptionOutput:
@@ -40,3 +44,8 @@ class BEVPerceptionOutput:
     ego_footprint_mask: Optional[np.ndarray] = None
     near_unknown_mask: Optional[np.ndarray] = None
     observed_mask: Optional[np.ndarray] = None
+    semantic_bev: Optional[np.ndarray] = None
+    depth_bev: Optional[np.ndarray] = None
+    sidewalk_mask: Optional[np.ndarray] = None
+    vehicle_mask: Optional[np.ndarray] = None
+    pedestrian_mask: Optional[np.ndarray] = None

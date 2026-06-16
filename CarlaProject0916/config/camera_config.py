@@ -22,6 +22,15 @@ CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 CAMERA_SENSOR_TICK = 0.05  # 20Hz target
 
+# Additional supervision sensors. They share the same extrinsic/intrinsic
+# config with RGB cameras, so their outputs can reuse the same IPM projector.
+ENABLE_SEMANTIC_CAMERA = True
+ENABLE_DEPTH_CAMERA = True
+
+# Depth-based filtering is useful for suppressing building smear in RGB IPM,
+# but keep it off until depth diagnostics look healthy.
+ENABLE_DEPTH_GROUND_FILTER = False
+
 # 默认中远距 FOV
 CAMERA_FOV = 95.0
 

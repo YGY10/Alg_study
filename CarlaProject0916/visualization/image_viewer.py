@@ -76,9 +76,17 @@ class MultiCameraViewer:
 
         canvas = np.vstack(row_images)
 
+        sync_state = "sync" if multi_camera_frame.synchronized else "latest"
+        frame_text = (
+            f"frame={multi_camera_frame.frame_id}"
+            if multi_camera_frame.frame_id is not None
+            else "frame=none"
+        )
+
         draw_text(
             canvas,
-            f"speed={ego_speed_kmh:.2f} km/h | main_fps={main_fps:.2f}",
+            f"speed={ego_speed_kmh:.2f} km/h | main_fps={main_fps:.2f} | "
+            f"{sync_state} | {frame_text}",
             pos=(20, 30),
             color=(0, 255, 255),
         )

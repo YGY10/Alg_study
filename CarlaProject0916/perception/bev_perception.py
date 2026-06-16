@@ -11,6 +11,61 @@ from perception.perception_output import (
 from utils.image_utils import draw_text
 
 
+CARLA_LABEL_ROAD_LINES = 6
+CARLA_LABEL_ROADS = 7
+CARLA_LABEL_SIDEWALKS = 8
+CARLA_LABEL_PEDESTRIANS = 4
+CARLA_LABEL_VEHICLES = 10
+CARLA_LABEL_GROUND = 14
+CARLA_ROAD_SURFACE_LABELS = [CARLA_LABEL_ROADS, CARLA_LABEL_GROUND]
+CARLA_NON_ROAD_LABELS = {
+    0,
+    1,   # building
+    2,   # fence
+    4,   # pedestrian
+    5,   # pole
+    6,   # road line
+    8,   # sidewalk
+    9,   # vegetation
+    10,  # vehicle
+    11,  # wall
+    12,  # traffic sign
+    13,  # sky
+    15,  # bridge
+    16,  # rail track
+    17,  # guard rail
+    18,  # traffic light
+    20,  # dynamic
+    21,  # water
+    22,  # terrain
+}
+CARLA_SEMANTIC_COLORS = {
+    0: (0, 0, 0),
+    1: (70, 70, 70),
+    2: (100, 40, 40),
+    3: (55, 90, 80),
+    4: (220, 20, 60),
+    5: (153, 153, 153),
+    6: (255, 255, 255),
+    7: (128, 64, 128),
+    8: (244, 35, 232),
+    9: (107, 142, 35),
+    10: (0, 0, 142),
+    11: (102, 102, 156),
+    12: (220, 220, 0),
+    13: (70, 130, 180),
+    14: (81, 0, 81),
+    15: (150, 100, 100),
+    16: (230, 150, 140),
+    17: (180, 165, 180),
+    18: (250, 170, 30),
+    19: (110, 190, 160),
+    20: (170, 120, 50),
+    21: (45, 60, 150),
+    22: (145, 170, 100),
+}
+
+
 class BEVPerception(BasePerception):
     def __init__(self):
         # ============================================================
@@ -74,6 +129,14 @@ class BEVPerception(BasePerception):
             )
 
         image = bev_image.copy()
+
+        if perception_input.semantic_bev is not None:
+            return self._process_semantic_bev(
+                image=image,
+                semantic_bev=perception_input.semantic_bev,
+                depth_bev=perception_input.depth_bev,
+                perception_input=perception_input,
+            )
 
         # 0. observed / coverage mask
         observed_mask = self._prepare_observed_mask(
@@ -169,7 +232,199 @@ class BEVPerception(BasePerception):
             ego_footprint_mask=ego_footprint_mask,
             near_unknown_mask=near_unknown_mask,
             observed_mask=observed_mask,
+            depth_bev=perception_input.depth_bev,
         )
+
+    # ============================================================
+    # CARLA semantic supervision path
+    # ============================================================
+    def _process_semantic_bev(
+        self,
+        image,
+        semantic_bev,
+        depth_bev,
+        perception_input,
+    ):
+        h, w = image.shape[:2]
+
+        semantic = semantic_bev.copy()
+        if semantic.shape[0] != h or semantic.shape[1] != w:
+            semantic = cv2.resize(
+                semantic,
+                (w, h),
+                interpolation=cv2.INTER_NEAREST,
+            )
+
+        observed_mask = self._prepare_observed_mask(
+            observed_mask=perception_input.observed_mask,
+            image_shape=image.shape[:2],
+        )
+
+        ego_footprint_mask, near_unknown_mask = self._build_ego_and_unknown_masks(
+            image_bgr=image,
+            bev_grid=perception_input.bev_grid,
+        )
+
+        adaptive_road_labels = self._infer_road_surface_labels(
+            semantic=semantic,
+            bev_grid=perception_input.bev_grid,
+        )
+        road_surface_mask = self._labels_to_mask(semantic, adaptive_road_labels)
+        road_marking_mask = self._labels_to_mask(semantic, [CARLA_LABEL_ROAD_LINES])
+        sidewalk_mask = self._labels_to_mask(semantic, [CARLA_LABEL_SIDEWALKS])
+        vehicle_mask = self._labels_to_mask(semantic, [CARLA_LABEL_VEHICLES])
+        pedestrian_mask = self._labels_to_mask(semantic, [CARLA_LABEL_PEDESTRIANS])
+
+        road_surface_mask = cv2.bitwise_and(road_surface_mask, observed_mask)
+        road_marking_mask = cv2.bitwise_and(road_marking_mask, observed_mask)
+        sidewalk_mask = cv2.bitwise_and(sidewalk_mask, observed_mask)
+        vehicle_mask = cv2.bitwise_and(vehicle_mask, observed_mask)
+        pedestrian_mask = cv2.bitwise_and(pedestrian_mask, observed_mask)
+
+        for mask in (
+            road_surface_mask,
+            road_marking_mask,
+            sidewalk_mask,
+            vehicle_mask,
+            pedestrian_mask,
+        ):
+            mask[ego_footprint_mask > 0] = 0
+            mask[near_unknown_mask > 0] = 0
+
+        road_context = cv2.dilate(
+            road_surface_mask,
+            self.kernel_large,
+            iterations=2,
+        )
+        road_marking_mask = cv2.bitwise_and(road_marking_mask, road_context)
+
+        road_surface_mask = cv2.morphologyEx(
+            road_surface_mask,
+            cv2.MORPH_CLOSE,
+            self.kernel_mid,
+            iterations=1,
+        )
+        road_marking_mask = cv2.morphologyEx(
+            road_marking_mask,
+            cv2.MORPH_CLOSE,
+            self.kernel_small,
+            iterations=1,
+        )
+        road_marking_mask = self._filter_components_by_area(
+            road_marking_mask,
+            min_area=8,
+            keep_top_k=None,
+        )
+
+        vehicle_mask = self._filter_components_by_area(
+            vehicle_mask,
+            min_area=12,
+            keep_top_k=20,
+        )
+        pedestrian_mask = self._filter_components_by_area(
+            pedestrian_mask,
+            min_area=6,
+            keep_top_k=20,
+        )
+
+        lane_candidate_mask = road_marking_mask.copy()
+        white_mask = road_marking_mask.copy()
+        yellow_mask = np.zeros_like(road_marking_mask)
+        edge_mask = self._extract_edge_mask(image)
+        edge_mask = cv2.bitwise_and(edge_mask, observed_mask)
+
+        drivable_candidate_mask = cv2.bitwise_or(
+            road_surface_mask,
+            road_marking_mask,
+        )
+
+        debug_image = self._make_semantic_debug_image(
+            image=image,
+            observed_mask=observed_mask,
+            semantic=semantic,
+            road_surface_mask=road_surface_mask,
+            road_marking_mask=road_marking_mask,
+            sidewalk_mask=sidewalk_mask,
+            vehicle_mask=vehicle_mask,
+            pedestrian_mask=pedestrian_mask,
+            ego_footprint_mask=ego_footprint_mask,
+            near_unknown_mask=near_unknown_mask,
+            depth_bev=depth_bev,
+            road_labels=adaptive_road_labels,
+            ego_speed_kmh=perception_input.ego_speed_kmh,
+        )
+
+        return BEVPerceptionOutput(
+            white_mask=white_mask,
+            yellow_mask=yellow_mask,
+            edge_mask=edge_mask,
+            lane_candidate_mask=lane_candidate_mask,
+            road_marking_mask=road_marking_mask,
+            drivable_candidate_mask=drivable_candidate_mask,
+            debug_image=debug_image,
+            road_surface_mask=road_surface_mask,
+            ego_footprint_mask=ego_footprint_mask,
+            near_unknown_mask=near_unknown_mask,
+            observed_mask=observed_mask,
+            semantic_bev=semantic,
+            depth_bev=depth_bev,
+            sidewalk_mask=sidewalk_mask,
+            vehicle_mask=vehicle_mask,
+            pedestrian_mask=pedestrian_mask,
+        )
+
+    @staticmethod
+    def _labels_to_mask(label_image, label_ids):
+        mask = np.isin(label_image, label_ids).astype(np.uint8) * 255
+        return mask
+
+    def _infer_road_surface_labels(self, semantic, bev_grid):
+        """
+        CARLA maps are not perfectly consistent about road surface tags.
+        Town10HD often uses label 3 (Other) for visible asphalt patches, so
+        infer the local drivable surface from a small ego-front sample.
+        """
+        road_labels = set(CARLA_ROAD_SURFACE_LABELS)
+
+        h, w = semantic.shape[:2]
+        if bev_grid is None:
+            row_center = int(h * 0.75)
+            col_center = w // 2
+            row_radius = max(8, int(h * 0.08))
+            col_radius = max(8, int(w * 0.08))
+        else:
+            row_center, col_center = bev_grid.vehicle_xy_to_bev_pixel(4.0, 0.0)
+            row_center = int(round(row_center))
+            col_center = int(round(col_center))
+            row_radius = max(8, int(round(5.0 / bev_grid.resolution)))
+            col_radius = max(8, int(round(3.0 / bev_grid.resolution)))
+
+        r1 = max(0, row_center - row_radius)
+        r2 = min(h, row_center + row_radius)
+        c1 = max(0, col_center - col_radius)
+        c2 = min(w, col_center + col_radius)
+
+        patch = semantic[r1:r2, c1:c2]
+        if patch.size == 0:
+            return sorted(road_labels)
+
+        labels, counts = np.unique(patch, return_counts=True)
+        pairs = sorted(
+            zip(labels.tolist(), counts.tolist()),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+
+        for label_id, count in pairs:
+            label_id = int(label_id)
+            if label_id in CARLA_NON_ROAD_LABELS:
+                continue
+            if count < 20:
+                continue
+            road_labels.add(label_id)
+            break
+
+        return sorted(road_labels)
 
     # ============================================================
     # Observed / coverage mask
@@ -820,3 +1075,99 @@ class BEVPerception(BasePerception):
         )
 
         return debug
+
+    def _make_semantic_debug_image(
+        self,
+        image,
+        observed_mask,
+        semantic,
+        road_surface_mask,
+        road_marking_mask,
+        sidewalk_mask,
+        vehicle_mask,
+        pedestrian_mask,
+        ego_footprint_mask,
+        near_unknown_mask,
+        depth_bev,
+        road_labels,
+        ego_speed_kmh=0.0,
+    ):
+        debug = np.zeros_like(image)
+        debug[observed_mask > 0] = (18, 18, 18)
+
+        unobserved_pixels = observed_mask == 0
+        debug[unobserved_pixels] = (12, 12, 12)
+
+        road_pixels = road_surface_mask > 0
+        debug[road_pixels] = (50, 170, 50)
+
+        sidewalk_pixels = sidewalk_mask > 0
+        debug[sidewalk_pixels] = (180, 65, 170)
+
+        debug[road_marking_mask > 0] = (255, 255, 255)
+        debug[vehicle_mask > 0] = (0, 165, 255)
+        debug[pedestrian_mask > 0] = (255, 0, 255)
+        debug[near_unknown_mask > 0] = (40, 40, 40)
+        debug[ego_footprint_mask > 0] = (0, 0, 255)
+
+        contours, _ = cv2.findContours(
+            road_marking_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        cv2.drawContours(debug, contours, -1, (0, 255, 0), 1)
+
+        depth_text = "depth=off"
+        if depth_bev is not None:
+            depth_valid = depth_bev[(depth_bev > 1e-3) & (observed_mask > 0)]
+            if depth_valid.size > 0:
+                depth_text = (
+                    f"depth mean={float(np.mean(depth_valid)):.1f}m "
+                    f"max={float(np.max(depth_valid)):.1f}m"
+                )
+
+        draw_text(
+            debug,
+            f"Semantic BEV | speed={ego_speed_kmh:.1f} km/h | {depth_text}",
+            pos=(10, 24),
+            color=(0, 255, 255),
+            scale=0.45,
+            thickness=1,
+        )
+
+        draw_text(
+            debug,
+            f"road labels={list(road_labels)} | line white | sidewalk pink | ego red",
+            pos=(10, 44),
+            color=(0, 255, 255),
+            scale=0.35,
+            thickness=1,
+        )
+
+        label_count = int(np.count_nonzero(semantic))
+        draw_text(
+            debug,
+            f"semantic pixels={label_count}",
+            pos=(10, 62),
+            color=(0, 255, 255),
+            scale=0.35,
+            thickness=1,
+        )
+
+        return debug
+
+    @staticmethod
+    def _colorize_semantic(semantic):
+        h, w = semantic.shape[:2]
+        color = np.zeros((h, w, 3), dtype=np.uint8)
+
+        for label_id, bgr in CARLA_SEMANTIC_COLORS.items():
+            color[semantic == label_id] = bgr
+
+        unknown = (semantic != 0) & ~np.isin(
+            semantic,
+            list(CARLA_SEMANTIC_COLORS.keys()),
+        )
+        color[unknown] = (255, 255, 0)
+
+        return color

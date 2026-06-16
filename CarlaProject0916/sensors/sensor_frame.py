@@ -12,9 +12,14 @@ class CameraFrame:
     image: np.ndarray
     width: int
     height: int
+    sensor_type: str = "rgb"
 
 
 @dataclass
 class MultiCameraFrame:
     frames: Dict[str, Optional[CameraFrame]]
     timestamp: float
+    semantic_frames: Optional[Dict[str, Optional[CameraFrame]]] = None
+    depth_frames: Optional[Dict[str, Optional[CameraFrame]]] = None
+    frame_id: Optional[int] = None
+    synchronized: bool = False
