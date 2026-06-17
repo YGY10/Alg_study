@@ -171,6 +171,43 @@ def compute_teacher_losses(
     }
 
 
+def compute_model_candidate_losses(
+    path_scores: torch.Tensor,
+    velocity_scores: torch.Tensor,
+    trajectory_scores: torch.Tensor,
+    candidate_trajectories: torch.Tensor,
+    teacher_path_probs: torch.Tensor,
+    target_trajectory: torch.Tensor,
+    target_trajectory_mask: torch.Tensor,
+    teacher_velocity_index: torch.Tensor,
+    trajectory_sigma: float = 4.0,
+    velocity_loss_weight: float = 0.0,
+    trajectory_loss_weight: float = 1.0,
+) -> dict[str, torch.Tensor]:
+    path_loss = soft_cross_entropy(path_scores, teacher_path_probs)
+    velocity_loss = F.cross_entropy(velocity_scores, teacher_velocity_index)
+    trajectory_targets = build_trajectory_soft_targets(
+        candidate_trajectories=candidate_trajectories,
+        target_trajectory=target_trajectory,
+        target_trajectory_mask=target_trajectory_mask,
+        sigma=trajectory_sigma,
+    )
+    trajectory_loss = soft_cross_entropy(trajectory_scores, trajectory_targets)
+
+    total_loss = (
+        path_loss
+        + trajectory_loss * trajectory_loss_weight
+        + velocity_loss * velocity_loss_weight
+    )
+
+    return {
+        "loss": total_loss,
+        "path_loss": path_loss,
+        "velocity_loss": velocity_loss,
+        "trajectory_loss": trajectory_loss,
+    }
+
+
 if __name__ == "__main__":
     batch_size = 4
     num_path = 1024

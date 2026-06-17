@@ -282,6 +282,7 @@ class ToySparseDriveV2Model(nn.Module):
         trajectory_vocab: torch.Tensor,
         ego_feature: torch.Tensor,
         forced_path_indices: torch.Tensor | None = None,
+        extra_path_indices: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         batch_size = scene_map.shape[0]
         num_velocity = velocity_feature.shape[0]
@@ -292,10 +293,22 @@ class ToySparseDriveV2Model(nn.Module):
                 topk_path,
                 dim=1,
             )
+            model_topk_path_indices = topk_path_indices
+            model_topk_path_scores = topk_path_scores
+            if extra_path_indices is not None:
+                extra_path_indices = extra_path_indices.to(path_scores.device).long()
+                topk_path_indices = torch.cat(
+                    [topk_path_indices, extra_path_indices],
+                    dim=1,
+                )
+                topk_path = topk_path_indices.shape[1]
+                topk_path_scores = torch.gather(path_scores, 1, topk_path_indices)
         else:
             topk_path_indices = forced_path_indices.to(path_scores.device).long()
             topk_path = topk_path_indices.shape[1]
             topk_path_scores = torch.gather(path_scores, 1, topk_path_indices)
+            model_topk_path_indices = topk_path_indices
+            model_topk_path_scores = topk_path_scores
         selected_path_context = torch.gather(
             path_context,
             1,
@@ -378,6 +391,8 @@ class ToySparseDriveV2Model(nn.Module):
             ),
             "topk_path_scores": topk_path_scores,
             "topk_path_indices": topk_path_indices,
+            "model_topk_path_scores": model_topk_path_scores,
+            "model_topk_path_indices": model_topk_path_indices,
         }
 
     def forward(
@@ -388,6 +403,7 @@ class ToySparseDriveV2Model(nn.Module):
         trajectory_vocab: torch.Tensor | None = None,
         ego_state: torch.Tensor | None = None,
         forced_path_indices: torch.Tensor | None = None,
+        extra_path_indices: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         scene_map, scene_feature, ego_feature = self.encode_scene(input_grid, ego_state)
         path_scores, path_context = self.score_paths(scene_map, path_vocab, ego_feature)
@@ -411,6 +427,7 @@ class ToySparseDriveV2Model(nn.Module):
                     trajectory_vocab=trajectory_vocab,
                     ego_feature=ego_feature,
                     forced_path_indices=forced_path_indices,
+                    extra_path_indices=extra_path_indices,
                 )
             )
 

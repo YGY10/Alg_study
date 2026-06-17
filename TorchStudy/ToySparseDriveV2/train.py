@@ -18,16 +18,16 @@ for path in (
         sys.path.insert(0, str(path))
 
 from dataset import ToySparseDriveV2Dataset
-from losses import compute_teacher_losses
+from losses import compute_model_candidate_losses
 from model import ToySparseDriveV2Model
 from vocab import SparseDriveVocab
 
-BATCH_SIZE = 16
+BATCH_SIZE = 64
 NUM_SAMPLES = 256
 NUM_EPOCHS = 200
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
-NUM_WORKERS = 2
+NUM_WORKERS = 4
 
 CHECKPOINT_DIR = PROJECT_ROOT / "outputs" / "checkpoints"
 BEST_CHECKPOINT_PATH = CHECKPOINT_DIR / "best_model.pt"
@@ -53,6 +53,7 @@ def compute_candidate_metrics(
     candidate_path_indices: torch.Tensor,
     candidate_velocity_indices: torch.Tensor,
     candidate_trajectories: torch.Tensor,
+    model_topk_path_indices: torch.Tensor,
     target_trajectory: torch.Tensor,
     target_trajectory_mask: torch.Tensor,
     target_path_index: torch.Tensor,
@@ -70,6 +71,9 @@ def compute_candidate_metrics(
 
     target_path_in_candidates = (
         candidate_path_indices == target_path_index[:, None]
+    ).any(dim=1)
+    target_path_in_model_topk = (
+        model_topk_path_indices == target_path_index[:, None]
     ).any(dim=1)
     pred_path_acc = (pred_path == target_path_index).float().mean()
     pred_velocity_acc = (pred_velocity == target_velocity_index).float().mean()
@@ -95,6 +99,7 @@ def compute_candidate_metrics(
 
     return {
         "topk_path_recall": target_path_in_candidates.float().mean(),
+        "model_topk_path_recall": target_path_in_model_topk.float().mean(),
         "trajectory_path_acc": pred_path_acc,
         "trajectory_velocity_acc": pred_velocity_acc,
         "trajectory_pair_acc": pred_pair_acc,
@@ -122,6 +127,7 @@ def train_one_epoch(
         "path_acc": 0.0,
         "velocity_acc": 0.0,
         "topk_path_recall": 0.0,
+        "model_topk_path_recall": 0.0,
         "trajectory_path_acc": 0.0,
         "trajectory_velocity_acc": 0.0,
         "trajectory_pair_acc": 0.0,
@@ -140,15 +146,17 @@ def train_one_epoch(
                 velocity_vocab=vocab.velocity,
                 trajectory_vocab=vocab.trajectory,
                 ego_state=batch["ego_state"],
-                forced_path_indices=batch["teacher_path_indices"],
+                extra_path_indices=batch["teacher_path_indices"],
             )
 
-            loss_dict = compute_teacher_losses(
+            loss_dict = compute_model_candidate_losses(
                 path_scores=output["path_scores"],
                 velocity_scores=output["velocity_scores"],
                 trajectory_scores=output["trajectory_scores"],
+                candidate_trajectories=output["candidate_trajectories"],
                 teacher_path_probs=batch["teacher_path_probs"],
-                teacher_candidate_probs=batch["teacher_candidate_probs"],
+                target_trajectory=batch["target_trajectory"],
+                target_trajectory_mask=batch["target_trajectory_mask"],
                 teacher_velocity_index=batch["velocity_index"],
             )
 
@@ -172,6 +180,7 @@ def train_one_epoch(
             candidate_path_indices=output["candidate_path_indices"],
             candidate_velocity_indices=output["candidate_velocity_indices"],
             candidate_trajectories=output["candidate_trajectories"],
+            model_topk_path_indices=output["model_topk_path_indices"],
             target_trajectory=batch["target_trajectory"],
             target_trajectory_mask=batch["target_trajectory_mask"],
             target_path_index=batch["path_index"],
@@ -289,6 +298,7 @@ def main() -> None:
             f"path_acc {metrics['path_acc']:.3f} | "
             f"vel_acc {metrics['velocity_acc']:.3f} | "
             f"topk_path {metrics['topk_path_recall']:.3f} | "
+            f"model_topk {metrics['model_topk_path_recall']:.3f} | "
             f"traj_vel {metrics['trajectory_velocity_acc']:.3f} | "
             f"traj_pair {metrics['trajectory_pair_acc']:.3f} | "
             f"traj_l2 {metrics['traj_l2_error']:.3f} | "

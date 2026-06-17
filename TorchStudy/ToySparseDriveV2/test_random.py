@@ -23,7 +23,13 @@ for path in (
         sys.path.insert(0, str(path))
 
 from dataset import TIME_STEPS, ToySparseDriveV2Dataset
-from teacher import EgoState, TeacherConfig, score_teacher_candidates
+from teacher import (
+    EgoState,
+    TeacherConfig,
+    normalize_obstacles,
+    score_teacher_candidates,
+    score_trajectories,
+)
 from grid import GridConfig, draw_points, draw_polyline, draw_rectangle, make_empty_grid
 from model import ToySparseDriveV2Model
 from vocab import SparseDriveVocab
@@ -112,6 +118,14 @@ def make_ego_state_tensor() -> torch.Tensor:
             float(CUSTOM_EGO_STATE["size_xy"][1]),
         ],
         dtype=torch.float32,
+    )
+
+
+def make_teacher_config() -> TeacherConfig:
+    return TeacherConfig(
+        num_path_candidates=8,
+        num_top_trajectories=8,
+        temperature=2.0,
     )
 
 
@@ -311,11 +325,7 @@ def select_teacher_reference(
     obstacles: list[dict[str, tuple[float, float]]],
     ego_state: EgoState,
 ) -> dict[str, Any]:
-    teacher_config = TeacherConfig(
-        num_path_candidates=8,
-        num_top_trajectories=8,
-        temperature=2.0,
-    )
+    teacher_config = make_teacher_config()
     teacher_output = score_teacher_candidates(
         vocab=vocab,
         goal_xy=sample["goal_xy"].numpy(),
@@ -337,6 +347,126 @@ def select_teacher_reference(
         "goal_cost": float(teacher_output.debug["goal_cost"][best]),
         "route_cost": float(teacher_output.debug["route_cost"][best]),
         "clearance": float(teacher_output.debug["clearance"][best]),
+        "path_costs": teacher_output.path_costs,
+        "candidate_flat_indices": teacher_output.candidate_flat_indices,
+        "candidate_costs": teacher_output.candidate_costs,
+        "candidate_path_indices": teacher_output.candidate_path_indices,
+        "candidate_velocity_indices": teacher_output.candidate_velocity_indices,
+    }
+
+
+def compute_rank_ascending(values: np.ndarray, index: int) -> int:
+    order = np.argsort(values)
+    return int(np.where(order == index)[0][0]) + 1
+
+
+def compute_rank_descending(values: np.ndarray, index: int) -> int:
+    order = np.argsort(-values)
+    return int(np.where(order == index)[0][0]) + 1
+
+
+def optional_float(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.4f}"
+
+
+def build_candidate_diagnostics(
+    vocab: SparseDriveVocab,
+    sample: dict[str, torch.Tensor],
+    obstacles: list[dict[str, tuple[float, float]]],
+    ego_state: EgoState,
+    output: dict[str, torch.Tensor],
+    prediction: dict[str, torch.Tensor],
+    reference: dict[str, Any],
+) -> dict[str, Any]:
+    pred_path_index = int(prediction["path_index"][0].cpu())
+    pred_velocity_index = int(prediction["velocity_index"][0].cpu())
+    pred_candidate_index = int(prediction["candidate_index"][0].cpu())
+    pred_flat_index = pred_path_index * vocab.num_velocity + pred_velocity_index
+
+    config = make_teacher_config()
+    scored_pred_path = score_trajectories(
+        vocab=vocab,
+        path_indices=np.array([pred_path_index], dtype=np.int64),
+        goal_xy=sample["goal_xy"].numpy(),
+        obstacles=normalize_obstacles(obstacles),
+        ego_state=ego_state,
+        route_path=sample["route_path"].numpy()[:, :2],
+        config=config,
+    )
+    pred_local_index = int(
+        np.where(scored_pred_path["candidate_velocity_indices"] == pred_velocity_index)[
+            0
+        ][0]
+    )
+
+    candidate_flat_indices = reference["candidate_flat_indices"]
+    candidate_costs = reference["candidate_costs"]
+    matched_teacher_candidate = np.where(candidate_flat_indices == pred_flat_index)[0]
+    in_teacher_candidate_set = len(matched_teacher_candidate) > 0
+    teacher_candidate_rank = None
+    if in_teacher_candidate_set:
+        candidate_order = np.argsort(candidate_costs)
+        teacher_candidate_rank = int(
+            np.where(candidate_order == matched_teacher_candidate[0])[0][0]
+        ) + 1
+
+    path_costs = reference["path_costs"]
+    path_scores = output["path_scores"][0].detach().cpu().numpy()
+    velocity_scores = output["velocity_scores"][0].detach().cpu().numpy()
+    trajectory_scores = output["trajectory_scores"][0].detach().cpu().numpy()
+    candidate_path_indices = output["candidate_path_indices"][0].detach().cpu().numpy()
+    candidate_velocity_indices = (
+        output["candidate_velocity_indices"][0].detach().cpu().numpy()
+    )
+
+    ref_path_index = int(reference["path_index"])
+    ref_velocity_index = int(reference["velocity_index"])
+    ref_model_candidate = np.where(
+        (candidate_path_indices == ref_path_index)
+        & (candidate_velocity_indices == ref_velocity_index)
+    )[0]
+    ref_model_trajectory_score = None
+    if len(ref_model_candidate) > 0:
+        ref_model_trajectory_score = float(trajectory_scores[ref_model_candidate[0]])
+
+    pred_cost = float(scored_pred_path["cost"][pred_local_index])
+    ref_cost = float(reference["cost"])
+    return {
+        "pred_flat_index": pred_flat_index,
+        "pred_cost": pred_cost,
+        "pred_goal_cost": float(scored_pred_path["goal_cost"][pred_local_index]),
+        "pred_route_cost": float(scored_pred_path["route_cost"][pred_local_index]),
+        "pred_clearance": float(scored_pred_path["clearance"][pred_local_index]),
+        "pred_collides": bool(scored_pred_path["collision"][pred_local_index]),
+        "cost_gap": pred_cost - ref_cost,
+        "cost_ratio": pred_cost / max(abs(ref_cost), 1.0e-6),
+        "pred_path_teacher_cost": float(path_costs[pred_path_index]),
+        "ref_path_teacher_cost": float(path_costs[ref_path_index]),
+        "pred_path_teacher_rank": compute_rank_ascending(
+            path_costs,
+            pred_path_index,
+        ),
+        "ref_path_teacher_rank": compute_rank_ascending(path_costs, ref_path_index),
+        "pred_in_teacher_candidate_set": in_teacher_candidate_set,
+        "pred_teacher_candidate_rank": teacher_candidate_rank,
+        "pred_model_path_score": float(path_scores[pred_path_index]),
+        "ref_model_path_score": float(path_scores[ref_path_index]),
+        "pred_model_path_rank": compute_rank_descending(path_scores, pred_path_index),
+        "ref_model_path_rank": compute_rank_descending(path_scores, ref_path_index),
+        "pred_model_velocity_score": float(velocity_scores[pred_velocity_index]),
+        "ref_model_velocity_score": float(velocity_scores[ref_velocity_index]),
+        "pred_model_velocity_rank": compute_rank_descending(
+            velocity_scores,
+            pred_velocity_index,
+        ),
+        "ref_model_velocity_rank": compute_rank_descending(
+            velocity_scores,
+            ref_velocity_index,
+        ),
+        "pred_model_trajectory_score": float(trajectory_scores[pred_candidate_index]),
+        "ref_model_trajectory_score": ref_model_trajectory_score,
     }
 
 
@@ -508,6 +638,15 @@ def main() -> None:
 
     pred_path_index = int(prediction["path_index"][0].cpu())
     pred_velocity_index = int(prediction["velocity_index"][0].cpu())
+    diagnostics = build_candidate_diagnostics(
+        vocab=vocab_cpu,
+        sample=sample,
+        obstacles=active_obstacles,
+        ego_state=ego_state,
+        output=output,
+        prediction=prediction,
+        reference=reference,
+    )
 
     output_path = OUTPUT_DIR / f"sample_{sample_index}.png"
     plot_prediction(
@@ -538,6 +677,48 @@ def main() -> None:
     print(f"reference_clearance: {reference['clearance']:.4f}")
     print(f"pred path: {pred_path_index}")
     print(f"pred velocity: {pred_velocity_index}")
+    print(f"pred flat_index: {diagnostics['pred_flat_index']}")
+    print(f"pred teacher_cost: {diagnostics['pred_cost']:.4f}")
+    print(f"pred_goal_cost: {diagnostics['pred_goal_cost']:.4f}")
+    print(f"pred_route_cost: {diagnostics['pred_route_cost']:.4f}")
+    print(f"pred_clearance: {diagnostics['pred_clearance']:.4f}")
+    print(f"pred_collides: {diagnostics['pred_collides']}")
+    print(f"pred_vs_reference_cost_gap: {diagnostics['cost_gap']:.4f}")
+    print(f"pred_vs_reference_cost_ratio: {diagnostics['cost_ratio']:.4f}")
+    print(
+        "teacher_path_cost/rank "
+        f"ref={diagnostics['ref_path_teacher_cost']:.4f}/"
+        f"{diagnostics['ref_path_teacher_rank']} "
+        f"pred={diagnostics['pred_path_teacher_cost']:.4f}/"
+        f"{diagnostics['pred_path_teacher_rank']}"
+    )
+    print(
+        "pred_in_teacher_top_candidate_set: "
+        f"{diagnostics['pred_in_teacher_candidate_set']}"
+    )
+    print(
+        "pred_teacher_candidate_rank_in_top_set: "
+        f"{diagnostics['pred_teacher_candidate_rank']}"
+    )
+    print(
+        "model_path_score/rank "
+        f"ref={diagnostics['ref_model_path_score']:.4f}/"
+        f"{diagnostics['ref_model_path_rank']} "
+        f"pred={diagnostics['pred_model_path_score']:.4f}/"
+        f"{diagnostics['pred_model_path_rank']}"
+    )
+    print(
+        "model_velocity_score/rank "
+        f"ref={diagnostics['ref_model_velocity_score']:.4f}/"
+        f"{diagnostics['ref_model_velocity_rank']} "
+        f"pred={diagnostics['pred_model_velocity_score']:.4f}/"
+        f"{diagnostics['pred_model_velocity_rank']}"
+    )
+    print(
+        "model_trajectory_score "
+        f"ref={optional_float(diagnostics['ref_model_trajectory_score'])} "
+        f"pred={diagnostics['pred_model_trajectory_score']:.4f}"
+    )
     print(f"traj_l2_to_reference: {traj_l2:.4f}")
     print(f"endpoint_l2_to_reference: {endpoint_l2:.4f}")
     print(f"saved visualization to: {output_path}")
