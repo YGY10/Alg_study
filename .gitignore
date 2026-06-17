@@ -1,5 +1,6 @@
 /output
 /outputs
+/.codegraph
 /.vscode
 *.exe
 temp_test.cpp
