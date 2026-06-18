@@ -1,5 +1,7 @@
 # ToySparseDriveV2 Codex Context
 
+For any task under `TorchStudy/ToySparseDriveV2`, read `TorchStudy/ToySparseDriveV2/CODEX_CONTEXT.md` first.
+
 This file is the handoff context for Codex. Read this file first before editing
 or analyzing `TorchStudy/ToySparseDriveV2`.
 
