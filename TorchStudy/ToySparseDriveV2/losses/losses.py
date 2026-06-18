@@ -171,33 +171,63 @@ def compute_teacher_losses(
     }
 
 
+def compute_collision_margin_loss(
+    trajectory_scores: torch.Tensor,
+    candidate_collision: torch.Tensor,
+    margin: float = 2.0,
+) -> torch.Tensor:
+    collision_mask = candidate_collision.bool()
+    safe_mask = ~collision_mask
+
+    has_safe = safe_mask.any(dim=-1)
+    has_collision = collision_mask.any(dim=-1)
+    valid_batch = has_safe & has_collision
+    if not bool(valid_batch.any()):
+        return trajectory_scores.sum() * 0.0
+
+    valid_scores = trajectory_scores[valid_batch]
+    valid_collision_mask = collision_mask[valid_batch]
+    valid_safe_mask = safe_mask[valid_batch]
+
+    safe_scores = valid_scores.masked_fill(~valid_safe_mask, torch.finfo(valid_scores.dtype).min)
+    best_safe_score = safe_scores.max(dim=-1).values
+    margin_error = F.relu(valid_scores - best_safe_score[:, None] + margin)
+    margin_error = margin_error * valid_collision_mask.float()
+
+    denom = valid_collision_mask.float().sum().clamp(min=1.0)
+    return margin_error.sum() / denom
+
+
 def compute_model_candidate_losses(
     path_scores: torch.Tensor,
     velocity_scores: torch.Tensor,
     trajectory_scores: torch.Tensor,
-    candidate_trajectories: torch.Tensor,
     teacher_path_probs: torch.Tensor,
-    target_trajectory: torch.Tensor,
-    target_trajectory_mask: torch.Tensor,
+    teacher_candidate_probs: torch.Tensor,
     teacher_velocity_index: torch.Tensor,
-    trajectory_sigma: float = 4.0,
+    candidate_collision: torch.Tensor | None = None,
     velocity_loss_weight: float = 0.0,
     trajectory_loss_weight: float = 1.0,
+    collision_margin_weight: float = 0.5,
+    collision_margin: float = 2.0,
 ) -> dict[str, torch.Tensor]:
     path_loss = soft_cross_entropy(path_scores, teacher_path_probs)
     velocity_loss = F.cross_entropy(velocity_scores, teacher_velocity_index)
-    trajectory_targets = build_trajectory_soft_targets(
-        candidate_trajectories=candidate_trajectories,
-        target_trajectory=target_trajectory,
-        target_trajectory_mask=target_trajectory_mask,
-        sigma=trajectory_sigma,
-    )
-    trajectory_loss = soft_cross_entropy(trajectory_scores, trajectory_targets)
+    trajectory_loss = soft_cross_entropy(trajectory_scores, teacher_candidate_probs)
+    if candidate_collision is None:
+        collision_margin_loss = trajectory_scores.sum() * 0.0
+    else:
+        collision_margin_loss = compute_collision_margin_loss(
+            trajectory_scores=trajectory_scores,
+            candidate_collision=candidate_collision,
+            margin=collision_margin,
+        )
 
     total_loss = (
         path_loss
         + trajectory_loss * trajectory_loss_weight
         + velocity_loss * velocity_loss_weight
+        + collision_margin_loss * collision_margin_weight
     )
 
     return {
@@ -205,6 +235,7 @@ def compute_model_candidate_losses(
         "path_loss": path_loss,
         "velocity_loss": velocity_loss,
         "trajectory_loss": trajectory_loss,
+        "collision_margin_loss": collision_margin_loss,
     }
 
 

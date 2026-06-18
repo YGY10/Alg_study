@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -20,10 +21,17 @@ for path in (
 from dataset import ToySparseDriveV2Dataset
 from losses import compute_model_candidate_losses
 from model import ToySparseDriveV2Model
+from teacher import (
+    DynamicObstacle,
+    EgoState,
+    TeacherConfig,
+    score_trajectories,
+    softmax_from_cost,
+)
 from vocab import SparseDriveVocab
 
-BATCH_SIZE = 64
-NUM_SAMPLES = 256
+BATCH_SIZE = 16
+NUM_SAMPLES = 1024
 NUM_EPOCHS = 200
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
@@ -108,12 +116,128 @@ def compute_candidate_metrics(
     }
 
 
+def build_teacher_candidate_targets_for_batch(
+    vocab: SparseDriveVocab,
+    candidate_path_indices: torch.Tensor,
+    candidate_velocity_indices: torch.Tensor,
+    batch: dict[str, torch.Tensor],
+    teacher_config: TeacherConfig,
+) -> dict[str, torch.Tensor]:
+    device = candidate_path_indices.device
+    path_indices_np = candidate_path_indices.detach().cpu().numpy()
+    velocity_indices_np = candidate_velocity_indices.detach().cpu().numpy()
+
+    goal_xy_np = batch["goal_xy"].detach().cpu().numpy()
+    route_path_np = batch["route_path"].detach().cpu().numpy()[..., :2]
+    ego_state_np = batch["ego_state"].detach().cpu().numpy()
+    obstacle_centers_np = batch["obstacle_centers"].detach().cpu().numpy()
+    obstacle_sizes_np = batch["obstacle_sizes"].detach().cpu().numpy()
+    obstacle_velocities_np = batch["obstacle_velocities"].detach().cpu().numpy()
+    obstacle_mask_np = batch["obstacle_mask"].detach().cpu().numpy() > 0.5
+
+    batch_size, num_candidates = path_indices_np.shape
+    teacher_probs = np.zeros((batch_size, num_candidates), dtype=np.float32)
+    teacher_costs = np.zeros((batch_size, num_candidates), dtype=np.float32)
+    teacher_collision = np.zeros((batch_size, num_candidates), dtype=bool)
+    teacher_clearance = np.zeros((batch_size, num_candidates), dtype=np.float32)
+
+    for batch_index in range(batch_size):
+        obstacles = []
+        for obstacle_index in np.flatnonzero(obstacle_mask_np[batch_index]):
+            obstacles.append(
+                DynamicObstacle(
+                    center_xy=obstacle_centers_np[batch_index, obstacle_index],
+                    size_xy=(
+                        float(obstacle_sizes_np[batch_index, obstacle_index, 0]),
+                        float(obstacle_sizes_np[batch_index, obstacle_index, 1]),
+                    ),
+                    velocity_xy=obstacle_velocities_np[batch_index, obstacle_index],
+                )
+            )
+
+        ego_vector = ego_state_np[batch_index]
+        ego_state = EgoState(
+            speed=float(ego_vector[0]),
+            size_xy=(float(ego_vector[1]), float(ego_vector[2])),
+        )
+
+        unique_path_indices = np.unique(path_indices_np[batch_index]).astype(np.int64)
+        scored = score_trajectories(
+            vocab=vocab,
+            path_indices=unique_path_indices,
+            goal_xy=goal_xy_np[batch_index],
+            obstacles=obstacles,
+            ego_state=ego_state,
+            route_path=route_path_np[batch_index],
+            config=teacher_config,
+        )
+
+        scored_flat_indices = scored["candidate_flat_indices"]
+        scored_costs = scored["cost"]
+        scored_collision = scored["collision"]
+        scored_clearance = scored["clearance"]
+        cost_by_flat_index = {
+            int(flat_index): float(cost)
+            for flat_index, cost in zip(scored_flat_indices, scored_costs)
+        }
+        collision_by_flat_index = {
+            int(flat_index): bool(collision)
+            for flat_index, collision in zip(scored_flat_indices, scored_collision)
+        }
+        clearance_by_flat_index = {
+            int(flat_index): float(clearance)
+            for flat_index, clearance in zip(scored_flat_indices, scored_clearance)
+        }
+
+        candidate_flat_indices = (
+            path_indices_np[batch_index] * vocab.num_velocity
+            + velocity_indices_np[batch_index]
+        )
+        candidate_costs = np.array(
+            [
+                cost_by_flat_index[int(flat_index)]
+                for flat_index in candidate_flat_indices
+            ],
+            dtype=np.float32,
+        )
+        candidate_collision = np.array(
+            [
+                collision_by_flat_index[int(flat_index)]
+                for flat_index in candidate_flat_indices
+            ],
+            dtype=bool,
+        )
+        candidate_clearance = np.array(
+            [
+                clearance_by_flat_index[int(flat_index)]
+                for flat_index in candidate_flat_indices
+            ],
+            dtype=np.float32,
+        )
+        teacher_probs[batch_index] = softmax_from_cost(
+            candidate_costs,
+            temperature=teacher_config.temperature,
+        ).astype(np.float32)
+        teacher_costs[batch_index] = candidate_costs
+        teacher_collision[batch_index] = candidate_collision
+        teacher_clearance[batch_index] = candidate_clearance
+
+    return {
+        "probs": torch.from_numpy(teacher_probs).to(device=device),
+        "costs": torch.from_numpy(teacher_costs).to(device=device),
+        "collision": torch.from_numpy(teacher_collision).to(device=device),
+        "clearance": torch.from_numpy(teacher_clearance).to(device=device),
+    }
+
+
 def train_one_epoch(
     model: ToySparseDriveV2Model,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     vocab: SparseDriveVocab,
+    teacher_vocab: SparseDriveVocab,
     device: torch.device,
+    teacher_config: TeacherConfig,
 ) -> dict[str, float]:
     model.train()
 
@@ -124,6 +248,7 @@ def train_one_epoch(
         "path_loss": 0.0,
         "velocity_loss": 0.0,
         "trajectory_loss": 0.0,
+        "collision_margin_loss": 0.0,
         "path_acc": 0.0,
         "velocity_acc": 0.0,
         "topk_path_recall": 0.0,
@@ -133,6 +258,9 @@ def train_one_epoch(
         "trajectory_pair_acc": 0.0,
         "traj_l2_error": 0.0,
         "traj_endpoint_error": 0.0,
+        "pred_collision_rate": 0.0,
+        "candidate_safe_rate": 0.0,
+        "pred_teacher_cost": 0.0,
     }
     num_batches = 0
 
@@ -149,15 +277,22 @@ def train_one_epoch(
                 extra_path_indices=batch["teacher_path_indices"],
             )
 
+            teacher_candidate_targets = build_teacher_candidate_targets_for_batch(
+                vocab=teacher_vocab,
+                candidate_path_indices=output["candidate_path_indices"],
+                candidate_velocity_indices=output["candidate_velocity_indices"],
+                batch=batch,
+                teacher_config=teacher_config,
+            )
+
             loss_dict = compute_model_candidate_losses(
                 path_scores=output["path_scores"],
                 velocity_scores=output["velocity_scores"],
                 trajectory_scores=output["trajectory_scores"],
-                candidate_trajectories=output["candidate_trajectories"],
                 teacher_path_probs=batch["teacher_path_probs"],
-                target_trajectory=batch["target_trajectory"],
-                target_trajectory_mask=batch["target_trajectory_mask"],
+                teacher_candidate_probs=teacher_candidate_targets["probs"],
                 teacher_velocity_index=batch["velocity_index"],
+                candidate_collision=teacher_candidate_targets["collision"],
             )
 
         optimizer.zero_grad()
@@ -175,6 +310,25 @@ def train_one_epoch(
         velocity_acc = compute_accuracy(
             output["velocity_scores"], batch["velocity_index"]
         )
+        best_candidate = output["trajectory_scores"].argmax(dim=-1)
+        batch_indices = torch.arange(
+            output["trajectory_scores"].shape[0],
+            device=output["trajectory_scores"].device,
+        )
+        pred_collision_rate = (
+            teacher_candidate_targets["collision"][
+                batch_indices,
+                best_candidate,
+            ]
+            .float()
+            .mean()
+        )
+        candidate_safe_rate = (~teacher_candidate_targets["collision"]).float().mean()
+        pred_teacher_cost = teacher_candidate_targets["costs"][
+            batch_indices,
+            best_candidate,
+        ].mean()
+
         candidate_metrics = compute_candidate_metrics(
             trajectory_scores=output["trajectory_scores"],
             candidate_path_indices=output["candidate_path_indices"],
@@ -192,9 +346,13 @@ def train_one_epoch(
             "path_loss": loss_dict["path_loss"],
             "velocity_loss": loss_dict["velocity_loss"],
             "trajectory_loss": loss_dict["trajectory_loss"],
+            "collision_margin_loss": loss_dict["collision_margin_loss"],
             "path_acc": path_acc,
             "velocity_acc": velocity_acc,
             **candidate_metrics,
+            "pred_collision_rate": pred_collision_rate,
+            "candidate_safe_rate": candidate_safe_rate,
+            "pred_teacher_cost": pred_teacher_cost,
         }
 
         for key, value in batch_metrics.items():
@@ -262,6 +420,7 @@ def main() -> None:
         eta_min=1e-5,
     )
 
+    best_collision_rate = float("inf")
     best_traj_l2 = float("inf")
 
     for epoch in range(1, NUM_EPOCHS + 1):
@@ -270,12 +429,22 @@ def main() -> None:
             dataloader=dataloader,
             optimizer=optimizer,
             vocab=vocab,
+            teacher_vocab=dataset.vocab,
             device=device,
+            teacher_config=dataset.teacher_config,
         )
         scheduler.step()
 
-        is_best = metrics["traj_l2_error"] < best_traj_l2
+        collision_improved = (
+            metrics["pred_collision_rate"] < best_collision_rate - 1.0e-6
+        )
+        same_collision = (
+            abs(metrics["pred_collision_rate"] - best_collision_rate) <= 1.0e-6
+        )
+        l2_improved = metrics["traj_l2_error"] < best_traj_l2
+        is_best = collision_improved or (same_collision and l2_improved)
         if is_best:
+            best_collision_rate = metrics["pred_collision_rate"]
             best_traj_l2 = metrics["traj_l2_error"]
             save_checkpoint(
                 path=BEST_CHECKPOINT_PATH,
@@ -295,6 +464,7 @@ def main() -> None:
             f"path {metrics['path_loss']:.4f} | "
             f"vel {metrics['velocity_loss']:.4f} | "
             f"traj {metrics['trajectory_loss']:.4f} | "
+            f"margin {metrics['collision_margin_loss']:.4f} | "
             f"path_acc {metrics['path_acc']:.3f} | "
             f"vel_acc {metrics['velocity_acc']:.3f} | "
             f"topk_path {metrics['topk_path_recall']:.3f} | "
@@ -302,11 +472,15 @@ def main() -> None:
             f"traj_vel {metrics['trajectory_velocity_acc']:.3f} | "
             f"traj_pair {metrics['trajectory_pair_acc']:.3f} | "
             f"traj_l2 {metrics['traj_l2_error']:.3f} | "
-            f"end_l2 {metrics['traj_endpoint_error']:.3f}"
+            f"end_l2 {metrics['traj_endpoint_error']:.3f} | "
+            f"collision {metrics['pred_collision_rate']:.3f} | "
+            f"safe {metrics['candidate_safe_rate']:.3f} | "
+            f"pred_cost {metrics['pred_teacher_cost']:.1f}"
             f"{best_mark}"
         )
 
     print(f"best checkpoint: {BEST_CHECKPOINT_PATH}")
+    print(f"best collision_rate: {best_collision_rate:.6f}")
     print(f"best traj_l2: {best_traj_l2:.6f}")
 
 

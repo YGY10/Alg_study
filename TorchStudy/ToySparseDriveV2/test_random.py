@@ -408,9 +408,9 @@ def build_candidate_diagnostics(
     teacher_candidate_rank = None
     if in_teacher_candidate_set:
         candidate_order = np.argsort(candidate_costs)
-        teacher_candidate_rank = int(
-            np.where(candidate_order == matched_teacher_candidate[0])[0][0]
-        ) + 1
+        teacher_candidate_rank = (
+            int(np.where(candidate_order == matched_teacher_candidate[0])[0][0]) + 1
+        )
 
     path_costs = reference["path_costs"]
     path_scores = output["path_scores"][0].detach().cpu().numpy()
