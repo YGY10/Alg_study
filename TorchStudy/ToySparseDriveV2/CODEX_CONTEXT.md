@@ -104,10 +104,17 @@ goal_xy = route_path[-1, :2]
 So `goal_xy` is random through the randomly selected path endpoint. It is not
 sampled independently in continuous space.
 
-Current obstacle sampling is globally random:
+Current obstacle sampling is mixed:
 
 ```text
 num obstacles: 4 to 12
+70% route-aware obstacles
+30% global random obstacles
+```
+
+Global random obstacles use:
+
+```text
 x: grid_config.x_min + 8 to grid_config.x_max - 8
 y: grid_config.y_min + 8 to grid_config.y_max - 8
 length: 3 to 8
@@ -116,9 +123,15 @@ vx: -4 to 4
 vy: -3 to 3
 ```
 
-This is enough for basic training but not ideal for hard collision-boundary
-learning. Future improvement: add route-aware obstacle sampling near the route,
-while keeping some global random obstacles.
+Route-aware obstacles are sampled near the selected route:
+
+```text
+route anchor x: 10m to 45m forward
+center_x = route_x + uniform(-3m, 3m)
+center_y = route_y + uniform(-10m, 10m)
+```
+
+This was added to increase route-adjacent hard collision-boundary cases.
 
 ## Teacher Strategy
 
@@ -451,12 +464,9 @@ model_topk
 collision_margin_weight = 1.0
 ```
 
-4. Add a route-aware hard obstacle sampler:
-
-```text
-70% obstacles near route / future ego area
-30% global random obstacles
-```
+4. Route-aware hard obstacle sampling has been added. If collision still
+   plateaus, tune its probability/ranges or add a more structured lane-crossing
+   dynamic obstacle sampler.
 
 5. Add an evaluation script that runs many fixed random/custom cases and reports:
 
@@ -526,3 +536,63 @@ test_random.py
 The latest major change was adding explicit `collision_margin_loss` and safety
 first checkpoint selection. The latest known checkpoint is epoch 75 with about
 6.25% selected-trajectory collision rate on training metrics.
+
+## 2026-06-23 Update: Explicit Collision Head
+
+ToySparseDriveV2 now follows SparseDriveV2 more closely by keeping trajectory
+candidates and adding an explicit candidate-level safety head instead of relying
+only on one scalar `trajectory_scores` output.
+
+Changed files:
+
+- `models/model.py`
+  - Added `no_collision_head` beside `trajectory_score_head`.
+  - `score_trajectories()` now returns `no_collision_logits` with shape `[B, C]`.
+
+- `losses/losses.py`
+  - `compute_model_candidate_losses()` now accepts `no_collision_logits`.
+  - Added BCE loss against `~candidate_collision` as `no_collision_loss`.
+  - `collision_margin_loss` now uses combined planning scores:
+    `planning_scores = trajectory_scores + safety_score_weight * no_collision_logits`.
+
+- `train.py`
+  - Added `SAFETY_SCORE_WEIGHT = 2.0`.
+  - Final candidate selection and metrics now use `planning_scores`, not raw
+    `trajectory_scores`.
+  - Logs new metrics: `no_col` and `no_col_acc`.
+
+- `test_random.py`
+  - Uses the same `planning_scores` for prediction.
+  - Prints raw trajectory score, no-collision logit, and combined planning score
+    for reference and prediction candidates.
+
+Important: old checkpoints do not contain `no_collision_head` parameters. Retrain
+after this architecture change before running meaningful `test_random.py` results.
+
+## 2026-06-23 Update: Safety Weight Reduced + Raw Metrics
+
+After observing that `SAFETY_SCORE_WEIGHT = 2.0` made planning very safe but
+kept `traj_l2` high (~9-10m after 100+ epochs), the weight was reduced:
+
+```python
+SAFETY_SCORE_WEIGHT = 1.0
+```
+
+This was changed in both `train.py` and `test_random.py`.
+
+`train.py` now logs raw trajectory-score argmax metrics alongside planning-score
+argmax metrics:
+
+- `raw_col`: collision rate from raw `trajectory_scores.argmax()`
+- `raw_l2`: trajectory L2 from raw `trajectory_scores.argmax()`
+- `raw_pair`: pair accuracy from raw `trajectory_scores.argmax()`
+
+Existing `collision`, `traj_l2`, and `traj_pair` are still computed from:
+
+```python
+planning_scores = trajectory_scores + SAFETY_SCORE_WEIGHT * no_collision_logits
+```
+
+Use these paired metrics to diagnose whether the safety head is improving final
+selection or overpowering the geometric/teacher trajectory score.
+

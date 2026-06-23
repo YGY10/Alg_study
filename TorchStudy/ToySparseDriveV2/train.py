@@ -30,15 +30,16 @@ from teacher import (
 )
 from vocab import SparseDriveVocab
 
-BATCH_SIZE = 16
+BATCH_SIZE = 18
 NUM_SAMPLES = 1024
 NUM_EPOCHS = 200
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
-NUM_WORKERS = 4
+NUM_WORKERS = 6
 
 CHECKPOINT_DIR = PROJECT_ROOT / "outputs" / "checkpoints"
 BEST_CHECKPOINT_PATH = CHECKPOINT_DIR / "best_model.pt"
+SAFETY_SCORE_WEIGHT = 1.0
 
 
 def move_batch_to_device(
@@ -54,6 +55,23 @@ def compute_accuracy(
 ) -> torch.Tensor:
     prediction = scores.argmax(dim=-1)
     return (prediction == target_index).float().mean()
+
+
+def compute_planning_scores(
+    trajectory_scores: torch.Tensor,
+    no_collision_logits: torch.Tensor,
+    safety_score_weight: float = SAFETY_SCORE_WEIGHT,
+) -> torch.Tensor:
+    return trajectory_scores + no_collision_logits * safety_score_weight
+
+
+def compute_no_collision_accuracy(
+    no_collision_logits: torch.Tensor,
+    candidate_collision: torch.Tensor,
+) -> torch.Tensor:
+    prediction_is_safe = no_collision_logits >= 0.0
+    target_is_safe = ~candidate_collision.bool()
+    return (prediction_is_safe == target_is_safe).float().mean()
 
 
 def compute_candidate_metrics(
@@ -248,6 +266,7 @@ def train_one_epoch(
         "path_loss": 0.0,
         "velocity_loss": 0.0,
         "trajectory_loss": 0.0,
+        "no_collision_loss": 0.0,
         "collision_margin_loss": 0.0,
         "path_acc": 0.0,
         "velocity_acc": 0.0,
@@ -260,7 +279,11 @@ def train_one_epoch(
         "traj_endpoint_error": 0.0,
         "pred_collision_rate": 0.0,
         "candidate_safe_rate": 0.0,
+        "no_collision_acc": 0.0,
         "pred_teacher_cost": 0.0,
+        "raw_pred_collision_rate": 0.0,
+        "raw_trajectory_pair_acc": 0.0,
+        "raw_traj_l2_error": 0.0,
     }
     num_batches = 0
 
@@ -289,10 +312,12 @@ def train_one_epoch(
                 path_scores=output["path_scores"],
                 velocity_scores=output["velocity_scores"],
                 trajectory_scores=output["trajectory_scores"],
+                no_collision_logits=output["no_collision_logits"],
                 teacher_path_probs=batch["teacher_path_probs"],
                 teacher_candidate_probs=teacher_candidate_targets["probs"],
                 teacher_velocity_index=batch["velocity_index"],
                 candidate_collision=teacher_candidate_targets["collision"],
+                safety_score_weight=SAFETY_SCORE_WEIGHT,
             )
 
         optimizer.zero_grad()
@@ -310,10 +335,14 @@ def train_one_epoch(
         velocity_acc = compute_accuracy(
             output["velocity_scores"], batch["velocity_index"]
         )
-        best_candidate = output["trajectory_scores"].argmax(dim=-1)
+        planning_scores = compute_planning_scores(
+            trajectory_scores=output["trajectory_scores"],
+            no_collision_logits=output["no_collision_logits"],
+        )
+        best_candidate = planning_scores.argmax(dim=-1)
         batch_indices = torch.arange(
-            output["trajectory_scores"].shape[0],
-            device=output["trajectory_scores"].device,
+            planning_scores.shape[0],
+            device=planning_scores.device,
         )
         pred_collision_rate = (
             teacher_candidate_targets["collision"][
@@ -328,8 +357,23 @@ def train_one_epoch(
             batch_indices,
             best_candidate,
         ].mean()
+        no_collision_acc = compute_no_collision_accuracy(
+            no_collision_logits=output["no_collision_logits"],
+            candidate_collision=teacher_candidate_targets["collision"],
+        )
 
         candidate_metrics = compute_candidate_metrics(
+            trajectory_scores=planning_scores,
+            candidate_path_indices=output["candidate_path_indices"],
+            candidate_velocity_indices=output["candidate_velocity_indices"],
+            candidate_trajectories=output["candidate_trajectories"],
+            model_topk_path_indices=output["model_topk_path_indices"],
+            target_trajectory=batch["target_trajectory"],
+            target_trajectory_mask=batch["target_trajectory_mask"],
+            target_path_index=batch["path_index"],
+            target_velocity_index=batch["velocity_index"],
+        )
+        raw_candidate_metrics = compute_candidate_metrics(
             trajectory_scores=output["trajectory_scores"],
             candidate_path_indices=output["candidate_path_indices"],
             candidate_velocity_indices=output["candidate_velocity_indices"],
@@ -340,19 +384,33 @@ def train_one_epoch(
             target_path_index=batch["path_index"],
             target_velocity_index=batch["velocity_index"],
         )
+        raw_best_candidate = output["trajectory_scores"].argmax(dim=-1)
+        raw_pred_collision_rate = (
+            teacher_candidate_targets["collision"][
+                batch_indices,
+                raw_best_candidate,
+            ]
+            .float()
+            .mean()
+        )
 
         batch_metrics = {
             "loss": loss_dict["loss"],
             "path_loss": loss_dict["path_loss"],
             "velocity_loss": loss_dict["velocity_loss"],
             "trajectory_loss": loss_dict["trajectory_loss"],
+            "no_collision_loss": loss_dict["no_collision_loss"],
             "collision_margin_loss": loss_dict["collision_margin_loss"],
             "path_acc": path_acc,
             "velocity_acc": velocity_acc,
             **candidate_metrics,
             "pred_collision_rate": pred_collision_rate,
             "candidate_safe_rate": candidate_safe_rate,
+            "no_collision_acc": no_collision_acc,
             "pred_teacher_cost": pred_teacher_cost,
+            "raw_pred_collision_rate": raw_pred_collision_rate,
+            "raw_trajectory_pair_acc": raw_candidate_metrics["trajectory_pair_acc"],
+            "raw_traj_l2_error": raw_candidate_metrics["traj_l2_error"],
         }
 
         for key, value in batch_metrics.items():
@@ -464,6 +522,7 @@ def main() -> None:
             f"path {metrics['path_loss']:.4f} | "
             f"vel {metrics['velocity_loss']:.4f} | "
             f"traj {metrics['trajectory_loss']:.4f} | "
+            f"no_col {metrics['no_collision_loss']:.4f} | "
             f"margin {metrics['collision_margin_loss']:.4f} | "
             f"path_acc {metrics['path_acc']:.3f} | "
             f"vel_acc {metrics['velocity_acc']:.3f} | "
@@ -473,8 +532,12 @@ def main() -> None:
             f"traj_pair {metrics['trajectory_pair_acc']:.3f} | "
             f"traj_l2 {metrics['traj_l2_error']:.3f} | "
             f"end_l2 {metrics['traj_endpoint_error']:.3f} | "
+            f"raw_l2 {metrics['raw_traj_l2_error']:.3f} | "
             f"collision {metrics['pred_collision_rate']:.3f} | "
+            f"raw_col {metrics['raw_pred_collision_rate']:.3f} | "
+            f"raw_pair {metrics['raw_trajectory_pair_acc']:.3f} | "
             f"safe {metrics['candidate_safe_rate']:.3f} | "
+            f"no_col_acc {metrics['no_collision_acc']:.3f} | "
             f"pred_cost {metrics['pred_teacher_cost']:.1f}"
             f"{best_mark}"
         )

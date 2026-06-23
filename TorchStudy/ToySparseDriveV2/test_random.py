@@ -36,6 +36,7 @@ from vocab import SparseDriveVocab
 
 CHECKPOINT_PATH = PROJECT_ROOT / "outputs" / "checkpoints" / "best_model.pt"
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / "test_random"
+SAFETY_SCORE_WEIGHT = 1.0
 
 # Edit this dict to test custom ego state.
 # xy/yaw are kept for Teacher scoring. The current model was trained in ego frame,
@@ -212,10 +213,11 @@ def select_prediction(
     output: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
     trajectory_scores = output["trajectory_scores"]
-    best_candidate = trajectory_scores.argmax(dim=-1)
+    planning_scores = trajectory_scores + output["no_collision_logits"] * SAFETY_SCORE_WEIGHT
+    best_candidate = planning_scores.argmax(dim=-1)
     batch_indices = torch.arange(
-        trajectory_scores.shape[0],
-        device=trajectory_scores.device,
+        planning_scores.shape[0],
+        device=planning_scores.device,
     )
 
     return {
@@ -416,6 +418,8 @@ def build_candidate_diagnostics(
     path_scores = output["path_scores"][0].detach().cpu().numpy()
     velocity_scores = output["velocity_scores"][0].detach().cpu().numpy()
     trajectory_scores = output["trajectory_scores"][0].detach().cpu().numpy()
+    no_collision_logits = output["no_collision_logits"][0].detach().cpu().numpy()
+    planning_scores = trajectory_scores + no_collision_logits * SAFETY_SCORE_WEIGHT
     candidate_path_indices = output["candidate_path_indices"][0].detach().cpu().numpy()
     candidate_velocity_indices = (
         output["candidate_velocity_indices"][0].detach().cpu().numpy()
@@ -428,8 +432,13 @@ def build_candidate_diagnostics(
         & (candidate_velocity_indices == ref_velocity_index)
     )[0]
     ref_model_trajectory_score = None
+    ref_model_no_collision_logit = None
+    ref_model_planning_score = None
     if len(ref_model_candidate) > 0:
-        ref_model_trajectory_score = float(trajectory_scores[ref_model_candidate[0]])
+        ref_candidate_index = ref_model_candidate[0]
+        ref_model_trajectory_score = float(trajectory_scores[ref_candidate_index])
+        ref_model_no_collision_logit = float(no_collision_logits[ref_candidate_index])
+        ref_model_planning_score = float(planning_scores[ref_candidate_index])
 
     pred_cost = float(scored_pred_path["cost"][pred_local_index])
     ref_cost = float(reference["cost"])
@@ -467,6 +476,10 @@ def build_candidate_diagnostics(
         ),
         "pred_model_trajectory_score": float(trajectory_scores[pred_candidate_index]),
         "ref_model_trajectory_score": ref_model_trajectory_score,
+        "pred_model_no_collision_logit": float(no_collision_logits[pred_candidate_index]),
+        "ref_model_no_collision_logit": ref_model_no_collision_logit,
+        "pred_model_planning_score": float(planning_scores[pred_candidate_index]),
+        "ref_model_planning_score": ref_model_planning_score,
     }
 
 
@@ -718,6 +731,16 @@ def main() -> None:
         "model_trajectory_score "
         f"ref={optional_float(diagnostics['ref_model_trajectory_score'])} "
         f"pred={diagnostics['pred_model_trajectory_score']:.4f}"
+    )
+    print(
+        "model_no_collision_logit "
+        f"ref={optional_float(diagnostics['ref_model_no_collision_logit'])} "
+        f"pred={diagnostics['pred_model_no_collision_logit']:.4f}"
+    )
+    print(
+        "model_planning_score "
+        f"ref={optional_float(diagnostics['ref_model_planning_score'])} "
+        f"pred={diagnostics['pred_model_planning_score']:.4f}"
     )
     print(f"traj_l2_to_reference: {traj_l2:.4f}")
     print(f"endpoint_l2_to_reference: {endpoint_l2:.4f}")

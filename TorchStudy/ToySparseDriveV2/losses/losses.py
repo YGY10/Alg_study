@@ -202,23 +202,38 @@ def compute_model_candidate_losses(
     path_scores: torch.Tensor,
     velocity_scores: torch.Tensor,
     trajectory_scores: torch.Tensor,
+    no_collision_logits: torch.Tensor | None,
     teacher_path_probs: torch.Tensor,
     teacher_candidate_probs: torch.Tensor,
     teacher_velocity_index: torch.Tensor,
     candidate_collision: torch.Tensor | None = None,
     velocity_loss_weight: float = 0.0,
     trajectory_loss_weight: float = 1.0,
+    no_collision_loss_weight: float = 1.0,
     collision_margin_weight: float = 0.5,
     collision_margin: float = 2.0,
+    safety_score_weight: float = 2.0,
 ) -> dict[str, torch.Tensor]:
     path_loss = soft_cross_entropy(path_scores, teacher_path_probs)
     velocity_loss = F.cross_entropy(velocity_scores, teacher_velocity_index)
     trajectory_loss = soft_cross_entropy(trajectory_scores, teacher_candidate_probs)
+
+    if no_collision_logits is None or candidate_collision is None:
+        no_collision_loss = trajectory_scores.sum() * 0.0
+        planning_scores = trajectory_scores
+    else:
+        no_collision_target = (~candidate_collision.bool()).float()
+        no_collision_loss = F.binary_cross_entropy_with_logits(
+            no_collision_logits,
+            no_collision_target,
+        )
+        planning_scores = trajectory_scores + no_collision_logits * safety_score_weight
+
     if candidate_collision is None:
         collision_margin_loss = trajectory_scores.sum() * 0.0
     else:
         collision_margin_loss = compute_collision_margin_loss(
-            trajectory_scores=trajectory_scores,
+            trajectory_scores=planning_scores,
             candidate_collision=candidate_collision,
             margin=collision_margin,
         )
@@ -227,6 +242,7 @@ def compute_model_candidate_losses(
         path_loss
         + trajectory_loss * trajectory_loss_weight
         + velocity_loss * velocity_loss_weight
+        + no_collision_loss * no_collision_loss_weight
         + collision_margin_loss * collision_margin_weight
     )
 
@@ -235,6 +251,7 @@ def compute_model_candidate_losses(
         "path_loss": path_loss,
         "velocity_loss": velocity_loss,
         "trajectory_loss": trajectory_loss,
+        "no_collision_loss": no_collision_loss,
         "collision_margin_loss": collision_margin_loss,
     }
 

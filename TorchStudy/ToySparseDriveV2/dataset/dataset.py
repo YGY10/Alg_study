@@ -61,6 +61,76 @@ def sample_obstacle(
     )
 
 
+def sample_route_aware_obstacle(
+    rng: np.random.Generator,
+    grid_config: GridConfig,
+    route_path: np.ndarray,
+    x_min_forward: float = 10.0,
+    x_max_forward: float = 45.0,
+    lateral_range: float = 10.0,
+    longitudinal_jitter: float = 3.0,
+) -> Obstacle:
+    route_xy = route_path[:, :2]
+    candidate_mask = (
+        (route_xy[:, 0] >= x_min_forward)
+        & (route_xy[:, 0] <= x_max_forward)
+    )
+    candidate_points = route_xy[candidate_mask]
+    if len(candidate_points) == 0:
+        return sample_obstacle(rng, grid_config)
+
+    anchor = candidate_points[int(rng.integers(0, len(candidate_points)))]
+    center_xy = np.array(
+        [
+            anchor[0] + rng.uniform(-longitudinal_jitter, longitudinal_jitter),
+            anchor[1] + rng.uniform(-lateral_range, lateral_range),
+        ],
+        dtype=np.float32,
+    )
+    center_xy[0] = np.clip(
+        center_xy[0],
+        grid_config.x_min + 8.0,
+        grid_config.x_max - 8.0,
+    )
+    center_xy[1] = np.clip(
+        center_xy[1],
+        grid_config.y_min + 8.0,
+        grid_config.y_max - 8.0,
+    )
+
+    size_xy = (
+        float(rng.uniform(3.0, 8.0)),
+        float(rng.uniform(2.0, 5.0)),
+    )
+    velocity_xy = np.array(
+        [
+            rng.uniform(-4.0, 4.0),
+            rng.uniform(-3.0, 3.0),
+        ],
+        dtype=np.float32,
+    )
+    return Obstacle(
+        center_xy=center_xy,
+        size_xy=size_xy,
+        velocity_xy=velocity_xy,
+    )
+
+
+def sample_mixed_obstacle(
+    rng: np.random.Generator,
+    grid_config: GridConfig,
+    route_path: np.ndarray,
+    route_aware_probability: float = 0.7,
+) -> Obstacle:
+    if rng.random() < route_aware_probability:
+        return sample_route_aware_obstacle(
+            rng=rng,
+            grid_config=grid_config,
+            route_path=route_path,
+        )
+    return sample_obstacle(rng, grid_config)
+
+
 def rasterize_dynamic_obstacles(
     input_grid: np.ndarray,
     obstacles: list[Obstacle],
@@ -171,7 +241,13 @@ class ToySparseDriveV2Dataset(Dataset):
 
         num_obstacles = int(rng.integers(self.min_obstacles, self.max_obstacles + 1))
         obstacles = [
-            sample_obstacle(rng, self.grid_config) for _ in range(num_obstacles)
+            sample_mixed_obstacle(
+                rng=rng,
+                grid_config=self.grid_config,
+                route_path=route_path,
+                route_aware_probability=0.7,
+            )
+            for _ in range(num_obstacles)
         ]
 
         teacher_output = score_teacher_candidates(

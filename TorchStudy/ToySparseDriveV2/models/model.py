@@ -126,6 +126,11 @@ class ToySparseDriveV2Model(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
+        self.no_collision_head = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
 
     def xy_to_sample_grid(self, xy: torch.Tensor) -> torch.Tensor:
         """Convert xy coordinates to grid_sample coordinates.
@@ -362,6 +367,7 @@ class ToySparseDriveV2Model(nn.Module):
         )
 
         trajectory_scores = self.trajectory_score_head(trajectory_context).squeeze(-1)
+        no_collision_logits = self.no_collision_head(trajectory_context).squeeze(-1)
 
         velocity_indices = torch.arange(
             num_velocity,
@@ -380,6 +386,7 @@ class ToySparseDriveV2Model(nn.Module):
 
         return {
             "trajectory_scores": trajectory_scores,
+            "no_collision_logits": no_collision_logits,
             "candidate_trajectories": candidate_trajectories,
             "candidate_path_indices": candidate_path_indices.reshape(
                 batch_size,
