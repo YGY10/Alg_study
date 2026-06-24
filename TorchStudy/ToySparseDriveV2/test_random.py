@@ -45,7 +45,7 @@ SAFETY_SCORE_WEIGHT = 1.0
 CUSTOM_EGO_STATE = {
     "xy": (0.0, 0.0),
     "yaw": 0.0,
-    "speed": 0.0,
+    "speed": 1.0,
     "size_xy": (4.8, 2.0),
 }
 
@@ -65,37 +65,42 @@ CUSTOM_OBSTACLES = [
         "velocity_xy": (1.0, 0.0),
     },
     {
-        "center_xy": (20.0, -4.0),
+        "center_xy": (25.0, -4.0),
         "size_xy": (5.0, 2.5),
         "velocity_xy": (3.0, 0.0),
     },
-    # {
-    #     "center_xy": (10.0, 4.0),
-    #     "size_xy": (5.0, 2.5),
-    #     "velocity_xy": (1.0, 0.0),
-    # },
-    # {
-    #     "center_xy": (15.0, -6.0),
-    #     "size_xy": (4.5, 2.2),
-    #     "velocity_xy": (1.0, 0.0),
-    # },
-    # {
-    #     "center_xy": (15.0, -3.0),
-    #     "size_xy": (4.5, 2.2),
-    #     "velocity_xy": (1.0, 0.0),
-    # },
-    # {
-    #     "center_xy": (15.0, 0.0),
-    #     "size_xy": (5.0, 2.5),
-    #     "velocity_xy": (1.0, 0.0),
-    # },
     {
-        "center_xy": (15.0, 2.0),
+        "center_xy": (10.0, 6.0),
         "size_xy": (5.0, 2.5),
         "velocity_xy": (1.0, 0.0),
     },
     {
-        "center_xy": (15.0, 6.0),
+        "center_xy": (18.0, -14.0),
+        "size_xy": (4.5, 2.2),
+        "velocity_xy": (0.2, 0.0),
+    },
+    {
+        "center_xy": (18.0, -10.0),
+        "size_xy": (4.5, 2.2),
+        "velocity_xy": (0.2, 0.0),
+    },
+    {
+        "center_xy": (18.0, -3.0),
+        "size_xy": (4.5, 2.2),
+        "velocity_xy": (1.0, 0.0),
+    },
+    {
+        "center_xy": (18.0, 0.0),
+        "size_xy": (5.0, 2.5),
+        "velocity_xy": (1.0, 0.0),
+    },
+    {
+        "center_xy": (18.0, 8.0),
+        "size_xy": (5.0, 2.5),
+        "velocity_xy": (1.0, 0.0),
+    },
+    {
+        "center_xy": (25.0, 5.0),
         "size_xy": (5.0, 2.5),
         "velocity_xy": (1.0, 0.0),
     },
@@ -142,6 +147,7 @@ def sample_obstacles_to_dicts(
     for i in np.where(mask > 0.5)[0]:
         obstacles.append(
             {
+                "id": f"obs{i}",
                 "center_xy": (float(centers[i, 0]), float(centers[i, 1])),
                 "size_xy": (float(sizes[i, 0]), float(sizes[i, 1])),
                 "velocity_xy": (float(velocities[i, 0]), float(velocities[i, 1])),
@@ -213,7 +219,9 @@ def select_prediction(
     output: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
     trajectory_scores = output["trajectory_scores"]
-    planning_scores = trajectory_scores + output["no_collision_logits"] * SAFETY_SCORE_WEIGHT
+    planning_scores = (
+        trajectory_scores + output["no_collision_logits"] * SAFETY_SCORE_WEIGHT
+    )
     best_candidate = planning_scores.argmax(dim=-1)
     batch_indices = torch.arange(
         planning_scores.shape[0],
@@ -316,6 +324,10 @@ def override_obstacles(
     sample["obstacle_sizes"] = sizes
     sample["obstacle_velocities"] = velocities
     sample["obstacle_mask"] = mask
+    sample["obstacle_ids"] = [
+        str(obstacle.get("id", f"obs{obstacle_index}"))
+        for obstacle_index, obstacle in enumerate(obstacles[:max_obstacles])
+    ]
     sample["input_grid"] = torch.from_numpy(input_grid).float()
 
     return sample
@@ -476,7 +488,9 @@ def build_candidate_diagnostics(
         ),
         "pred_model_trajectory_score": float(trajectory_scores[pred_candidate_index]),
         "ref_model_trajectory_score": ref_model_trajectory_score,
-        "pred_model_no_collision_logit": float(no_collision_logits[pred_candidate_index]),
+        "pred_model_no_collision_logit": float(
+            no_collision_logits[pred_candidate_index]
+        ),
         "ref_model_no_collision_logit": ref_model_no_collision_logit,
         "pred_model_planning_score": float(planning_scores[pred_candidate_index]),
         "ref_model_planning_score": ref_model_planning_score,
@@ -521,6 +535,7 @@ def plot_prediction(
     obstacle_sizes = sample["obstacle_sizes"].numpy()
     obstacle_velocities = sample["obstacle_velocities"].numpy()
     obstacle_mask = sample["obstacle_mask"].numpy()
+    obstacle_ids = sample.get("obstacle_ids")
 
     fig, ax = plt.subplots(figsize=(9, 8))
 
@@ -535,6 +550,28 @@ def plot_prediction(
             size_xy,
             color="#666666",
             alpha=0.45,
+        )
+        obstacle_id = (
+            obstacle_ids[obstacle_index]
+            if obstacle_ids is not None and obstacle_index < len(obstacle_ids)
+            else f"obs{obstacle_index}"
+        )
+        ax.annotate(
+            obstacle_id,
+            xy=(float(center_xy[1]), float(center_xy[0])),
+            xytext=(4, 4),
+            textcoords="offset points",
+            fontsize=8,
+            fontweight="bold",
+            color="white",
+            bbox={
+                "boxstyle": "round,pad=0.18",
+                "facecolor": "#333333",
+                "edgecolor": "white",
+                "linewidth": 0.5,
+                "alpha": 0.9,
+            },
+            zorder=10,
         )
         for time_s in TIME_STEPS:
             future_center = center_xy + velocity_xy * float(time_s)
@@ -679,6 +716,15 @@ def main() -> None:
     print(f"ego speed: {ego_state.speed}")
     print(f"ego size_xy: {ego_state.size_xy}")
     print(f"goal_xy: {sample['goal_xy'].tolist()}")
+    print("obstacles:")
+    for obstacle_index, obstacle in enumerate(active_obstacles):
+        obstacle_id = str(obstacle.get("id", f"obs{obstacle_index}"))
+        print(
+            f"  {obstacle_id}: "
+            f"center_xy={tuple(obstacle['center_xy'])} "
+            f"size_xy={tuple(obstacle['size_xy'])} "
+            f"velocity_xy={tuple(obstacle['velocity_xy'])}"
+        )
     print(f"old target path: {int(sample['path_index'])}")
     print(f"old target velocity: {int(sample['velocity_index'])}")
     print(f"reference path: {reference['path_index']}")

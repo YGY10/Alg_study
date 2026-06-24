@@ -18,7 +18,10 @@ for path in (
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from dataset import ToySparseDriveV2Dataset
+try:
+    from dataset.dataset import ToySparseDriveV2Dataset
+except ModuleNotFoundError:
+    from dataset import ToySparseDriveV2Dataset
 from losses import compute_model_candidate_losses
 from model import ToySparseDriveV2Model
 from teacher import (
@@ -39,6 +42,7 @@ NUM_WORKERS = 6
 
 CHECKPOINT_DIR = PROJECT_ROOT / "outputs" / "checkpoints"
 BEST_CHECKPOINT_PATH = CHECKPOINT_DIR / "best_model.pt"
+TEACHER_CACHE_DIR = PROJECT_ROOT / "cache" / "teacher_v1"
 SAFETY_SCORE_WEIGHT = 1.0
 
 
@@ -170,6 +174,7 @@ def build_teacher_candidate_targets_for_batch(
                         float(obstacle_sizes_np[batch_index, obstacle_index, 1]),
                     ),
                     velocity_xy=obstacle_velocities_np[batch_index, obstacle_index],
+                    id=f"batch{batch_index}_obs{obstacle_index}",
                 )
             )
 
@@ -455,7 +460,22 @@ def main() -> None:
     dataset = ToySparseDriveV2Dataset(
         num_samples=NUM_SAMPLES,
         seed_offset=0,
+        teacher_cache_dir=TEACHER_CACHE_DIR,
+        require_teacher_cache=True,
     )
+    missing_cache_paths = [
+        dataset.teacher_cache_path(index)
+        for index in range(len(dataset))
+        if not dataset.teacher_cache_path(index).is_file()
+    ]
+    if missing_cache_paths:
+        raise FileNotFoundError(
+            f"Teacher cache is incomplete: {len(missing_cache_paths)} missing files. "
+            f"First missing file: {missing_cache_paths[0]}. "
+            "Run: cd dataset && python build_teacher_cache.py "
+            "--num-samples 1024 --output-dir ../cache/teacher_v1"
+        )
+
     dataloader = DataLoader(
         dataset,
         batch_size=BATCH_SIZE,

@@ -596,3 +596,127 @@ planning_scores = trajectory_scores + SAFETY_SCORE_WEIGHT * no_collision_logits
 Use these paired metrics to diagnose whether the safety head is improving final
 selection or overpowering the geometric/teacher trajectory score.
 
+## 2026-06-24 Update: Teacher Dynamics Feasibility
+
+`dataset/teacher.py` now checks velocity-vocab compatibility with the current ego speed.
+
+New `TeacherConfig` fields:
+
+```python
+max_accel = 3.0
+max_decel = 5.0
+dynamics_invalid_weight = 1.0e5
+accel_violation_weight = 20.0
+```
+
+Both the transition from current ego speed to the first future velocity and all
+subsequent velocity steps are checked. Invalid profiles receive a large penalty,
+while continuous acceleration violation and the existing acceleration/jerk costs
+remain available for ranking and debugging. Teacher top-k logs now print
+`dyn_invalid`, `init_violation`, and `accel_violation`.
+
+Validation with ego speed 1 m/s selected v207 with initial acceleration about
+1.996 m/s^2 and `dyn_invalid=False`, replacing the previously selected v151
+profile that jumped to about 9.9 m/s at t=0.5 s.
+
+## 2026-06-24 Update: Route Cost Uses Frenet Lateral Offset
+
+Teacher route cost no longer uses nearest distance to discrete route points.
+Each path/trajectory point is projected exactly onto the nearest route polyline
+segment, producing signed Frenet lateral offset `l` (`l>0` left, `l<0` right).
+
+Trajectory route cost is the weighted mean of `abs(l)` over valid trajectory
+points. Weights increase linearly from `0.5` to `1.5`, so later points matter
+more and trajectories are encouraged to return toward the route after avoidance.
+Path coarse filtering now uses the same segment-projection definition with an
+unweighted mean `abs(l)`. `route_l` is included in teacher debug output.
+
+Exact segment projection is used instead of route densification because it gives
+a continuous projection independent of route point spacing.
+
+
+
+## Full-Search Teacher Cache (2026-06-24)
+
+The old dataset Teacher used path coarse filtering before combining paths with
+velocity vocab. That could remove a route-following path which would be safe
+when paired with a braking velocity. This old behavior is now only a debugging
+fallback.
+
+The authoritative training labels now come from an offline full search:
+
+```text
+1024 paths x 256 velocities = 262,144 trajectories per scene
+```
+
+Implementation:
+
+- `dataset/teacher.py::score_all_trajectories_chunked`
+  scores every path/velocity pair in path chunks and only retains the global
+  Top-K plus the best cost for each of the 1024 paths.
+- `dataset/build_teacher_cache.py`
+  generates resumable per-sample `.npz` caches.
+- `dataset/dataset.py`
+  deterministically regenerates the scene and loads the corresponding cached
+  labels. It validates cache version, sample index, seed offset, and route path.
+- `train.py`
+  requires `cache/teacher_v1`; it does not silently fall back to the old
+  coarse-filter Teacher.
+
+Generate the complete cache before training:
+
+```bash
+cd TorchStudy/ToySparseDriveV2/dataset
+conda activate torch310
+python build_teacher_cache.py \
+  --num-samples 1024 \
+  --path-chunk-size 32 \
+  --top-k 64 \
+  --output-dir ../cache/teacher_v1
+```
+
+The command is resumable: existing sample files are skipped. Use `--overwrite`
+only when Teacher scoring logic or weights change.
+
+A smoke run on this machine took about 15.6 seconds for one scene with chunk
+size 32, so a sequential 1024-scene build is expected to take roughly 4-5
+hours. The cached files are then reused for every epoch.
+
+Training still performs online Teacher scoring only for the small mixed
+candidate set produced by model Top-K paths plus cached Teacher paths. This
+keeps explicit collision/cost supervision on current model mistakes without
+repeating the full 262,144-trajectory search.
+
+Smoke validation result for sample 0:
+
+```text
+old coarse Teacher: p372 / v137
+full-search Teacher: p4 / v137
+```
+
+This confirms that the old path pruning could change the generated truth.
+
+
+## Teacher Safety/Comfort Cost Update (2026-06-24)
+
+Teacher trajectory scoring now uses:
+
+```text
+minimum_clearance = 0.8 m
+clearance_violation_weight = 200
+route_weight = 1.5
+progress_weight = 0.1
+lateral_accel_weight = 0.1
+```
+
+`clearance_violation = max(0.8 - clearance, 0)^2` prevents trajectories with
+only a few centimeters of residual clearance from winning merely because they
+do not geometrically overlap an obstacle. Lateral acceleration is estimated as
+`speed * yaw_rate` and penalized by its masked mean square.
+
+On the 8 m/s manual Teacher scene, the old winner `p179/v68` had only 0.047 m
+clearance. After this update the winner is `p552/v114`, which stays on the route,
+has 2.387 m clearance, and decelerates from 8.0 m/s to about 0.9 m/s over 4 s.
+
+Teacher cache version is now 2. Any cache generated before this update must be
+regenerated.

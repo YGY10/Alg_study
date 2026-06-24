@@ -15,7 +15,7 @@ for path in (TOY_ROOT, CURRENT_DIR):
         sys.path.insert(0, str(path))
 
 from grid import GridConfig, draw_points, draw_polyline, draw_rectangle, make_empty_grid
-from teacher import EgoState, TeacherConfig, default_route_path, score_teacher_candidates
+from teacher import EgoState, TeacherConfig, score_teacher_candidates
 from vocab import SparseDriveVocab
 
 TIME_STEPS = np.arange(1, 9, dtype=np.float32) * 0.5
@@ -215,6 +215,8 @@ class ToySparseDriveV2Dataset(Dataset):
         max_obstacles: int = 12,
         teacher_config: TeacherConfig | None = None,
         ego_state: EgoState = EgoState(speed=0.0),
+        teacher_cache_dir: str | Path | None = None,
+        require_teacher_cache: bool = False,
     ) -> None:
         self.num_samples = num_samples
         self.seed_offset = seed_offset
@@ -228,11 +230,18 @@ class ToySparseDriveV2Dataset(Dataset):
             temperature=2.0,
         )
         self.ego_state = ego_state
+        self.teacher_cache_dir = (
+            Path(teacher_cache_dir) if teacher_cache_dir is not None else None
+        )
+        self.require_teacher_cache = require_teacher_cache
 
     def __len__(self) -> int:
         return self.num_samples
 
-    def __getitem__(self, index) -> dict[str, torch.Tensor]:
+    def generate_scene(
+        self,
+        index: int,
+    ) -> tuple[int, np.ndarray, np.ndarray, list[Obstacle]]:
         rng = np.random.default_rng(self.seed_offset + index)
 
         route_path_index = int(rng.integers(0, self.vocab.num_path))
@@ -249,19 +258,76 @@ class ToySparseDriveV2Dataset(Dataset):
             )
             for _ in range(num_obstacles)
         ]
+        return route_path_index, route_path, goal_xy, obstacles
 
-        teacher_output = score_teacher_candidates(
-            vocab=self.vocab,
-            goal_xy=goal_xy,
-            obstacles=obstacles_to_teacher_dicts(obstacles),
-            ego_state=self.ego_state,
-            route_path=route_path[:, :2],
-            config=self.teacher_config,
-        )
+    def teacher_cache_path(self, index: int) -> Path | None:
+        if self.teacher_cache_dir is None:
+            return None
+        return self.teacher_cache_dir / f"sample_{index:06d}.npz"
 
-        path_index = teacher_output.best_path_index
-        velocity_index = teacher_output.best_velocity_index
-        trajectory_index = teacher_output.best_flat_index
+    def load_teacher_cache(self, index: int) -> dict[str, np.ndarray] | None:
+        cache_path = self.teacher_cache_path(index)
+        if cache_path is None or not cache_path.is_file():
+            if self.require_teacher_cache:
+                raise FileNotFoundError(
+                    f"Missing teacher cache for sample {index}: {cache_path}. "
+                    "Run dataset/build_teacher_cache.py first."
+                )
+            return None
+
+        with np.load(cache_path, allow_pickle=False) as data:
+            cache = {key: data[key].copy() for key in data.files}
+
+        if int(cache["cache_version"]) != 2:
+            raise ValueError(f"Unsupported teacher cache version: {cache_path}")
+        if int(cache["sample_index"]) != index:
+            raise ValueError(f"Teacher cache sample mismatch: {cache_path}")
+        if int(cache["seed_offset"]) != self.seed_offset:
+            raise ValueError(f"Teacher cache seed mismatch: {cache_path}")
+        return cache
+
+    def __getitem__(self, index) -> dict[str, torch.Tensor]:
+        route_path_index, route_path, goal_xy, obstacles = self.generate_scene(index)
+        teacher_cache = self.load_teacher_cache(index)
+        if teacher_cache is not None and int(teacher_cache["route_path_index"]) != route_path_index:
+            raise ValueError(
+                f"Teacher cache route mismatch for sample {index}: "
+                f"cache={int(teacher_cache['route_path_index'])}, scene={route_path_index}"
+            )
+
+        if teacher_cache is None:
+            teacher_output = score_teacher_candidates(
+                vocab=self.vocab,
+                goal_xy=goal_xy,
+                obstacles=obstacles_to_teacher_dicts(obstacles),
+                ego_state=self.ego_state,
+                route_path=route_path[:, :2],
+                config=self.teacher_config,
+            )
+            path_index = teacher_output.best_path_index
+            velocity_index = teacher_output.best_velocity_index
+            trajectory_index = teacher_output.best_flat_index
+            teacher_path_indices = teacher_output.path_indices
+            teacher_path_probs = build_path_probability(
+                teacher_output.path_costs,
+                temperature=self.teacher_config.temperature,
+            )
+            teacher_candidate_probs = teacher_output.candidate_probs
+            teacher_best_candidate_index = teacher_output.best_candidate_index
+        else:
+            path_index = int(teacher_cache["best_path_index"])
+            velocity_index = int(teacher_cache["best_velocity_index"])
+            trajectory_index = int(teacher_cache["best_flat_index"])
+            teacher_path_indices = teacher_cache["teacher_path_indices"].astype(
+                np.int64
+            )
+            teacher_path_probs = teacher_cache["teacher_path_probs"].astype(
+                np.float32
+            )
+            teacher_candidate_probs = teacher_cache["teacher_topk_probs"].astype(
+                np.float32
+            )
+            teacher_best_candidate_index = 0
 
         target_path = self.vocab.path[path_index].cpu().numpy()
         target_velocity = self.vocab.velocity[velocity_index].cpu().numpy()
@@ -304,11 +370,6 @@ class ToySparseDriveV2Dataset(Dataset):
             dtype=np.float32,
         )
 
-        teacher_path_probs = build_path_probability(
-            teacher_output.path_costs,
-            temperature=self.teacher_config.temperature,
-        )
-
         return {
             "input_grid": torch.from_numpy(input_grid).float(),
             "target_path": torch.from_numpy(target_path).float(),
@@ -326,14 +387,14 @@ class ToySparseDriveV2Dataset(Dataset):
             "goal_xy": torch.from_numpy(goal_xy).float(),
             "ego_state": torch.from_numpy(ego_state_vector).float(),
             "teacher_path_indices": torch.from_numpy(
-                teacher_output.path_indices,
+                teacher_path_indices,
             ).long(),
             "teacher_path_probs": torch.from_numpy(teacher_path_probs).float(),
             "teacher_candidate_probs": torch.from_numpy(
-                teacher_output.candidate_probs,
+                teacher_candidate_probs,
             ).float(),
             "teacher_best_candidate_index": torch.tensor(
-                teacher_output.best_candidate_index,
+                teacher_best_candidate_index,
                 dtype=torch.long,
             ),
             "obstacle_centers": obstacle_centers.float(),

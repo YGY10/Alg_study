@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import sys
 from typing import Any
@@ -29,13 +29,19 @@ class DynamicObstacle:
     center_xy: np.ndarray
     size_xy: tuple[float, float]
     velocity_xy: np.ndarray
+    id: str = ""
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "DynamicObstacle":
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+        default_id: str = "",
+    ) -> "DynamicObstacle":
         return cls(
             center_xy=np.asarray(data["center_xy"], dtype=np.float32),
             size_xy=(float(data["size_xy"][0]), float(data["size_xy"][1])),
             velocity_xy=np.asarray(data["velocity_xy"], dtype=np.float32),
+            id=str(data.get("id", default_id)),
         )
 
     def center_at(self, time_s: np.ndarray | float) -> np.ndarray:
@@ -58,15 +64,24 @@ class TeacherConfig:
     segment_samples: int = 6
     safety_margin: float = 0.5
     desired_clearance: float = 2.0
+    minimum_clearance: float = 0.8
+    clearance_violation_weight: float = 200.0
+    max_accel: float = 3.0
+    max_decel: float = 5.0
+    dynamics_invalid_weight: float = 1.0e5
+    accel_violation_weight: float = 20.0
     collision_weight: float = 1.0e6
     path_goal_weight: float = 1.0
     path_route_weight: float = 0.5
     path_collision_weight: float = 1000.0
-    goal_weight: float = 10
-    route_weight: float = 0.8
+    goal_weight: float = 2
+    route_weight: float = 1.5
+    route_point_weight_start: float = 0.5
+    route_point_weight_end: float = 1.5
     clearance_weight: float = 8.0
-    progress_weight: float = 0.25
+    progress_weight: float = 0.1
     comfort_weight: float = 0.15
+    lateral_accel_weight: float = 0.1
     speed_weight: float = 0.02
     initial_accel_weight: float = 0.2
     accel_weight: float = 0.08
@@ -95,11 +110,23 @@ def normalize_obstacles(
     obstacles: list[DynamicObstacle | dict[str, Any]],
 ) -> list[DynamicObstacle]:
     normalized = []
-    for obstacle in obstacles:
+    used_ids: set[str] = set()
+    for obstacle_index, obstacle in enumerate(obstacles):
+        default_id = f"obs{obstacle_index}"
         if isinstance(obstacle, DynamicObstacle):
-            normalized.append(obstacle)
+            normalized_obstacle = obstacle
+            if not normalized_obstacle.id:
+                normalized_obstacle = replace(normalized_obstacle, id=default_id)
         else:
-            normalized.append(DynamicObstacle.from_dict(obstacle))
+            normalized_obstacle = DynamicObstacle.from_dict(
+                obstacle,
+                default_id=default_id,
+            )
+
+        if normalized_obstacle.id in used_ids:
+            raise ValueError(f"Duplicate obstacle id: {normalized_obstacle.id!r}")
+        used_ids.add(normalized_obstacle.id)
+        normalized.append(normalized_obstacle)
     return normalized
 
 
@@ -120,6 +147,70 @@ def pairwise_nearest_distance(points: np.ndarray, reference: np.ndarray) -> np.n
     diff = points[..., None, :] - reference[None, None, :, :]
     distance = np.linalg.norm(diff, axis=-1)
     return distance.min(axis=-1)
+
+
+def project_points_to_route_l(
+    points: np.ndarray,
+    route_path: np.ndarray,
+) -> np.ndarray:
+    """Project points onto route segments and return signed lateral offset l."""
+    points = np.asarray(points, dtype=np.float32)
+    route_path = np.asarray(route_path, dtype=np.float32)
+    if route_path.ndim != 2 or route_path.shape[1] != 2:
+        raise ValueError(f"route_path must have shape [R, 2], got {route_path.shape}")
+    if route_path.shape[0] < 2:
+        raise ValueError("route_path must contain at least two points")
+
+    segment_start = route_path[:-1]
+    segment_vector = route_path[1:] - route_path[:-1]
+    segment_length_sq = np.sum(segment_vector**2, axis=-1)
+    valid_segment = segment_length_sq > 1.0e-8
+    safe_length_sq = np.where(valid_segment, segment_length_sq, 1.0)
+
+    point_to_start = points[..., None, :] - segment_start
+    projection_ratio = np.sum(point_to_start * segment_vector, axis=-1) / safe_length_sq
+    projection_ratio = np.clip(projection_ratio, 0.0, 1.0)
+    projected = segment_start + projection_ratio[..., None] * segment_vector
+    residual = points[..., None, :] - projected
+    distance = np.linalg.norm(residual, axis=-1)
+    distance = np.where(valid_segment, distance, np.inf)
+
+    nearest_segment = np.argmin(distance, axis=-1)
+    nearest_distance = np.take_along_axis(
+        distance,
+        nearest_segment[..., None],
+        axis=-1,
+    )[..., 0]
+
+    selected_segment = segment_vector[nearest_segment]
+    selected_residual = np.take_along_axis(
+        residual,
+        nearest_segment[..., None, None],
+        axis=-2,
+    )[..., 0, :]
+    cross = (
+        selected_segment[..., 0] * selected_residual[..., 1]
+        - selected_segment[..., 1] * selected_residual[..., 0]
+    )
+    sign = np.where(cross < 0.0, -1.0, 1.0)
+    return (nearest_distance * sign).astype(np.float32)
+
+
+def weighted_route_l_cost(
+    route_l: np.ndarray,
+    masks: np.ndarray,
+    weight_start: float,
+    weight_end: float,
+) -> np.ndarray:
+    point_weights = np.linspace(
+        weight_start,
+        weight_end,
+        route_l.shape[-1],
+        dtype=np.float32,
+    )
+    valid_weights = masks.astype(np.float32) * point_weights
+    denominator = valid_weights.sum(axis=-1).clip(min=1.0e-6)
+    return (np.abs(route_l) * valid_weights).sum(axis=-1) / denominator
 
 
 def softmax_from_cost(cost: np.ndarray, temperature: float) -> np.ndarray:
@@ -235,8 +326,8 @@ def score_paths(
     endpoint_xy = path_xy[:, -1]
     goal_cost = np.linalg.norm(endpoint_xy - goal_xy[None, :], axis=-1)
 
-    route_dist = pairwise_nearest_distance(path_xy, route_path)
-    route_cost = route_dist.mean(axis=-1)
+    path_route_l = project_points_to_route_l(path_xy, route_path)
+    route_cost = np.abs(path_route_l).mean(axis=-1)
 
     path_times = np.linspace(0.0, TIME_STEPS[-1], path_xy.shape[1], dtype=np.float32)
     path_valid = np.ones(path_xy.shape[:2], dtype=bool)
@@ -303,9 +394,21 @@ def score_trajectories(
     endpoint_xy = trajectories[np.arange(trajectories.shape[0]), endpoint_index, :2]
 
     goal_cost = np.linalg.norm(endpoint_xy - goal_xy[None, :], axis=-1)
-    route_dist = pairwise_nearest_distance(trajectories[..., :2], route_path)
-    route_cost = (route_dist * masks).sum(axis=-1) / np.maximum(masks.sum(axis=-1), 1.0)
+    route_l = project_points_to_route_l(trajectories[..., :2], route_path)
+    route_cost = weighted_route_l_cost(
+        route_l=route_l,
+        masks=masks,
+        weight_start=config.route_point_weight_start,
+        weight_end=config.route_point_weight_end,
+    )
     clearance_cost = np.maximum(config.desired_clearance - clearance, 0.0) ** 2
+    clearance_violation = (
+        np.maximum(
+            config.minimum_clearance - clearance,
+            0.0,
+        )
+        ** 2
+    )
 
     goal_direction = goal_xy - np.asarray(ego_state.xy, dtype=np.float32)
     goal_norm = max(float(np.linalg.norm(goal_direction)), 1.0e-6)
@@ -328,13 +431,52 @@ def score_trajectories(
     accel_cost = (accel**2).mean(axis=-1)
     jerk_cost = (jerk**2).mean(axis=-1)
 
+    trajectory_yaw = np.unwrap(trajectories[..., 2], axis=-1)
+    previous_yaw = np.concatenate(
+        [
+            np.full(
+                (trajectories.shape[0], 1),
+                float(ego_state.yaw),
+                dtype=np.float32,
+            ),
+            trajectory_yaw[:, :-1],
+        ],
+        axis=-1,
+    )
+    yaw_rate = (trajectory_yaw - previous_yaw) / dt
+    lateral_accel = candidate_velocity * yaw_rate
+    lateral_accel_cost = (lateral_accel**2 * masks.astype(np.float32)).sum(
+        axis=-1
+    ) / masks.sum(axis=-1).clip(min=1.0)
+
+    initial_accel_violation = (
+        np.maximum(initial_accel - config.max_accel, 0.0) ** 2
+        + np.maximum(-config.max_decel - initial_accel, 0.0) ** 2
+    )
+    accel_violation = (
+        np.maximum(accel - config.max_accel, 0.0) ** 2
+        + np.maximum(-config.max_decel - accel, 0.0) ** 2
+    )
+    accel_violation_cost = accel_violation.mean(axis=-1)
+    dynamics_invalid = (
+        (initial_accel > config.max_accel)
+        | (initial_accel < -config.max_decel)
+        | (accel > config.max_accel).any(axis=-1)
+        | (accel < -config.max_decel).any(axis=-1)
+    )
+
     cost = (
         config.collision_weight * collision.astype(np.float32)
+        + config.dynamics_invalid_weight * dynamics_invalid.astype(np.float32)
+        + config.accel_violation_weight
+        * (initial_accel_violation + accel_violation_cost)
         + config.goal_weight * goal_cost
         + config.route_weight * route_cost
         + config.clearance_weight * clearance_cost
+        + config.clearance_violation_weight * clearance_violation
         - config.progress_weight * progress
         + config.comfort_weight * comfort_cost
+        + config.lateral_accel_weight * lateral_accel_cost
         + config.speed_weight * speed_mean
         + config.initial_accel_weight * initial_accel_cost
         + config.accel_weight * accel_cost
@@ -350,15 +492,21 @@ def score_trajectories(
         "cost": cost.astype(np.float32),
         "collision": collision,
         "clearance": clearance.astype(np.float32),
+        "clearance_violation": clearance_violation.astype(np.float32),
         "goal_cost": goal_cost.astype(np.float32),
         "route_cost": route_cost.astype(np.float32),
+        "route_l": route_l.astype(np.float32),
         "progress": progress.astype(np.float32),
         "comfort_cost": comfort_cost.astype(np.float32),
+        "lateral_accel_cost": lateral_accel_cost.astype(np.float32),
         "speed_mean": speed_mean.astype(np.float32),
         "initial_accel": initial_accel.astype(np.float32),
         "initial_accel_cost": initial_accel_cost.astype(np.float32),
         "accel_cost": accel_cost.astype(np.float32),
         "jerk_cost": jerk_cost.astype(np.float32),
+        "initial_accel_violation": initial_accel_violation.astype(np.float32),
+        "accel_violation_cost": accel_violation_cost.astype(np.float32),
+        "dynamics_invalid": dynamics_invalid,
     }
 
 
@@ -411,19 +559,26 @@ def score_teacher_candidates(
     debug = {
         "collision": scored["collision"],
         "clearance": scored["clearance"],
+        "clearance_violation": scored["clearance_violation"],
         "goal_cost": scored["goal_cost"],
         "route_cost": scored["route_cost"],
+        "route_l": scored["route_l"],
         "progress": scored["progress"],
         "comfort_cost": scored["comfort_cost"],
+        "lateral_accel_cost": scored["lateral_accel_cost"],
         "speed_mean": scored["speed_mean"],
         "initial_accel": scored["initial_accel"],
         "initial_accel_cost": scored["initial_accel_cost"],
         "accel_cost": scored["accel_cost"],
         "jerk_cost": scored["jerk_cost"],
+        "initial_accel_violation": scored["initial_accel_violation"],
+        "accel_violation_cost": scored["accel_violation_cost"],
+        "dynamics_invalid": scored["dynamics_invalid"],
         "trajectories": scored["trajectories"],
         "masks": scored["masks"],
         "route_path": route_path,
         "goal_xy": goal_xy,
+        "ego_speed": float(ego_state.speed),
     }
 
     return TeacherOutput(
@@ -440,6 +595,122 @@ def score_teacher_candidates(
         best_path_index=best_path_index,
         best_velocity_index=best_velocity_index,
         topk_flat_indices=scored["candidate_flat_indices"][topk],
+        debug=debug,
+    )
+
+
+def score_all_trajectories_chunked(
+    vocab: SparseDriveVocab,
+    goal_xy: tuple[float, float] | np.ndarray,
+    obstacles: list[DynamicObstacle | dict[str, Any]],
+    ego_state: EgoState = EgoState(),
+    route_path: np.ndarray | None = None,
+    config: TeacherConfig = TeacherConfig(),
+    path_chunk_size: int = 32,
+    top_k: int | None = None,
+) -> TeacherOutput:
+    """Score every path/velocity pair while retaining only the global top-k."""
+    if path_chunk_size <= 0:
+        raise ValueError("path_chunk_size must be positive")
+
+    goal_xy = np.asarray(goal_xy, dtype=np.float32)
+    obstacles = normalize_obstacles(obstacles)
+    if route_path is None:
+        route_path = default_route_path(ego_state, goal_xy)
+    else:
+        route_path = np.asarray(route_path, dtype=np.float32)
+
+    top_k = config.num_top_trajectories if top_k is None else int(top_k)
+    top_k = max(1, min(top_k, vocab.num_path * vocab.num_velocity))
+    per_path_best_cost = np.full(vocab.num_path, np.inf, dtype=np.float32)
+    retained: dict[str, np.ndarray] | None = None
+
+    for path_start in range(0, vocab.num_path, path_chunk_size):
+        path_stop = min(path_start + path_chunk_size, vocab.num_path)
+        path_indices = np.arange(path_start, path_stop, dtype=np.int64)
+        scored = score_trajectories(
+            vocab=vocab,
+            path_indices=path_indices,
+            goal_xy=goal_xy,
+            obstacles=obstacles,
+            ego_state=ego_state,
+            route_path=route_path,
+            config=config,
+        )
+
+        chunk_cost = scored["cost"]
+        per_path_best_cost[path_indices] = chunk_cost.reshape(
+            len(path_indices), vocab.num_velocity
+        ).min(axis=1)
+
+        local_order = np.argsort(chunk_cost)[:top_k]
+        local_top = {key: value[local_order] for key, value in scored.items()}
+        if retained is None:
+            retained = local_top
+            continue
+
+        merged = {
+            key: np.concatenate([retained[key], local_top[key]], axis=0)
+            for key in retained
+        }
+        merged_order = np.argsort(merged["cost"])[:top_k]
+        retained = {key: value[merged_order] for key, value in merged.items()}
+
+    if retained is None:
+        raise RuntimeError("No trajectories were scored")
+
+    final_order = np.argsort(retained["cost"])
+    retained = {key: value[final_order] for key, value in retained.items()}
+    candidate_costs = retained["cost"].astype(np.float32)
+    candidate_probs = softmax_from_cost(candidate_costs, config.temperature).astype(
+        np.float32
+    )
+    path_indices = np.argsort(per_path_best_cost)[: config.num_path_candidates]
+
+    debug = {
+        "collision": retained["collision"],
+        "clearance": retained["clearance"],
+        "clearance_violation": retained["clearance_violation"],
+        "goal_cost": retained["goal_cost"],
+        "route_cost": retained["route_cost"],
+        "route_l": retained["route_l"],
+        "progress": retained["progress"],
+        "comfort_cost": retained["comfort_cost"],
+        "lateral_accel_cost": retained["lateral_accel_cost"],
+        "speed_mean": retained["speed_mean"],
+        "initial_accel": retained["initial_accel"],
+        "initial_accel_cost": retained["initial_accel_cost"],
+        "accel_cost": retained["accel_cost"],
+        "jerk_cost": retained["jerk_cost"],
+        "initial_accel_violation": retained["initial_accel_violation"],
+        "accel_violation_cost": retained["accel_violation_cost"],
+        "dynamics_invalid": retained["dynamics_invalid"],
+        "trajectories": retained["trajectories"],
+        "masks": retained["masks"],
+        "route_path": route_path,
+        "goal_xy": goal_xy,
+        "ego_speed": float(ego_state.speed),
+        "full_search": True,
+        "path_chunk_size": int(path_chunk_size),
+    }
+
+    best_flat_index = int(retained["candidate_flat_indices"][0])
+    best_path_index = int(retained["candidate_path_indices"][0])
+    best_velocity_index = int(retained["candidate_velocity_indices"][0])
+    return TeacherOutput(
+        path_indices=path_indices.astype(np.int64),
+        path_costs=per_path_best_cost,
+        candidate_flat_indices=retained["candidate_flat_indices"],
+        candidate_path_indices=retained["candidate_path_indices"],
+        candidate_velocity_indices=retained["candidate_velocity_indices"],
+        candidate_costs=candidate_costs,
+        candidate_scores=-candidate_costs,
+        candidate_probs=candidate_probs,
+        best_candidate_index=0,
+        best_flat_index=best_flat_index,
+        best_path_index=best_path_index,
+        best_velocity_index=best_velocity_index,
+        topk_flat_indices=retained["candidate_flat_indices"].copy(),
         debug=debug,
     )
 
@@ -482,12 +753,19 @@ def visualize_teacher_output(
     goal_xy = output.debug["goal_xy"]
     best_path = vocab.path[output.best_path_index].detach().cpu().numpy()
     best_velocity = vocab.velocity[output.best_velocity_index].detach().cpu().numpy()
+    ego_speed = float(output.debug["ego_speed"])
+    velocity_times = np.concatenate(
+        [np.array([0.0], dtype=np.float32), TIME_STEPS.astype(np.float32)]
+    )
+    velocity_with_current = np.concatenate(
+        [np.array([ego_speed], dtype=np.float32), best_velocity.astype(np.float32)]
+    )
 
-    fig = plt.figure(figsize=(15, 8))
+    fig = plt.figure(figsize=(16, 8))
     gs = fig.add_gridspec(
         nrows=2,
         ncols=2,
-        width_ratios=(1.15, 1.0),
+        width_ratios=(1.0, 1.2),
         height_ratios=(1.0, 1.0),
     )
     ax = fig.add_subplot(gs[:, 0])
@@ -501,6 +779,23 @@ def visualize_teacher_output(
             obstacle.size_xy,
             color="#666666",
             alpha=0.45,
+        )
+        ax.annotate(
+            obstacle.id,
+            xy=(float(obstacle.center_xy[1]), float(obstacle.center_xy[0])),
+            xytext=(4, 4),
+            textcoords="offset points",
+            fontsize=8,
+            fontweight="bold",
+            color="white",
+            bbox={
+                "boxstyle": "round,pad=0.18",
+                "facecolor": "#333333",
+                "edgecolor": "white",
+                "linewidth": 0.5,
+                "alpha": 0.9,
+            },
+            zorder=10,
         )
         for time_s in TIME_STEPS:
             future_center = obstacle.center_at(float(time_s))
@@ -548,13 +843,39 @@ def visualize_teacher_output(
     ax.grid(True, alpha=0.25)
     ax.legend(loc="upper right")
 
+    candidate_paths = vocab.path[output.path_indices].detach().cpu().numpy()
+    for rank, (path_index, candidate_path) in enumerate(
+        zip(output.path_indices, candidate_paths)
+    ):
+        is_best = int(path_index) == output.best_path_index
+        ax_path.plot(
+            candidate_path[:, 1],
+            candidate_path[:, 0],
+            color="#1f77b4" if is_best else "#7f7f7f",
+            linewidth=2.4 if is_best else 0.9,
+            alpha=1.0 if is_best else max(0.18, 0.65 - rank * 0.012),
+            zorder=3 if is_best else 1,
+            label="selected path" if is_best else None,
+        )
+        if rank < 10:
+            ax_path.annotate(
+                f"{rank + 1}:p{int(path_index)}",
+                xy=(float(candidate_path[-1, 1]), float(candidate_path[-1, 0])),
+                xytext=(3, 2),
+                textcoords="offset points",
+                fontsize=7,
+                color="#1f77b4" if is_best else "#555555",
+                zorder=4,
+            )
+
     ax_path.plot(
-        best_path[:, 1],
-        best_path[:, 0],
-        color="#1f77b4",
-        linewidth=1.8,
-        marker=".",
-        markersize=4,
+        route_path[:, 1],
+        route_path[:, 0],
+        color="#d62728",
+        linewidth=1.2,
+        linestyle="--",
+        label="route",
+        zorder=2,
     )
     ax_path.scatter(
         [best_path[0, 1]],
@@ -562,15 +883,20 @@ def visualize_teacher_output(
         color="#2ca02c",
         s=45,
         label="start",
+        zorder=5,
     )
     ax_path.scatter(
         [best_path[-1, 1]],
         [best_path[-1, 0]],
         color="#d62728",
         s=45,
-        label="end",
+        label="selected end",
+        zorder=5,
     )
-    ax_path.set_title(f"selected path p{output.best_path_index} | 50 points")
+    ax_path.set_title(
+        f"top-{len(output.path_indices)} candidate paths | "
+        f"selected p{output.best_path_index}"
+    )
     ax_path.set_xlabel("y left [m]")
     ax_path.set_ylabel("x forward [m]")
     ax_path.set_aspect("equal", adjustable="box")
@@ -579,18 +905,29 @@ def visualize_teacher_output(
     ax_path.legend(loc="best")
 
     ax_velocity.plot(
-        np.arange(1, len(best_velocity) + 1),
-        best_velocity,
+        velocity_times,
+        velocity_with_current,
         color="#9467bd",
         linewidth=1.8,
         marker="o",
         markersize=4,
     )
-    ax_velocity.set_title(f"selected velocity v{output.best_velocity_index} | 8 steps")
-    ax_velocity.set_xlabel("step")
+    ax_velocity.scatter(
+        [0.0],
+        [ego_speed],
+        color="#2ca02c",
+        s=55,
+        zorder=3,
+        label="current ego speed",
+    )
+    ax_velocity.set_title(
+        f"selected velocity v{output.best_velocity_index} | current + 8 future steps"
+    )
+    ax_velocity.set_xlabel("time [s]")
     ax_velocity.set_ylabel("speed [m/s]")
-    ax_velocity.set_xticks(np.arange(1, len(best_velocity) + 1))
+    ax_velocity.set_xticks(velocity_times)
     ax_velocity.grid(True, alpha=0.25)
+    ax_velocity.legend(loc="best")
 
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -603,7 +940,7 @@ def main() -> None:
     ego_state = EgoState(
         xy=(0.0, 0.0),
         yaw=0.0,
-        speed=5.0,
+        speed=1.0,
         size_xy=(4.8, 2.0),
     )
     goal_xy = np.array([38.0, 0.0], dtype=np.float32)
@@ -611,45 +948,59 @@ def main() -> None:
     obstacles = normalize_obstacles(
         [
             {
-                "center_xy": (15.0, 1.0),
+                "id": "1",
+                "center_xy": (35.0, 2.0),
                 "size_xy": (5.0, 2.5),
                 "velocity_xy": (1.0, 0.0),
             },
             {
-                "center_xy": (10.0, -4.0),
+                "id": "2",
+                "center_xy": (25.0, -4.0),
+                "size_xy": (5.0, 2.5),
+                "velocity_xy": (3.0, 0.0),
+            },
+            {
+                "id": "3",
+                "center_xy": (10.0, 6.0),
                 "size_xy": (5.0, 2.5),
                 "velocity_xy": (1.0, 0.0),
             },
-            # {
-            #     "center_xy": (10.0, 4.0),
-            #     "size_xy": (5.0, 2.5),
-            #     "velocity_xy": (1.0, 0.0),
-            # },
-            # {
-            #     "center_xy": (15.0, -6.0),
-            #     "size_xy": (4.5, 2.2),
-            #     "velocity_xy": (1.0, 0.0),
-            # },
-            # {
-            #     "center_xy": (15.0, -3.0),
-            #     "size_xy": (4.5, 2.2),
-            #     "velocity_xy": (1.0, 0.0),
-            # },
-            # {
-            #     "center_xy": (15.0, 0.0),
-            #     "size_xy": (5.0, 2.5),
-            #     "velocity_xy": (1.0, 0.0),
-            # },
-            # {
-            #     "center_xy": (15.0, 4.0),
-            #     "size_xy": (5.0, 2.5),
-            #     "velocity_xy": (1.0, 0.0),
-            # },
-            # {
-            #     "center_xy": (15.0, 6.0),
-            #     "size_xy": (5.0, 2.5),
-            #     "velocity_xy": (1.0, 0.0),
-            # },
+            {
+                "id": "4",
+                "center_xy": (18.0, -14.0),
+                "size_xy": (4.5, 2.2),
+                "velocity_xy": (0.2, 0.0),
+            },
+            {
+                "id": "5",
+                "center_xy": (18.0, -10.0),
+                "size_xy": (4.5, 2.2),
+                "velocity_xy": (0.2, 0.0),
+            },
+            {
+                "id": "6",
+                "center_xy": (18.0, -3.0),
+                "size_xy": (4.5, 2.2),
+                "velocity_xy": (1.0, 0.0),
+            },
+            {
+                "id": "7",
+                "center_xy": (6.0, 0.0),
+                "size_xy": (5.0, 2.5),
+                "velocity_xy": (1.0, 0.0),
+            },
+            {
+                "id": "8",
+                "center_xy": (18.0, 8.0),
+                "size_xy": (5.0, 2.5),
+                "velocity_xy": (1.0, 0.0),
+            },
+            {
+                "id": "9",
+                "center_xy": (25.0, 5.0),
+                "size_xy": (5.0, 2.5),
+                "velocity_xy": (1.0, 0.0),
+            },
         ]
     )
 
@@ -658,13 +1009,15 @@ def main() -> None:
         num_top_trajectories=10,
         temperature=2.0,
     )
-    output = score_teacher_candidates(
+    output = score_all_trajectories_chunked(
         vocab=vocab,
         goal_xy=goal_xy,
         obstacles=obstacles,
         ego_state=ego_state,
         route_path=None,
         config=config,
+        path_chunk_size=32,
+        top_k=64,
     )
 
     print("best_flat_index:", output.best_flat_index)
@@ -692,12 +1045,17 @@ def main() -> None:
             f"prob={output.candidate_probs[candidate_index]:.4f} "
             f"collision={bool(output.debug['collision'][candidate_index])} "
             f"clearance={output.debug['clearance'][candidate_index]:.3f} "
+            f"clear_violation={output.debug['clearance_violation'][candidate_index]:.3f} "
             f"goal={output.debug['goal_cost'][candidate_index]:.3f} "
             f"route={output.debug['route_cost'][candidate_index]:.3f} "
             f"progress={output.debug['progress'][candidate_index]:.3f} "
             f"speed={output.debug['speed_mean'][candidate_index]:.3f} "
             f"init_acc={output.debug['initial_accel'][candidate_index]:.3f} "
+            f"dyn_invalid={bool(output.debug['dynamics_invalid'][candidate_index])} "
+            f"init_violation={output.debug['initial_accel_violation'][candidate_index]:.3f} "
+            f"accel_violation={output.debug['accel_violation_cost'][candidate_index]:.3f} "
             f"accel_cost={output.debug['accel_cost'][candidate_index]:.3f} "
+            f"lat_accel_cost={output.debug['lateral_accel_cost'][candidate_index]:.3f} "
             f"jerk_cost={output.debug['jerk_cost'][candidate_index]:.3f}"
         )
 
