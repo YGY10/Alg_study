@@ -463,17 +463,33 @@ def main() -> None:
         teacher_cache_dir=TEACHER_CACHE_DIR,
         require_teacher_cache=True,
     )
-    missing_cache_paths = [
-        dataset.teacher_cache_path(index)
-        for index in range(len(dataset))
-        if not dataset.teacher_cache_path(index).is_file()
-    ]
-    if missing_cache_paths:
+    missing_cache_paths = []
+    incompatible_cache_paths = []
+    for index in range(len(dataset)):
+        cache_path = dataset.teacher_cache_path(index)
+        if not cache_path.is_file():
+            missing_cache_paths.append(cache_path)
+            continue
+        try:
+            with np.load(cache_path, allow_pickle=False) as cache:
+                if int(cache["cache_version"]) != 3:
+                    incompatible_cache_paths.append(cache_path)
+        except Exception:
+            incompatible_cache_paths.append(cache_path)
+
+    if missing_cache_paths or incompatible_cache_paths:
+        first_problem = (
+            missing_cache_paths[0]
+            if missing_cache_paths
+            else incompatible_cache_paths[0]
+        )
         raise FileNotFoundError(
-            f"Teacher cache is incomplete: {len(missing_cache_paths)} missing files. "
-            f"First missing file: {missing_cache_paths[0]}. "
-            "Run: cd dataset && python build_teacher_cache.py "
-            "--num-samples 1024 --output-dir ../cache/teacher_v1"
+            f"Teacher cache is not ready: missing={len(missing_cache_paths)}, "
+            f"incompatible={len(incompatible_cache_paths)}. "
+            f"First problem: {first_problem}. "
+            "Run: python -u dataset/build_teacher_cache.py "
+            "--num-samples 1024 --path-chunk-size 32 --top-k 64 "
+            "--output-dir cache/teacher_v1 --overwrite"
         )
 
     dataloader = DataLoader(

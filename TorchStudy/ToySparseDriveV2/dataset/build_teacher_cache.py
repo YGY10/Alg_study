@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--path-chunk-size", type=int, default=32)
     parser.add_argument("--top-k", type=int, default=64)
     parser.add_argument("--num-path-candidates", type=int, default=8)
+    parser.add_argument("--max-scene-attempts", type=int, default=20)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -72,21 +73,38 @@ def main() -> None:
     for index in range(start_index, args.num_samples):
         cache_path = args.output_dir / f"sample_{index:06d}.npz"
         if cache_path.is_file() and not args.overwrite:
-            skipped += 1
-            continue
+            try:
+                with np.load(cache_path, allow_pickle=False) as existing:
+                    if int(existing["cache_version"]) == 3:
+                        skipped += 1
+                        continue
+            except Exception:
+                pass
 
         sample_start = time.perf_counter()
-        route_path_index, route_path, goal_xy, obstacles = dataset.generate_scene(index)
-        output = score_all_trajectories_chunked(
-            vocab=dataset.vocab,
-            goal_xy=goal_xy,
-            obstacles=obstacles_to_teacher_dicts(obstacles),
-            ego_state=dataset.ego_state,
-            route_path=route_path[:, :2],
-            config=teacher_config,
-            path_chunk_size=args.path_chunk_size,
-            top_k=args.top_k,
-        )
+        output = None
+        for scene_attempt in range(args.max_scene_attempts):
+            route_path_index, route_path, goal_xy, ego_state, obstacles = (
+                dataset.generate_scene(index, scene_attempt=scene_attempt)
+            )
+            output = score_all_trajectories_chunked(
+                vocab=dataset.vocab,
+                goal_xy=goal_xy,
+                obstacles=obstacles_to_teacher_dicts(obstacles),
+                ego_state=ego_state,
+                route_path=route_path[:, :2],
+                config=teacher_config,
+                path_chunk_size=args.path_chunk_size,
+                top_k=args.top_k,
+            )
+            if bool((~output.debug["collision"]).any()):
+                break
+        else:
+            raise RuntimeError(
+                f"No collision-free trajectory found for sample {index} after "
+                f"{args.max_scene_attempts} scene attempts"
+            )
+
         teacher_path_probs = softmax_from_cost(
             output.path_costs,
             teacher_config.temperature,
@@ -94,10 +112,12 @@ def main() -> None:
 
         save_cache_atomic(
             cache_path,
-            cache_version=np.asarray(2, dtype=np.int64),
+            cache_version=np.asarray(3, dtype=np.int64),
             sample_index=np.asarray(index, dtype=np.int64),
             seed_offset=np.asarray(args.seed_offset, dtype=np.int64),
+            scene_attempt=np.asarray(scene_attempt, dtype=np.int64),
             route_path_index=np.asarray(route_path_index, dtype=np.int64),
+            ego_speed=np.asarray(ego_state.speed, dtype=np.float32),
             teacher_config_json=np.asarray(config_json),
             best_path_index=np.asarray(output.best_path_index, dtype=np.int64),
             best_velocity_index=np.asarray(
@@ -122,8 +142,9 @@ def main() -> None:
         elapsed = time.perf_counter() - sample_start
         print(
             f"[{index + 1}/{args.num_samples}] "
-            f"sample={index} best=p{output.best_path_index} "
-            f"v{output.best_velocity_index} cost={output.candidate_costs[0]:.3f} "
+            f"sample={index} attempt={scene_attempt} speed={ego_state.speed:.2f} "
+            f"best=p{output.best_path_index} v{output.best_velocity_index} "
+            f"cost={output.candidate_costs[0]:.3f} "
             f"time={elapsed:.2f}s"
         )
 

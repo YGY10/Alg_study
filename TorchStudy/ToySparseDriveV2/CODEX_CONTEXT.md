@@ -720,3 +720,41 @@ has 2.387 m clearance, and decelerates from 8.0 m/s to about 0.9 m/s over 4 s.
 
 Teacher cache version is now 2. Any cache generated before this update must be
 regenerated.
+
+
+## Scene Generation and Cache v3 (2026-06-25)
+
+Training scene generation now addresses three data-quality problems:
+
+1. Each scene samples ego speed uniformly from `[0, 10] m/s`.
+2. Obstacles whose initial expanded AABB overlaps the ego vehicle are rejected
+   and resampled.
+3. During full-search cache generation, a scene is rejected and deterministically
+   regenerated when its retained global candidates contain no collision-free
+   trajectory. The accepted `scene_attempt` is stored in the cache so Dataset
+   reconstruction is exact.
+
+`ToySparseDriveV2Dataset.generate_scene(index, scene_attempt)` now returns:
+
+```text
+route_path_index, route_path, goal_xy, ego_state, obstacles
+```
+
+The random generator uses `SeedSequence([seed_offset, index, scene_attempt])`.
+Cache version is now 3 and stores `scene_attempt` plus `ego_speed`. `train.py`
+preflights all 1024 files and rejects missing, corrupt, or non-v3 caches.
+
+The previous v2 cache is incompatible and must be regenerated:
+
+```bash
+cd TorchStudy/ToySparseDriveV2
+python -u dataset/build_teacher_cache.py \
+  --num-samples 1024 \
+  --path-chunk-size 32 \
+  --top-k 64 \
+  --output-dir cache/teacher_v1 \
+  --overwrite
+```
+
+A 3-scene smoke test produced ego speeds 2.70, 5.57, and 4.02 m/s, no initial
+obstacle overlap, and collision-free Teacher best trajectories.

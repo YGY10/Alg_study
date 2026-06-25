@@ -131,6 +131,18 @@ def sample_mixed_obstacle(
     return sample_obstacle(rng, grid_config)
 
 
+
+def obstacle_overlaps_ego_initially(
+    obstacle: Obstacle,
+    ego_state: EgoState,
+    safety_margin: float,
+) -> bool:
+    ego_xy = np.asarray(ego_state.xy, dtype=np.float32)
+    ego_size = np.asarray(ego_state.size_xy, dtype=np.float32)
+    obstacle_size = np.asarray(obstacle.size_xy, dtype=np.float32)
+    half_extent = 0.5 * (ego_size + obstacle_size) + float(safety_margin)
+    return bool(np.all(np.abs(obstacle.center_xy - ego_xy) <= half_extent))
+
 def rasterize_dynamic_obstacles(
     input_grid: np.ndarray,
     obstacles: list[Obstacle],
@@ -241,24 +253,47 @@ class ToySparseDriveV2Dataset(Dataset):
     def generate_scene(
         self,
         index: int,
-    ) -> tuple[int, np.ndarray, np.ndarray, list[Obstacle]]:
-        rng = np.random.default_rng(self.seed_offset + index)
+        scene_attempt: int = 0,
+    ) -> tuple[int, np.ndarray, np.ndarray, EgoState, list[Obstacle]]:
+        seed_sequence = np.random.SeedSequence(
+            [self.seed_offset, int(index), int(scene_attempt)]
+        )
+        rng = np.random.default_rng(seed_sequence)
 
         route_path_index = int(rng.integers(0, self.vocab.num_path))
         route_path = self.vocab.path[route_path_index].cpu().numpy()
         goal_xy = route_path[-1, :2].astype(np.float32)
+        ego_state = EgoState(
+            xy=self.ego_state.xy,
+            yaw=self.ego_state.yaw,
+            speed=float(rng.uniform(0.0, 10.0)),
+            size_xy=self.ego_state.size_xy,
+        )
 
         num_obstacles = int(rng.integers(self.min_obstacles, self.max_obstacles + 1))
-        obstacles = [
-            sample_mixed_obstacle(
-                rng=rng,
-                grid_config=self.grid_config,
-                route_path=route_path,
-                route_aware_probability=0.7,
-            )
-            for _ in range(num_obstacles)
-        ]
-        return route_path_index, route_path, goal_xy, obstacles
+        obstacles = []
+        for _ in range(num_obstacles):
+            for _sample_attempt in range(100):
+                obstacle = sample_mixed_obstacle(
+                    rng=rng,
+                    grid_config=self.grid_config,
+                    route_path=route_path,
+                    route_aware_probability=0.7,
+                )
+                if not obstacle_overlaps_ego_initially(
+                    obstacle=obstacle,
+                    ego_state=ego_state,
+                    safety_margin=self.teacher_config.safety_margin,
+                ):
+                    obstacles.append(obstacle)
+                    break
+            else:
+                raise RuntimeError(
+                    f"Unable to sample a non-overlapping obstacle for "
+                    f"sample={index}, scene_attempt={scene_attempt}"
+                )
+
+        return route_path_index, route_path, goal_xy, ego_state, obstacles
 
     def teacher_cache_path(self, index: int) -> Path | None:
         if self.teacher_cache_dir is None:
@@ -278,7 +313,7 @@ class ToySparseDriveV2Dataset(Dataset):
         with np.load(cache_path, allow_pickle=False) as data:
             cache = {key: data[key].copy() for key in data.files}
 
-        if int(cache["cache_version"]) != 2:
+        if int(cache["cache_version"]) != 3:
             raise ValueError(f"Unsupported teacher cache version: {cache_path}")
         if int(cache["sample_index"]) != index:
             raise ValueError(f"Teacher cache sample mismatch: {cache_path}")
@@ -287,12 +322,26 @@ class ToySparseDriveV2Dataset(Dataset):
         return cache
 
     def __getitem__(self, index) -> dict[str, torch.Tensor]:
-        route_path_index, route_path, goal_xy, obstacles = self.generate_scene(index)
         teacher_cache = self.load_teacher_cache(index)
+        scene_attempt = (
+            int(teacher_cache["scene_attempt"]) if teacher_cache is not None else 0
+        )
+        route_path_index, route_path, goal_xy, ego_state, obstacles = (
+            self.generate_scene(index, scene_attempt=scene_attempt)
+        )
         if teacher_cache is not None and int(teacher_cache["route_path_index"]) != route_path_index:
             raise ValueError(
                 f"Teacher cache route mismatch for sample {index}: "
                 f"cache={int(teacher_cache['route_path_index'])}, scene={route_path_index}"
+            )
+        if teacher_cache is not None and not np.isclose(
+            float(teacher_cache["ego_speed"]),
+            ego_state.speed,
+            atol=1.0e-5,
+        ):
+            raise ValueError(
+                f"Teacher cache ego speed mismatch for sample {index}: "
+                f"cache={float(teacher_cache['ego_speed'])}, scene={ego_state.speed}"
             )
 
         if teacher_cache is None:
@@ -300,7 +349,7 @@ class ToySparseDriveV2Dataset(Dataset):
                 vocab=self.vocab,
                 goal_xy=goal_xy,
                 obstacles=obstacles_to_teacher_dicts(obstacles),
-                ego_state=self.ego_state,
+                ego_state=ego_state,
                 route_path=route_path[:, :2],
                 config=self.teacher_config,
             )
@@ -363,9 +412,9 @@ class ToySparseDriveV2Dataset(Dataset):
         )
         ego_state_vector = np.array(
             [
-                float(self.ego_state.speed),
-                float(self.ego_state.size_xy[0]),
-                float(self.ego_state.size_xy[1]),
+                float(ego_state.speed),
+                float(ego_state.size_xy[0]),
+                float(ego_state.size_xy[1]),
             ],
             dtype=np.float32,
         )
