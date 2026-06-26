@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import os
 from pathlib import Path
 import sys
 from typing import Any
 
 import matplotlib
 
-matplotlib.use("Agg")
+if os.environ.get("MPLBACKEND") is None:
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 

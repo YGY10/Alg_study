@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import argparse
 import random
 import sys
 from typing import Any
@@ -27,14 +28,17 @@ from teacher import (
     EgoState,
     TeacherConfig,
     normalize_obstacles,
-    score_teacher_candidates,
+    score_all_trajectories_chunked,
     score_trajectories,
 )
 from grid import GridConfig, draw_points, draw_polyline, draw_rectangle, make_empty_grid
 from model import ToySparseDriveV2Model
 from vocab import SparseDriveVocab
 
-CHECKPOINT_PATH = PROJECT_ROOT / "outputs" / "checkpoints" / "best_model.pt"
+TEACHER_CHECKPOINT_PATH = PROJECT_ROOT / "outputs" / "checkpoints" / "best_model.pt"
+HUMAN_CHECKPOINT_PATH = (
+    PROJECT_ROOT / "outputs" / "checkpoints_human" / "best_human_model.pt"
+)
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / "test_random"
 SAFETY_SCORE_WEIGHT = 1.0
 
@@ -70,15 +74,20 @@ CUSTOM_OBSTACLES = [
         "velocity_xy": (3.0, 0.0),
     },
     {
-        "center_xy": (10.0, 6.0),
+        "center_xy": (10.0, 3.0),
         "size_xy": (5.0, 2.5),
         "velocity_xy": (1.0, 0.0),
     },
-    {
-        "center_xy": (18.0, -14.0),
-        "size_xy": (4.5, 2.2),
-        "velocity_xy": (0.2, 0.0),
-    },
+    # {
+    #     "center_xy": (10.0, -3.0),
+    #     "size_xy": (5.0, 2.5),
+    #     "velocity_xy": (0.1, 0.0),
+    # },
+    # {
+    #     "center_xy": (18.0, -14.0),
+    #     "size_xy": (4.5, 2.2),
+    #     "velocity_xy": (0.2, 0.0),
+    # },
     {
         "center_xy": (18.0, -10.0),
         "size_xy": (4.5, 2.2),
@@ -107,6 +116,48 @@ CUSTOM_OBSTACLES = [
 ]
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--checkpoint-type",
+        choices=("teacher", "human"),
+        default="teacher",
+        help="Which default checkpoint to load.",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=Path,
+        default=None,
+        help="Optional explicit checkpoint path. Overrides --checkpoint-type.",
+    )
+    parser.add_argument(
+        "--sample-index",
+        type=int,
+        default=None,
+        help="Optional fixed dataset sample index.",
+    )
+    return parser.parse_args()
+
+
+def resolve_checkpoint_path(args: argparse.Namespace) -> Path:
+    if args.checkpoint_path is not None:
+        return args.checkpoint_path
+    if args.checkpoint_type == "human":
+        return HUMAN_CHECKPOINT_PATH
+    return TEACHER_CHECKPOINT_PATH
+
+
+def checkpoint_metrics_text(checkpoint: dict[str, Any]) -> str:
+    if "metrics" in checkpoint:
+        return str(checkpoint["metrics"])
+    if "val_metrics" in checkpoint or "train_metrics" in checkpoint:
+        return (
+            f"train={checkpoint.get('train_metrics', 'n/a')} | "
+            f"val={checkpoint.get('val_metrics', 'n/a')}"
+        )
+    return "n/a"
+
+
 def make_custom_ego_state() -> EgoState:
     return EgoState(
         xy=tuple(CUSTOM_EGO_STATE["xy"]),
@@ -129,8 +180,8 @@ def make_ego_state_tensor() -> torch.Tensor:
 
 def make_teacher_config() -> TeacherConfig:
     return TeacherConfig(
-        num_path_candidates=8,
-        num_top_trajectories=8,
+        num_path_candidates=32,
+        num_top_trajectories=64,
         temperature=2.0,
     )
 
@@ -340,13 +391,15 @@ def select_teacher_reference(
     ego_state: EgoState,
 ) -> dict[str, Any]:
     teacher_config = make_teacher_config()
-    teacher_output = score_teacher_candidates(
+    teacher_output = score_all_trajectories_chunked(
         vocab=vocab,
         goal_xy=sample["goal_xy"].numpy(),
         obstacles=obstacles,
         ego_state=ego_state,
         route_path=sample["route_path"].numpy()[:, :2],
         config=teacher_config,
+        path_chunk_size=32,
+        top_k=teacher_config.num_top_trajectories,
     )
 
     best = teacher_output.best_candidate_index
@@ -366,6 +419,7 @@ def select_teacher_reference(
         "candidate_costs": teacher_output.candidate_costs,
         "candidate_path_indices": teacher_output.candidate_path_indices,
         "candidate_velocity_indices": teacher_output.candidate_velocity_indices,
+        "candidate_probs": teacher_output.candidate_probs,
     }
 
 
@@ -383,6 +437,22 @@ def optional_float(value: float | None) -> str:
     if value is None:
         return "n/a"
     return f"{value:.4f}"
+
+
+def format_ranked_paths(
+    indices: np.ndarray,
+    values: np.ndarray,
+    *,
+    higher_is_better: bool,
+) -> str:
+    entries = []
+    for rank, path_index in enumerate(indices, start=1):
+        value = float(values[int(path_index)])
+        if higher_is_better:
+            entries.append(f"{rank}:p{int(path_index)} score={value:.3f}")
+        else:
+            entries.append(f"{rank}:p{int(path_index)} cost={value:.3f}")
+    return ", ".join(entries)
 
 
 def build_candidate_diagnostics(
@@ -428,6 +498,13 @@ def build_candidate_diagnostics(
 
     path_costs = reference["path_costs"]
     path_scores = output["path_scores"][0].detach().cpu().numpy()
+    teacher_top20_paths = np.argsort(path_costs)[:20].astype(np.int64)
+    model_top20_paths = np.argsort(-path_scores)[:20].astype(np.int64)
+    top20_intersection = [
+        int(path_index)
+        for path_index in model_top20_paths
+        if int(path_index) in set(teacher_top20_paths.tolist())
+    ]
     velocity_scores = output["velocity_scores"][0].detach().cpu().numpy()
     trajectory_scores = output["trajectory_scores"][0].detach().cpu().numpy()
     no_collision_logits = output["no_collision_logits"][0].detach().cpu().numpy()
@@ -476,6 +553,23 @@ def build_candidate_diagnostics(
         "ref_model_path_score": float(path_scores[ref_path_index]),
         "pred_model_path_rank": compute_rank_descending(path_scores, pred_path_index),
         "ref_model_path_rank": compute_rank_descending(path_scores, ref_path_index),
+        "teacher_top20_paths": teacher_top20_paths,
+        "model_top20_paths": model_top20_paths,
+        "top20_path_intersection": top20_intersection,
+        "teacher_top20_text": format_ranked_paths(
+            teacher_top20_paths,
+            path_costs,
+            higher_is_better=False,
+        ),
+        "model_top20_text": format_ranked_paths(
+            model_top20_paths,
+            path_scores,
+            higher_is_better=True,
+        ),
+        "ref_in_model_top20": bool(ref_path_index in set(model_top20_paths.tolist())),
+        "pred_in_teacher_top20": bool(
+            pred_path_index in set(teacher_top20_paths.tolist())
+        ),
         "pred_model_velocity_score": float(velocity_scores[pred_velocity_index]),
         "ref_model_velocity_score": float(velocity_scores[ref_velocity_index]),
         "pred_model_velocity_rank": compute_rank_descending(
@@ -518,11 +612,13 @@ def plot_prediction(
     pred_trajectory: np.ndarray,
     pred_path_index: int,
     pred_velocity_index: int,
+    vocab: SparseDriveVocab,
+    ego_state: EgoState,
     output_path: Path,
 ) -> None:
     config = GridConfig()
 
-    target_path = sample.get("route_path", sample["target_path"]).numpy()
+    route_path = sample.get("route_path", sample["target_path"]).numpy()
     old_target_trajectory = sample["target_trajectory"].numpy()
     old_target_mask = sample["target_trajectory_mask"].numpy()
     valid_old_target = old_target_trajectory[old_target_mask > 0.5]
@@ -531,13 +627,45 @@ def plot_prediction(
     reference_mask = reference["trajectory_mask"]
     valid_reference = reference_trajectory[reference_mask > 0.5]
 
+    ref_path_index = int(reference["path_index"])
+    ref_velocity_index = int(reference["velocity_index"])
+    ref_path = vocab.path[ref_path_index].detach().cpu().numpy()
+    pred_path = vocab.path[pred_path_index].detach().cpu().numpy()
+    ref_velocity = vocab.velocity[ref_velocity_index].detach().cpu().numpy()
+    pred_velocity = vocab.velocity[pred_velocity_index].detach().cpu().numpy()
+
+    velocity_times = np.concatenate(
+        [np.array([0.0], dtype=np.float32), TIME_STEPS.astype(np.float32)]
+    )
+    ref_velocity_with_current = np.concatenate(
+        [
+            np.array([float(ego_state.speed)], dtype=np.float32),
+            ref_velocity.astype(np.float32),
+        ]
+    )
+    pred_velocity_with_current = np.concatenate(
+        [
+            np.array([float(ego_state.speed)], dtype=np.float32),
+            pred_velocity.astype(np.float32),
+        ]
+    )
+
     obstacle_centers = sample["obstacle_centers"].numpy()
     obstacle_sizes = sample["obstacle_sizes"].numpy()
     obstacle_velocities = sample["obstacle_velocities"].numpy()
     obstacle_mask = sample["obstacle_mask"].numpy()
     obstacle_ids = sample.get("obstacle_ids")
 
-    fig, ax = plt.subplots(figsize=(9, 8))
+    fig = plt.figure(figsize=(16, 8))
+    gs = fig.add_gridspec(
+        nrows=2,
+        ncols=2,
+        width_ratios=(1.0, 1.2),
+        height_ratios=(1.0, 1.0),
+    )
+    ax_scene = fig.add_subplot(gs[:, 0])
+    ax_path = fig.add_subplot(gs[0, 1])
+    ax_velocity = fig.add_subplot(gs[1, 1])
 
     for obstacle_index in np.where(obstacle_mask > 0.5)[0]:
         center_xy = obstacle_centers[obstacle_index]
@@ -545,7 +673,7 @@ def plot_prediction(
         velocity_xy = obstacle_velocities[obstacle_index]
 
         draw_rectangle_world(
-            ax,
+            ax_scene,
             center_xy,
             size_xy,
             color="#666666",
@@ -556,7 +684,7 @@ def plot_prediction(
             if obstacle_ids is not None and obstacle_index < len(obstacle_ids)
             else f"obs{obstacle_index}"
         )
-        ax.annotate(
+        ax_scene.annotate(
             obstacle_id,
             xy=(float(center_xy[1]), float(center_xy[0])),
             xytext=(4, 4),
@@ -576,22 +704,22 @@ def plot_prediction(
         for time_s in TIME_STEPS:
             future_center = center_xy + velocity_xy * float(time_s)
             draw_rectangle_world(
-                ax,
+                ax_scene,
                 future_center,
                 size_xy,
                 color="#ff9900",
                 alpha=0.07,
             )
 
-    ax.plot(
-        target_path[:, 1],
-        target_path[:, 0],
+    ax_scene.plot(
+        route_path[:, 1],
+        route_path[:, 0],
         color="#1f77b4",
         linewidth=1.2,
         alpha=0.75,
         label="route path",
     )
-    ax.plot(
+    ax_scene.plot(
         valid_old_target[:, 1],
         valid_old_target[:, 0],
         color="#7f7f7f",
@@ -600,16 +728,16 @@ def plot_prediction(
         alpha=0.75,
         label="old dataset target",
     )
-    ax.plot(
+    ax_scene.plot(
         valid_reference[:, 1],
         valid_reference[:, 0],
         color="#2ca02c",
         linewidth=2.0,
         marker="o",
         markersize=4,
-        label="teacher reference",
+        label="full teacher reference",
     )
-    ax.plot(
+    ax_scene.plot(
         pred_trajectory[:, 1],
         pred_trajectory[:, 0],
         color="#d62728",
@@ -618,16 +746,118 @@ def plot_prediction(
         markersize=5,
         label="pred trajectory",
     )
+    ax_scene.scatter(
+        [sample["goal_xy"].numpy()[1]],
+        [sample["goal_xy"].numpy()[0]],
+        color="#d62728",
+        marker="*",
+        s=120,
+        label="goal",
+        zorder=6,
+    )
 
     setup_axis(
-        ax,
+        ax_scene,
         config,
         (
-            f"ref p{reference['path_index']} v{reference['velocity_index']} | "
+            f"full ref p{ref_path_index} v{ref_velocity_index} | "
             f"pred p{pred_path_index} v{pred_velocity_index}"
         ),
     )
-    ax.legend(loc="upper right")
+    ax_scene.legend(loc="upper right")
+
+    ax_path.plot(
+        route_path[:, 1],
+        route_path[:, 0],
+        color="#1f77b4",
+        linewidth=1.2,
+        linestyle="--",
+        alpha=0.75,
+        label="route",
+    )
+    ax_path.plot(
+        ref_path[:, 1],
+        ref_path[:, 0],
+        color="#2ca02c",
+        linewidth=2.2,
+        marker="o",
+        markersize=2.8,
+        label=f"ref path p{ref_path_index}",
+    )
+    ax_path.plot(
+        pred_path[:, 1],
+        pred_path[:, 0],
+        color="#d62728",
+        linewidth=2.0,
+        marker="x",
+        markersize=3.0,
+        label=f"pred path p{pred_path_index}",
+    )
+    ax_path.scatter(
+        [ref_path[0, 1]],
+        [ref_path[0, 0]],
+        color="#2ca02c",
+        s=45,
+        label="start",
+        zorder=5,
+    )
+    ax_path.scatter(
+        [ref_path[-1, 1]],
+        [ref_path[-1, 0]],
+        color="#2ca02c",
+        s=55,
+        marker="o",
+        zorder=5,
+    )
+    ax_path.scatter(
+        [pred_path[-1, 1]],
+        [pred_path[-1, 0]],
+        color="#d62728",
+        s=55,
+        marker="x",
+        zorder=5,
+    )
+    ax_path.set_title("selected path vocab shape")
+    ax_path.set_xlabel("y left [m]")
+    ax_path.set_ylabel("x forward [m]")
+    ax_path.set_aspect("equal", adjustable="box")
+    ax_path.invert_xaxis()
+    ax_path.grid(True, alpha=0.25)
+    ax_path.legend(loc="best")
+
+    ax_velocity.plot(
+        velocity_times,
+        ref_velocity_with_current,
+        color="#2ca02c",
+        linewidth=2.0,
+        marker="o",
+        markersize=4,
+        label=f"ref velocity v{ref_velocity_index}",
+    )
+    ax_velocity.plot(
+        velocity_times,
+        pred_velocity_with_current,
+        color="#d62728",
+        linewidth=1.8,
+        marker="x",
+        markersize=5,
+        label=f"pred velocity v{pred_velocity_index}",
+    )
+    ax_velocity.scatter(
+        [0.0],
+        [float(ego_state.speed)],
+        color="#1f77b4",
+        s=55,
+        zorder=3,
+        label="current ego speed",
+    )
+    ax_velocity.set_title("selected velocity vocab shape | current + 8 future steps")
+    ax_velocity.set_xlabel("time [s]")
+    ax_velocity.set_ylabel("speed [m/s]")
+    ax_velocity.set_xticks(velocity_times)
+    ax_velocity.grid(True, alpha=0.25)
+    ax_velocity.legend(loc="best")
+
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=180)
@@ -635,13 +865,16 @@ def plot_prediction(
 
 
 def main() -> None:
-    if not CHECKPOINT_PATH.exists():
+    args = parse_args()
+    checkpoint_path = resolve_checkpoint_path(args)
+    if not checkpoint_path.exists():
         raise FileNotFoundError(
-            f"Missing checkpoint: {CHECKPOINT_PATH}. Run train.py first."
+            f"Missing checkpoint: {checkpoint_path}. "
+            "Run train.py or train_human.py first."
         )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     vocab_cpu = SparseDriveVocab.load()
     vocab = vocab_cpu.to(device)
@@ -651,7 +884,11 @@ def main() -> None:
 
     ego_state = make_custom_ego_state()
     dataset = ToySparseDriveV2Dataset(num_samples=1024, seed_offset=10_000)
-    sample_index = random.randrange(len(dataset))
+    sample_index = (
+        int(args.sample_index)
+        if args.sample_index is not None
+        else random.randrange(len(dataset))
+    )
     sample = dataset[sample_index]
     sample = apply_custom_goal(sample)
     if CUSTOM_OBSTACLES:
@@ -705,11 +942,15 @@ def main() -> None:
         pred_trajectory=pred_trajectory[0].cpu().numpy(),
         pred_path_index=pred_path_index,
         pred_velocity_index=pred_velocity_index,
+        vocab=vocab_cpu,
+        ego_state=ego_state,
         output_path=output_path,
     )
 
+    print(f"checkpoint type: {args.checkpoint_type}")
+    print(f"checkpoint path: {checkpoint_path}")
     print(f"checkpoint epoch: {checkpoint['epoch']}")
-    print(f"checkpoint metrics: {checkpoint['metrics']}")
+    print(f"checkpoint metrics: {checkpoint_metrics_text(checkpoint)}")
     print(f"sample_index: {sample_index}")
     print(f"ego xy: {ego_state.xy}")
     print(f"ego yaw: {ego_state.yaw}")
@@ -727,10 +968,10 @@ def main() -> None:
         )
     print(f"old target path: {int(sample['path_index'])}")
     print(f"old target velocity: {int(sample['velocity_index'])}")
-    print(f"reference path: {reference['path_index']}")
-    print(f"reference velocity: {reference['velocity_index']}")
-    print(f"reference collides: {reference['collides']}")
-    print(f"reference cost: {reference['cost']:.4f}")
+    print(f"full teacher reference path: {reference['path_index']}")
+    print(f"full teacher reference velocity: {reference['velocity_index']}")
+    print(f"full teacher reference collides: {reference['collides']}")
+    print(f"full teacher reference cost: {reference['cost']:.4f}")
     print(f"reference_goal_cost: {reference['goal_cost']:.4f}")
     print(f"reference_route_cost: {reference['route_cost']:.4f}")
     print(f"reference_clearance: {reference['clearance']:.4f}")
@@ -766,6 +1007,15 @@ def main() -> None:
         f"pred={diagnostics['pred_model_path_score']:.4f}/"
         f"{diagnostics['pred_model_path_rank']}"
     )
+    print(f"teacher_top20_paths: {diagnostics['teacher_top20_text']}")
+    print(f"model_top20_paths: {diagnostics['model_top20_text']}")
+    print(
+        "top20_path_intersection: "
+        f"{diagnostics['top20_path_intersection']} "
+        f"count={len(diagnostics['top20_path_intersection'])}"
+    )
+    print(f"ref_in_model_top20: {diagnostics['ref_in_model_top20']}")
+    print(f"pred_in_teacher_top20: {diagnostics['pred_in_teacher_top20']}")
     print(
         "model_velocity_score/rank "
         f"ref={diagnostics['ref_model_velocity_score']:.4f}/"

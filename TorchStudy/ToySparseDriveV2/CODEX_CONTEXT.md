@@ -758,3 +758,253 @@ python -u dataset/build_teacher_cache.py \
 
 A 3-scene smoke test produced ego speeds 2.70, 5.57, and 4.02 m/s, no initial
 obstacle overlap, and collision-free Teacher best trajectories.
+
+
+## 2026-06-26 Update: Human Driving Data Path
+
+The project now has a separate human-driving supervision path. Keep it separate
+from the existing Teacher training path until experiments prove it is useful.
+
+### GUI / Matplotlib
+
+The `torch310` conda environment has X11/matplotlib GUI issues. Use the wrapper:
+
+```bash
+cd ~/Documents/Alg_study/TorchStudy/ToySparseDriveV2
+./scripts/run_gui.sh conda run -n torch310 python -u human_drive/drive_sim.py
+```
+
+`scripts/run_gui.sh` sets `MPLBACKEND=TkAgg`, `MPLCONFIGDIR=/tmp/matplotlib`,
+and preloads system `libX11/libxcb`. This avoids `FigureCanvasAgg` noninteractive
+warnings and Xlib crashes.
+
+`dataset/teacher.py` only forces `Agg` when `MPLBACKEND` is unset, so the wrapper
+can enable GUI plotting.
+
+### Manual Driving Controls
+
+`human_drive/drive_sim.py` is a simple interactive data collector.
+
+Current step control is two-stage:
+
+```text
+speed command: + accelerate, - brake, = keep speed
+steer command: A/a left, W/w straight, D/d right
+```
+
+A simulation step advances only after both a speed command and a steer command
+are selected. The order does not matter. Matplotlib default keymaps are disabled,
+so keys like `s` should not trigger figure save.
+
+Episode controls:
+
+```text
+f or Enter: save current episode and go to next scene
+r: discard current scene and generate a new scene
+Backspace: reset current scene
+Q or Esc: quit
+```
+
+Only explicit save writes JSON. Discard/reset/quit should not save garbage data.
+
+Human episodes are stored in:
+
+```text
+human_drive/episodes/*.json
+```
+
+As of the last check on 2026-06-26:
+
+```text
+total_json = 101
+goal_reached = 91
+timeout = 10
+average steps ~= 40
+```
+
+These 101 episodes are enough for a sanity check, not for a robust model.
+Recommended scale:
+
+```text
+~100 episodes: validate pipeline / overfit check
+300-500 episodes: first useful human-style model
+1000+ episodes: start discussing generalization
+```
+
+### Human Dataset
+
+New file:
+
+```text
+human_drive/human_dataset.py
+```
+
+It reads `human_drive/episodes/*.json` and splits each episode into many
+time-step samples. For each sample:
+
+1. Use current ego state as origin.
+2. Transform route, goal, obstacles, and future ego trajectory into current ego
+   coordinates.
+3. Build the same 4-channel grid used by the model:
+
+```text
+0 current obstacles
+1 future obstacle swept area
+2 route path
+3 goal point
+```
+
+4. Use future 4 s ego trajectory as the human target.
+5. Match that continuous target to the nearest SparseDriveV2 vocab pair:
+
+```text
+best path_index, velocity_index = argmin L2(vocab trajectory, human future)
+```
+
+Label matching is cached in:
+
+```text
+human_drive/cache/*.npz
+```
+
+Use `--rebuild-cache` only when episodes changed or label logic changed.
+
+Important: this dataset converts every timestep to the local ego frame. Do not
+train directly on world-frame human coordinates.
+
+### Human Training
+
+New file:
+
+```text
+train_human.py
+```
+
+It trains a fresh `ToySparseDriveV2Model` on human episodes only. It does not use
+Teacher cache. It forces the human target path into the model candidate set so
+trajectory CE always has a valid target candidate.
+
+Default command:
+
+```bash
+cd ~/Documents/Alg_study/TorchStudy/ToySparseDriveV2
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -u train_human.py --rebuild-cache
+```
+
+After cache exists:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -u train_human.py
+```
+
+Useful smoke command:
+
+```bash
+python train_human.py \
+  --max-episodes 4 \
+  --epochs 1 \
+  --batch-size 2 \
+  --num-workers 0 \
+  --cache-dir /tmp/toy_sparse_human_smoke \
+  --rebuild-cache \
+  --path-chunk-size 128 \
+  --label-batch-size 16
+```
+
+Human checkpoint path:
+
+```text
+outputs/checkpoints_human/best_human_model.pt
+```
+
+Best checkpoint is selected by validation `traj_l2_error`.
+
+### First Human Training Result
+
+With 101 episodes:
+
+```text
+train episodes = 81
+val episodes = 20
+train samples = 1689
+val samples = 439
+```
+
+Training showed the pipeline works but overfits quickly.
+
+Best checkpoint was around epoch 28:
+
+```text
+epoch 28
+train traj_l2 ~= 1.36
+train pair ~= 0.31
+val traj_l2 ~= 2.34
+val endpoint_l2 ~= 5.05
+val pair ~= 0.11
+```
+
+After epoch 30, train continued improving but val loss and val geometry became
+worse. Do not long-train this small 101-episode set. Use it to validate the
+pipeline, then collect more data or improve data/augmentation.
+
+### Testing Human Checkpoint
+
+`test_random.py` now supports Teacher and Human checkpoints:
+
+```bash
+python test_random.py --checkpoint-type teacher
+python test_random.py --checkpoint-type human
+python test_random.py --checkpoint-type human --sample-index 0
+python test_random.py --checkpoint-path outputs/checkpoints_human/best_human_model.pt
+```
+
+It uses:
+
+```python
+torch.load(..., weights_only=False)
+```
+
+because PyTorch 2.6+ defaults to `weights_only=True`, but this checkpoint stores
+metrics/args/path objects in addition to weights.
+
+Current limitation: `test_random.py` still compares predictions against the full
+Teacher reference, not against human future trajectories. For real human-model
+evaluation, add a dedicated `test_human_random.py` that samples from
+`HumanDriveDataset` and compares prediction to the human future target.
+
+### Current Human Path Interpretation
+
+The first human checkpoint can load and run, but results on synthetic
+`test_random.py` scenes are not reliable. This is expected because:
+
+1. It was trained from scratch on only 101 episodes.
+2. It sees human-style local data but `test_random.py` uses custom synthetic
+   scenarios and Teacher reference diagnostics.
+3. Human checkpoint has no explicit collision/safety training yet.
+
+Do not judge the human approach only by `test_random.py --checkpoint-type human`.
+Build a human-specific evaluator before making strong conclusions.
+
+### Recent Open TODOs
+
+The user requested new random scene generation constraints:
+
+```text
+1. no vehicles behind ego
+2. no reverse-driving vehicles
+```
+
+This was discussed but not fully implemented before switching to human-data
+training. If continuing synthetic/interactive scene generation, implement these
+in `dataset/dataset.py` sampling helpers so `train.py`, cache generation, and
+`human_drive/drive_sim.py` stay consistent.
+
+Recommended implementation:
+
+```text
+center_xy[0] >= ego_front_buffer, e.g. 3-5 m
+velocity_xy[0] >= 0
+optional: restrict |velocity_xy[1]| to avoid unrealistic sideways motion
+```
+
+Make this change in the shared obstacle sampling path, not only in one visualizer.
