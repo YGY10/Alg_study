@@ -88,21 +88,21 @@ CUSTOM_OBSTACLES = [
     #     "size_xy": (4.5, 2.2),
     #     "velocity_xy": (0.2, 0.0),
     # },
-    {
-        "center_xy": (18.0, -10.0),
-        "size_xy": (4.5, 2.2),
-        "velocity_xy": (0.2, 0.0),
-    },
-    {
-        "center_xy": (18.0, -3.0),
-        "size_xy": (4.5, 2.2),
-        "velocity_xy": (1.0, 0.0),
-    },
-    {
-        "center_xy": (18.0, 0.0),
-        "size_xy": (5.0, 2.5),
-        "velocity_xy": (1.0, 0.0),
-    },
+    # {
+    #     "center_xy": (18.0, -10.0),
+    #     "size_xy": (4.5, 2.2),
+    #     "velocity_xy": (0.2, 0.0),
+    # },
+    # {
+    #     "center_xy": (18.0, -3.0),
+    #     "size_xy": (4.5, 2.2),
+    #     "velocity_xy": (1.0, 0.0),
+    # },
+    # {
+    #     "center_xy": (18.0, 0.0),
+    #     "size_xy": (5.0, 2.5),
+    #     "velocity_xy": (1.0, 0.0),
+    # },
     {
         "center_xy": (18.0, 8.0),
         "size_xy": (5.0, 2.5),
