@@ -28,6 +28,83 @@ class Obstacle:
     velocity_xy: np.ndarray
 
 
+@dataclass(frozen=True)
+class SceneSamplingConfig:
+    mode: str = "random"
+    ego_speed_range: tuple[float, float] = (0.0, 10.0)
+    goal_x_range: tuple[float, float] | None = None
+    goal_y_range: tuple[float, float] | None = None
+    obstacle_x_range: tuple[float, float] | None = (3.0, 45.0)
+    obstacle_y_range: tuple[float, float] | None = None
+    obstacle_vx_range: tuple[float, float] = (0.0, 4.0)
+    obstacle_vy_range: tuple[float, float] = (-0.5, 0.5)
+    route_aware_probability: float = 0.7
+    min_obstacles: int | None = None
+    max_obstacles: int | None = None
+
+
+def make_scene_sampling_config(mode: str) -> SceneSamplingConfig:
+    if mode == "random":
+        return SceneSamplingConfig(mode=mode)
+    if mode == "straight":
+        return SceneSamplingConfig(
+            mode=mode,
+            ego_speed_range=(3.0, 8.0),
+            goal_x_range=(30.0, 50.0),
+            goal_y_range=(-8.0, 8.0),
+            obstacle_x_range=(10.0, 45.0),
+            obstacle_y_range=(-10.0, 10.0),
+            obstacle_vx_range=(0.0, 4.0),
+            obstacle_vy_range=(-0.5, 0.5),
+            route_aware_probability=0.9,
+            min_obstacles=4,
+            max_obstacles=10,
+        )
+    if mode == "low_speed_avoid":
+        return SceneSamplingConfig(
+            mode=mode,
+            ego_speed_range=(0.0, 3.0),
+            goal_x_range=(25.0, 45.0),
+            goal_y_range=(-15.0, 15.0),
+            obstacle_x_range=(8.0, 30.0),
+            obstacle_y_range=(-8.0, 8.0),
+            obstacle_vx_range=(0.0, 2.0),
+            obstacle_vy_range=(-0.4, 0.4),
+            route_aware_probability=0.9,
+            min_obstacles=4,
+            max_obstacles=9,
+        )
+    if mode == "follow_stop":
+        return SceneSamplingConfig(
+            mode=mode,
+            ego_speed_range=(3.0, 6.0),
+            goal_x_range=(30.0, 50.0),
+            goal_y_range=(-8.0, 8.0),
+            obstacle_x_range=(10.0, 28.0),
+            obstacle_y_range=(-8.0, 8.0),
+            obstacle_vx_range=(0.0, 2.0),
+            obstacle_vy_range=(-0.2, 0.2),
+            route_aware_probability=1.0,
+            min_obstacles=6,
+            max_obstacles=10,
+        )
+    if mode == "dense_front":
+        return SceneSamplingConfig(
+            mode=mode,
+            ego_speed_range=(2.0, 8.0),
+            goal_x_range=(30.0, 50.0),
+            goal_y_range=(-12.0, 12.0),
+            obstacle_x_range=(10.0, 45.0),
+            obstacle_y_range=(-10.0, 10.0),
+            obstacle_vx_range=(0.0, 4.0),
+            obstacle_vy_range=(-0.5, 0.5),
+            route_aware_probability=0.95,
+            min_obstacles=8,
+            max_obstacles=12,
+        )
+    raise ValueError(f"Unsupported scene sampling mode: {mode}")
+
+
 def obstacle_center_at_time(obstacle: Obstacle, time_s: float) -> np.ndarray:
     return obstacle.center_xy + obstacle.velocity_xy * time_s
 
@@ -35,11 +112,20 @@ def obstacle_center_at_time(obstacle: Obstacle, time_s: float) -> np.ndarray:
 def sample_obstacle(
     rng: np.random.Generator,
     grid_config: GridConfig,
+    config: SceneSamplingConfig = SceneSamplingConfig(),
 ) -> Obstacle:
+    x_low, x_high = config.obstacle_x_range or (
+        grid_config.x_min + 8.0,
+        grid_config.x_max - 8.0,
+    )
+    y_low, y_high = config.obstacle_y_range or (
+        grid_config.y_min + 8.0,
+        grid_config.y_max - 8.0,
+    )
     center_xy = np.array(
         [
-            rng.uniform(grid_config.x_min + 8.0, grid_config.x_max - 8.0),
-            rng.uniform(grid_config.y_min + 8.0, grid_config.y_max - 8.0),
+            rng.uniform(x_low, x_high),
+            rng.uniform(y_low, y_high),
         ],
         dtype=np.float32,
     )
@@ -49,8 +135,8 @@ def sample_obstacle(
     )
     velocity_xy = np.array(
         [
-            rng.uniform(-4.0, 4.0),
-            rng.uniform(-3.0, 3.0),
+            rng.uniform(*config.obstacle_vx_range),
+            rng.uniform(*config.obstacle_vy_range),
         ],
         dtype=np.float32,
     )
@@ -65,38 +151,51 @@ def sample_route_aware_obstacle(
     rng: np.random.Generator,
     grid_config: GridConfig,
     route_path: np.ndarray,
+    config: SceneSamplingConfig = SceneSamplingConfig(),
     x_min_forward: float = 10.0,
     x_max_forward: float = 45.0,
     lateral_range: float = 10.0,
     longitudinal_jitter: float = 3.0,
 ) -> Obstacle:
+    if config.obstacle_x_range is not None:
+        x_min_forward, x_max_forward = config.obstacle_x_range
+    if config.obstacle_y_range is not None:
+        lateral_range = max(
+            abs(config.obstacle_y_range[0]),
+            abs(config.obstacle_y_range[1]),
+        )
+
     route_xy = route_path[:, :2]
-    candidate_mask = (
-        (route_xy[:, 0] >= x_min_forward)
-        & (route_xy[:, 0] <= x_max_forward)
+    candidate_mask = (route_xy[:, 0] >= x_min_forward) & (
+        route_xy[:, 0] <= x_max_forward
     )
     candidate_points = route_xy[candidate_mask]
     if len(candidate_points) == 0:
-        return sample_obstacle(rng, grid_config)
+        return sample_obstacle(rng, grid_config, config=config)
 
     anchor = candidate_points[int(rng.integers(0, len(candidate_points)))]
+    lateral_low, lateral_high = (
+        config.obstacle_y_range
+        if config.obstacle_y_range is not None
+        else (-lateral_range, lateral_range)
+    )
     center_xy = np.array(
         [
             anchor[0] + rng.uniform(-longitudinal_jitter, longitudinal_jitter),
-            anchor[1] + rng.uniform(-lateral_range, lateral_range),
+            anchor[1] + rng.uniform(lateral_low, lateral_high),
         ],
         dtype=np.float32,
     )
-    center_xy[0] = np.clip(
-        center_xy[0],
+    clip_x_low, clip_x_high = config.obstacle_x_range or (
         grid_config.x_min + 8.0,
         grid_config.x_max - 8.0,
     )
-    center_xy[1] = np.clip(
-        center_xy[1],
+    clip_y_low, clip_y_high = config.obstacle_y_range or (
         grid_config.y_min + 8.0,
         grid_config.y_max - 8.0,
     )
+    center_xy[0] = np.clip(center_xy[0], clip_x_low, clip_x_high)
+    center_xy[1] = np.clip(center_xy[1], clip_y_low, clip_y_high)
 
     size_xy = (
         float(rng.uniform(3.0, 8.0)),
@@ -104,8 +203,8 @@ def sample_route_aware_obstacle(
     )
     velocity_xy = np.array(
         [
-            rng.uniform(-4.0, 4.0),
-            rng.uniform(-3.0, 3.0),
+            rng.uniform(*config.obstacle_vx_range),
+            rng.uniform(*config.obstacle_vy_range),
         ],
         dtype=np.float32,
     )
@@ -120,16 +219,24 @@ def sample_mixed_obstacle(
     rng: np.random.Generator,
     grid_config: GridConfig,
     route_path: np.ndarray,
-    route_aware_probability: float = 0.7,
+    config: SceneSamplingConfig = SceneSamplingConfig(),
 ) -> Obstacle:
-    if rng.random() < route_aware_probability:
+    if rng.random() < config.route_aware_probability:
         return sample_route_aware_obstacle(
             rng=rng,
             grid_config=grid_config,
             route_path=route_path,
+            config=config,
         )
-    return sample_obstacle(rng, grid_config)
+    return sample_obstacle(rng, grid_config, config=config)
 
+
+def obstacle_is_valid_for_scene(obstacle: Obstacle) -> bool:
+    if float(obstacle.center_xy[0]) < 3.0:
+        return False
+    if float(obstacle.velocity_xy[0]) < 0.0:
+        return False
+    return True
 
 
 def obstacle_overlaps_ego_initially(
@@ -142,6 +249,7 @@ def obstacle_overlaps_ego_initially(
     obstacle_size = np.asarray(obstacle.size_xy, dtype=np.float32)
     half_extent = 0.5 * (ego_size + obstacle_size) + float(safety_margin)
     return bool(np.all(np.abs(obstacle.center_xy - ego_xy) <= half_extent))
+
 
 def rasterize_dynamic_obstacles(
     input_grid: np.ndarray,
@@ -227,6 +335,7 @@ class ToySparseDriveV2Dataset(Dataset):
         max_obstacles: int = 12,
         teacher_config: TeacherConfig | None = None,
         ego_state: EgoState = EgoState(speed=0.0),
+        scene_config: SceneSamplingConfig = SceneSamplingConfig(),
         teacher_cache_dir: str | Path | None = None,
         require_teacher_cache: bool = False,
     ) -> None:
@@ -242,6 +351,7 @@ class ToySparseDriveV2Dataset(Dataset):
             temperature=2.0,
         )
         self.ego_state = ego_state
+        self.scene_config = scene_config
         self.teacher_cache_dir = (
             Path(teacher_cache_dir) if teacher_cache_dir is not None else None
         )
@@ -260,17 +370,27 @@ class ToySparseDriveV2Dataset(Dataset):
         )
         rng = np.random.default_rng(seed_sequence)
 
-        route_path_index = int(rng.integers(0, self.vocab.num_path))
+        route_path_index = self.sample_route_path_index(rng)
         route_path = self.vocab.path[route_path_index].cpu().numpy()
         goal_xy = route_path[-1, :2].astype(np.float32)
         ego_state = EgoState(
             xy=self.ego_state.xy,
             yaw=self.ego_state.yaw,
-            speed=float(rng.uniform(0.0, 10.0)),
+            speed=float(rng.uniform(*self.scene_config.ego_speed_range)),
             size_xy=self.ego_state.size_xy,
         )
 
-        num_obstacles = int(rng.integers(self.min_obstacles, self.max_obstacles + 1))
+        min_obstacles = (
+            self.scene_config.min_obstacles
+            if self.scene_config.min_obstacles is not None
+            else self.min_obstacles
+        )
+        max_obstacles = (
+            self.scene_config.max_obstacles
+            if self.scene_config.max_obstacles is not None
+            else self.max_obstacles
+        )
+        num_obstacles = int(rng.integers(min_obstacles, max_obstacles + 1))
         obstacles = []
         for _ in range(num_obstacles):
             for _sample_attempt in range(100):
@@ -278,9 +398,11 @@ class ToySparseDriveV2Dataset(Dataset):
                     rng=rng,
                     grid_config=self.grid_config,
                     route_path=route_path,
-                    route_aware_probability=0.7,
+                    config=self.scene_config,
                 )
-                if not obstacle_overlaps_ego_initially(
+                if obstacle_is_valid_for_scene(
+                    obstacle
+                ) and not obstacle_overlaps_ego_initially(
                     obstacle=obstacle,
                     ego_state=ego_state,
                     safety_margin=self.teacher_config.safety_margin,
@@ -294,6 +416,21 @@ class ToySparseDriveV2Dataset(Dataset):
                 )
 
         return route_path_index, route_path, goal_xy, ego_state, obstacles
+
+    def sample_route_path_index(self, rng: np.random.Generator) -> int:
+        endpoints = self.vocab.path[:, -1, :2].cpu().numpy()
+        mask = np.ones((self.vocab.num_path,), dtype=bool)
+        if self.scene_config.goal_x_range is not None:
+            x_low, x_high = self.scene_config.goal_x_range
+            mask &= (endpoints[:, 0] >= x_low) & (endpoints[:, 0] <= x_high)
+        if self.scene_config.goal_y_range is not None:
+            y_low, y_high = self.scene_config.goal_y_range
+            mask &= (endpoints[:, 1] >= y_low) & (endpoints[:, 1] <= y_high)
+
+        candidate_indices = np.where(mask)[0]
+        if len(candidate_indices) == 0:
+            return int(rng.integers(0, self.vocab.num_path))
+        return int(candidate_indices[int(rng.integers(0, len(candidate_indices)))])
 
     def teacher_cache_path(self, index: int) -> Path | None:
         if self.teacher_cache_dir is None:
@@ -329,7 +466,10 @@ class ToySparseDriveV2Dataset(Dataset):
         route_path_index, route_path, goal_xy, ego_state, obstacles = (
             self.generate_scene(index, scene_attempt=scene_attempt)
         )
-        if teacher_cache is not None and int(teacher_cache["route_path_index"]) != route_path_index:
+        if (
+            teacher_cache is not None
+            and int(teacher_cache["route_path_index"]) != route_path_index
+        ):
             raise ValueError(
                 f"Teacher cache route mismatch for sample {index}: "
                 f"cache={int(teacher_cache['route_path_index'])}, scene={route_path_index}"
@@ -370,9 +510,7 @@ class ToySparseDriveV2Dataset(Dataset):
             teacher_path_indices = teacher_cache["teacher_path_indices"].astype(
                 np.int64
             )
-            teacher_path_probs = teacher_cache["teacher_path_probs"].astype(
-                np.float32
-            )
+            teacher_path_probs = teacher_cache["teacher_path_probs"].astype(np.float32)
             teacher_candidate_probs = teacher_cache["teacher_topk_probs"].astype(
                 np.float32
             )

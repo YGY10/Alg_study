@@ -16,9 +16,17 @@ for path in (TOY_ROOT, CURRENT_DIR, TOY_ROOT / "vocab"):
         sys.path.insert(0, str(path))
 
 try:
-    from dataset.dataset import ToySparseDriveV2Dataset, obstacles_to_teacher_dicts
+    from dataset.dataset import (
+        ToySparseDriveV2Dataset,
+        make_scene_sampling_config,
+        obstacles_to_teacher_dicts,
+    )
 except ModuleNotFoundError:
-    from dataset import ToySparseDriveV2Dataset, obstacles_to_teacher_dicts
+    from dataset import (
+        ToySparseDriveV2Dataset,
+        make_scene_sampling_config,
+        obstacles_to_teacher_dicts,
+    )
 from teacher import TeacherConfig, score_all_trajectories_chunked, softmax_from_cost
 
 
@@ -36,6 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=64)
     parser.add_argument("--num-path-candidates", type=int, default=8)
     parser.add_argument("--max-scene-attempts", type=int, default=20)
+    parser.add_argument(
+        "--scene-mode",
+        choices=("random", "straight", "low_speed_avoid", "follow_stop", "dense_front"),
+        default="random",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -60,6 +73,7 @@ def main() -> None:
         num_samples=args.num_samples,
         seed_offset=args.seed_offset,
         teacher_config=teacher_config,
+        scene_config=make_scene_sampling_config(args.scene_mode),
     )
     config_json = json.dumps(asdict(teacher_config), sort_keys=True)
 
@@ -116,6 +130,7 @@ def main() -> None:
             sample_index=np.asarray(index, dtype=np.int64),
             seed_offset=np.asarray(args.seed_offset, dtype=np.int64),
             scene_attempt=np.asarray(scene_attempt, dtype=np.int64),
+            scene_mode=np.asarray(args.scene_mode),
             route_path_index=np.asarray(route_path_index, dtype=np.int64),
             ego_speed=np.asarray(ego_state.speed, dtype=np.float32),
             teacher_config_json=np.asarray(config_json),

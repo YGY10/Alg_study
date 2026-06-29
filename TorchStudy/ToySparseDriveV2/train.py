@@ -19,9 +19,9 @@ for path in (
         sys.path.insert(0, str(path))
 
 try:
-    from dataset.dataset import ToySparseDriveV2Dataset
+    from dataset.dataset import ToySparseDriveV2Dataset, make_scene_sampling_config
 except ModuleNotFoundError:
-    from dataset import ToySparseDriveV2Dataset
+    from dataset import ToySparseDriveV2Dataset, make_scene_sampling_config
 from losses import compute_model_candidate_losses
 from model import ToySparseDriveV2Model
 from teacher import (
@@ -44,6 +44,7 @@ CHECKPOINT_DIR = PROJECT_ROOT / "outputs" / "checkpoints"
 BEST_CHECKPOINT_PATH = CHECKPOINT_DIR / "best_model.pt"
 TEACHER_CACHE_DIR = PROJECT_ROOT / "cache" / "teacher_v1"
 SAFETY_SCORE_WEIGHT = 1.0
+SCENE_MODE = "random"
 
 
 def move_batch_to_device(
@@ -460,6 +461,7 @@ def main() -> None:
     dataset = ToySparseDriveV2Dataset(
         num_samples=NUM_SAMPLES,
         seed_offset=0,
+        scene_config=make_scene_sampling_config(SCENE_MODE),
         teacher_cache_dir=TEACHER_CACHE_DIR,
         require_teacher_cache=True,
     )

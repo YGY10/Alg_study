@@ -42,7 +42,7 @@ for path in (TOY_ROOT, DATASET_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from dataset import Obstacle, ToySparseDriveV2Dataset
+from dataset import Obstacle, ToySparseDriveV2Dataset, make_scene_sampling_config
 from grid import GridConfig
 from teacher import EgoState, TeacherConfig, draw_rectangle_world
 
@@ -241,6 +241,7 @@ class HumanDriveSimulator:
             seed_offset=args.seed_offset,
             grid_config=self.grid_config,
             teacher_config=self.teacher_config,
+            scene_config=make_scene_sampling_config(args.scene_mode),
         )
         self.speed_command_map = make_speed_command_map(
             accel_step=args.accel,
@@ -327,6 +328,7 @@ class HumanDriveSimulator:
     def build_episode_record(self) -> dict[str, Any]:
         return {
             "source": "human_drive_v1",
+            "scene_mode": str(self.args.scene_mode),
             "scene_index": int(self.scene_index),
             "scene_attempt": int(self.scene_attempt),
             "route_path_index": int(self.route_path_index),
@@ -580,7 +582,8 @@ class HumanDriveSimulator:
             linewidth=2.0,
         )
         self.ax_scene.set_title(
-            f"scene {self.scene_index} | t={self.time_s:.1f}s | "
+            f"scene {self.scene_index} | mode={self.args.scene_mode} | "
+            f"t={self.time_s:.1f}s | "
             f"speed={self.state.speed:.2f}m/s | status={self.status}\n"
             f"pending speed={self.pending_accel_key or '_'} "
             f"steer={self.pending_steer_key or '_'} | "
@@ -653,6 +656,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-samples", type=int, default=1_000_000)
     parser.add_argument("--scene-index", type=int, default=None)
     parser.add_argument("--scene-attempt", type=int, default=0)
+    parser.add_argument(
+        "--scene-mode",
+        choices=("random", "straight", "low_speed_avoid", "follow_stop", "dense_front"),
+        default="random",
+        help="Scene distribution used for newly sampled human driving episodes.",
+    )
     parser.add_argument("--dt", type=float, default=0.2)
     parser.add_argument("--max-time", type=float, default=12.0)
     parser.add_argument("--accel", type=float, default=1.5)
