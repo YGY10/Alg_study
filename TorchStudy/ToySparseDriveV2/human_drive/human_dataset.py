@@ -114,6 +114,45 @@ def trajectory_l2_distance(
     return dist.sum(dim=-1) / target_mask.sum().clamp(min=1.0)
 
 
+def cumulative_distance(points_xy: np.ndarray) -> np.ndarray:
+    points_xy = np.asarray(points_xy, dtype=np.float32)
+    if len(points_xy) == 0:
+        return np.zeros((0,), dtype=np.float32)
+    segment = np.linalg.norm(np.diff(points_xy, axis=0), axis=-1)
+    return np.concatenate(
+        [np.zeros((1,), dtype=np.float32), np.cumsum(segment).astype(np.float32)],
+        axis=0,
+    )
+
+
+def interp_points_by_distance(
+    points_xy: np.ndarray,
+    query_distance: np.ndarray,
+) -> np.ndarray:
+    points_xy = np.asarray(points_xy, dtype=np.float32)
+    query_distance = np.asarray(query_distance, dtype=np.float32)
+    distance = cumulative_distance(points_xy)
+    if len(points_xy) == 0:
+        return np.zeros((len(query_distance), 2), dtype=np.float32)
+    if float(distance[-1]) <= 1.0e-6:
+        return np.repeat(points_xy[:1], repeats=len(query_distance), axis=0)
+    clipped_query = np.clip(query_distance, 0.0, float(distance[-1]))
+    return np.stack(
+        [
+            np.interp(clipped_query, distance, points_xy[:, 0]),
+            np.interp(clipped_query, distance, points_xy[:, 1]),
+        ],
+        axis=-1,
+    ).astype(np.float32)
+
+
+def softmax_numpy(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    values = values - np.max(values)
+    exp_values = np.exp(values)
+    return (exp_values / np.sum(exp_values)).astype(np.float32)
+
+
 class HumanDriveDataset(Dataset):
     def __init__(
         self,
@@ -124,12 +163,22 @@ class HumanDriveDataset(Dataset):
         rebuild_cache: bool = False,
         path_chunk_size: int = 32,
         label_batch_size: int = 64,
+        long_path_horizon: float = 8.0,
+        long_path_compare_points: int = 32,
+        long_path_positive_topk: int = 8,
+        long_path_temperature: float = 2.0,
+        long_path_min_progress: float = 5.0,
     ) -> None:
         self.episode_paths = [Path(path) for path in episode_paths]
         self.vocab = vocab or SparseDriveVocab.load()
         self.grid_config = grid_config
         self.path_chunk_size = path_chunk_size
         self.label_batch_size = label_batch_size
+        self.long_path_horizon = float(long_path_horizon)
+        self.long_path_compare_points = int(long_path_compare_points)
+        self.long_path_positive_topk = int(long_path_positive_topk)
+        self.long_path_temperature = float(long_path_temperature)
+        self.long_path_min_progress = float(long_path_min_progress)
         self.cache_path = Path(cache_path) if cache_path is not None else None
 
         self.samples: list[dict[str, Any]] = []
@@ -138,6 +187,9 @@ class HumanDriveDataset(Dataset):
 
         self.path_indices: np.ndarray
         self.velocity_indices: np.ndarray
+        self.long_path_indices: np.ndarray
+        self.long_path_weights: np.ndarray
+        self.long_path_valid: np.ndarray
         if (
             self.cache_path is not None
             and self.cache_path.is_file()
@@ -179,6 +231,24 @@ class HumanDriveDataset(Dataset):
     def _load_label_cache(self) -> None:
         assert self.cache_path is not None
         with np.load(self.cache_path, allow_pickle=False) as data:
+            required_keys = {
+                "path_indices",
+                "velocity_indices",
+                "long_path_indices",
+                "long_path_weights",
+                "long_path_valid",
+                "long_path_horizon",
+                "long_path_compare_points",
+                "long_path_positive_topk",
+                "long_path_temperature",
+                "long_path_min_progress",
+            }
+            missing_keys = required_keys.difference(data.files)
+            if missing_keys:
+                raise ValueError(
+                    f"Human label cache misses {sorted(missing_keys)}; "
+                    f"rerun with rebuild_cache=True: {self.cache_path}"
+                )
             cache_episode_paths = [Path(item) for item in data["episode_paths"]]
             if cache_episode_paths != self.episode_paths:
                 raise ValueError(
@@ -188,13 +258,36 @@ class HumanDriveDataset(Dataset):
                 raise ValueError(
                     f"Human label cache sample count mismatch: {self.cache_path}"
                 )
+            if abs(float(data["long_path_horizon"]) - self.long_path_horizon) > 1.0e-6:
+                raise ValueError(f"Human label cache long_path_horizon mismatch: {self.cache_path}")
+            if int(data["long_path_compare_points"]) != self.long_path_compare_points:
+                raise ValueError(f"Human label cache long_path_compare_points mismatch: {self.cache_path}")
+            if int(data["long_path_positive_topk"]) != self.long_path_positive_topk:
+                raise ValueError(f"Human label cache long_path_positive_topk mismatch: {self.cache_path}")
+            if abs(float(data["long_path_temperature"]) - self.long_path_temperature) > 1.0e-6:
+                raise ValueError(f"Human label cache long_path_temperature mismatch: {self.cache_path}")
+            if abs(float(data["long_path_min_progress"]) - self.long_path_min_progress) > 1.0e-6:
+                raise ValueError(f"Human label cache long_path_min_progress mismatch: {self.cache_path}")
             self.path_indices = data["path_indices"].astype(np.int64)
             self.velocity_indices = data["velocity_indices"].astype(np.int64)
+            self.long_path_indices = data["long_path_indices"].astype(np.int64)
+            self.long_path_weights = data["long_path_weights"].astype(np.float32)
+            self.long_path_valid = data["long_path_valid"].astype(bool)
 
     def _build_label_cache(self) -> None:
         num_samples = len(self.samples)
         path_indices = np.zeros((num_samples,), dtype=np.int64)
         velocity_indices = np.zeros((num_samples,), dtype=np.int64)
+        long_path_indices = np.zeros(
+            (num_samples, self.long_path_positive_topk),
+            dtype=np.int64,
+        )
+        long_path_weights = np.full(
+            (num_samples, self.long_path_positive_topk),
+            1.0 / max(self.long_path_positive_topk, 1),
+            dtype=np.float32,
+        )
+        long_path_valid = np.zeros((num_samples,), dtype=bool)
 
         target_trajectories = []
         target_masks = []
@@ -246,6 +339,15 @@ class HumanDriveDataset(Dataset):
 
         self.path_indices = path_indices
         self.velocity_indices = velocity_indices
+        (
+            long_path_indices,
+            long_path_weights,
+            long_path_valid,
+        ) = self._build_long_path_labels()
+
+        self.long_path_indices = long_path_indices
+        self.long_path_weights = long_path_weights
+        self.long_path_valid = long_path_valid
 
         if self.cache_path is not None:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -258,7 +360,102 @@ class HumanDriveDataset(Dataset):
                 ),
                 path_indices=self.path_indices,
                 velocity_indices=self.velocity_indices,
+                long_path_indices=self.long_path_indices,
+                long_path_weights=self.long_path_weights,
+                long_path_valid=self.long_path_valid,
+                long_path_horizon=np.asarray(self.long_path_horizon, dtype=np.float32),
+                long_path_compare_points=np.asarray(
+                    self.long_path_compare_points,
+                    dtype=np.int64,
+                ),
+                long_path_positive_topk=np.asarray(
+                    self.long_path_positive_topk,
+                    dtype=np.int64,
+                ),
+                long_path_temperature=np.asarray(
+                    self.long_path_temperature,
+                    dtype=np.float32,
+                ),
+                long_path_min_progress=np.asarray(
+                    self.long_path_min_progress,
+                    dtype=np.float32,
+                ),
             )
+
+    def _build_long_path_labels(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        num_samples = len(self.samples)
+        topk = min(self.long_path_positive_topk, self.vocab.num_path)
+        long_path_indices = np.zeros((num_samples, topk), dtype=np.int64)
+        long_path_weights = np.full((num_samples, topk), 1.0 / topk, dtype=np.float32)
+        long_path_valid = np.zeros((num_samples,), dtype=bool)
+
+        path_xy = self.vocab.path[..., :2].cpu().float()
+        path_distance = torch.stack(
+            [
+                torch.from_numpy(cumulative_distance(path_xy[path_index].numpy()))
+                for path_index in range(self.vocab.num_path)
+            ],
+            dim=0,
+        ).float()
+        path_count = path_xy.shape[0]
+
+        for sample_index in range(num_samples):
+            human_xy, valid = self.build_long_path_target(sample_index)
+            if not valid:
+                long_path_indices[sample_index, :topk] = self.path_indices[sample_index]
+                continue
+
+            human_distance = cumulative_distance(human_xy)
+            human_progress = float(human_distance[-1])
+            query_distance_np = np.linspace(
+                0.0,
+                human_progress,
+                self.long_path_compare_points,
+                dtype=np.float32,
+            )
+            human_points = torch.from_numpy(
+                interp_points_by_distance(human_xy, query_distance_np)
+            ).float()
+            query_distance = torch.from_numpy(query_distance_np).float()
+
+            query = query_distance[None, :].expand(path_count, -1)
+            query = torch.minimum(
+                query,
+                path_distance[:, -1:].expand_as(query),
+            )
+            upper = torch.searchsorted(path_distance.contiguous(), query.contiguous())
+            upper = upper.clamp(min=1, max=path_distance.shape[1] - 1)
+            lower = upper - 1
+
+            s0 = torch.gather(path_distance, 1, lower)
+            s1 = torch.gather(path_distance, 1, upper)
+            denom = (s1 - s0).clamp(min=1.0e-6)
+            alpha = ((query - s0) / denom).unsqueeze(-1)
+
+            lower_xy = torch.gather(
+                path_xy,
+                1,
+                lower[..., None].expand(-1, -1, 2),
+            )
+            upper_xy = torch.gather(
+                path_xy,
+                1,
+                upper[..., None].expand(-1, -1, 2),
+            )
+            path_points = lower_xy + alpha * (upper_xy - lower_xy)
+            cost = torch.linalg.norm(path_points - human_points[None, :, :], dim=-1).mean(dim=-1)
+
+            top_cost, top_indices = torch.topk(cost, k=topk, largest=False)
+            top_indices_np = top_indices.numpy().astype(np.int64)
+            long_path_indices[sample_index, :topk] = top_indices_np
+            long_path_weights[sample_index, :topk] = softmax_numpy(
+                -top_cost.numpy().astype(np.float32) / max(self.long_path_temperature, 1.0e-6)
+            )
+            long_path_valid[sample_index] = True
+
+        return long_path_indices, long_path_weights, long_path_valid
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -287,6 +484,34 @@ class HumanDriveDataset(Dataset):
         ).astype(np.float32)
         target_mask = np.ones((len(FUTURE_TIMES),), dtype=np.float32)
         return target_trajectory, target_mask
+
+    def build_long_path_target(self, index: int) -> tuple[np.ndarray, bool]:
+        sample = self.samples[index]
+        ego_history = sample["ego_history"]
+        times = sample["times"]
+        step_index = sample["step_index"]
+        current_state = ego_history[step_index]
+        current_time = float(times[step_index])
+        end_time = min(
+            current_time + self.long_path_horizon,
+            float(times[-1]),
+        )
+
+        future_mask = (times >= current_time - 1.0e-6) & (times <= end_time + 1.0e-6)
+        future_states = ego_history[future_mask]
+        if len(future_states) < 2:
+            return np.zeros((0, 2), dtype=np.float32), False
+
+        current_xy = current_state[:2]
+        current_yaw = float(current_state[2])
+        future_xy = transform_points_to_ego(
+            future_states[:, :2],
+            ego_xy=current_xy,
+            ego_yaw=current_yaw,
+        )
+        progress = float(cumulative_distance(future_xy)[-1])
+        valid = progress >= self.long_path_min_progress
+        return future_xy.astype(np.float32), valid
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         sample = self.samples[index]
@@ -371,6 +596,12 @@ class HumanDriveDataset(Dataset):
                 path_index * self.vocab.num_velocity + velocity_index,
                 dtype=torch.long,
             ),
+            "long_path_indices": torch.from_numpy(self.long_path_indices[index]).long(),
+            "long_path_weights": torch.from_numpy(self.long_path_weights[index]).float(),
+            "long_path_valid": torch.tensor(
+                bool(self.long_path_valid[index]),
+                dtype=torch.bool,
+            ),
             "route_path": torch.from_numpy(route_path_ego).float(),
             "goal_xy": torch.from_numpy(goal_xy).float(),
             "ego_state": torch.from_numpy(ego_state).float(),
@@ -387,6 +618,7 @@ if __name__ == "__main__":
     dataset = HumanDriveDataset(
         episode_paths=paths,
         cache_path=CURRENT_DIR / "cache" / "human_dataset_debug.npz",
+        rebuild_cache=True,
     )
     print("episodes:", len(paths))
     print("samples:", len(dataset))

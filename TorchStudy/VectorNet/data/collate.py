@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List
+import numpy as np
 
 import torch
 
@@ -104,7 +105,7 @@ def vectornet_collate_fn(samples: List[SceneSample]) -> VectorNetBatch:
             polyline_mask[batch_idx, polyline_idx] = 1.0
 
     target_index = torch.tensor(target_indices, dtype=torch.long)
-    future = torch.tensor(futures, dtype=torch.float32)
+    future = torch.from_numpy(np.stack(futures, axis=0)).float()
 
     return VectorNetBatch(
         x=x,

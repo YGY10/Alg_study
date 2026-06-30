@@ -54,6 +54,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--path-chunk-size", type=int, default=32)
     parser.add_argument("--label-batch-size", type=int, default=64)
+    parser.add_argument("--long-path-horizon", type=float, default=8.0)
+    parser.add_argument("--long-path-compare-points", type=int, default=32)
+    parser.add_argument("--long-path-positive-topk", type=int, default=8)
+    parser.add_argument("--long-path-temperature", type=float, default=2.0)
+    parser.add_argument("--long-path-min-progress", type=float, default=5.0)
+    parser.add_argument(
+        "--forced-long-path-topk",
+        type=int,
+        default=4,
+        help="Add this many long-path teacher anchors to trajectory candidates during training/validation.",
+    )
     parser.add_argument("--path-loss-weight", type=float, default=0.2)
     parser.add_argument("--velocity-loss-weight", type=float, default=0.0)
     parser.add_argument("--trajectory-loss-weight", type=float, default=1.0)
@@ -64,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--endpoint-weight", type=float, default=0.5)
     parser.add_argument("--safety-margin", type=float, default=0.3)
     parser.add_argument("--unsafe-margin", type=float, default=2.0)
+    parser.add_argument("--collision-penalty", type=float, default=8.0)
     parser.add_argument("--rebuild-cache", action="store_true")
     return parser.parse_args()
 
@@ -126,40 +138,19 @@ def trajectory_distance_to_human(
     return combined, traj_l2, endpoint_l2
 
 
-def soft_path_human_loss(
+def long_path_human_loss(
     path_scores: torch.Tensor,
-    path_vocab: torch.Tensor,
-    target_trajectory: torch.Tensor,
-    target_mask: torch.Tensor,
-    positive_topk: int,
-    temperature: float,
-    endpoint_weight: float,
+    long_path_indices: torch.Tensor,
+    long_path_weights: torch.Tensor,
+    long_path_valid: torch.Tensor,
 ) -> torch.Tensor:
-    target_len = target_trajectory.shape[1]
-    path_xy = path_vocab[:, :target_len, :2]
-    mask = target_mask.float()
-    diff = path_xy[None, :, :, :] - target_trajectory[:, None, :, :2]
-    point_l2 = diff.pow(2).sum(dim=-1).sqrt()
-    path_l2 = (point_l2 * mask[:, None, :]).sum(dim=-1) / mask.sum(dim=-1)[:, None].clamp(min=1.0)
-
-    endpoint_index = mask.sum(dim=-1).long().clamp(min=1) - 1
-    batch_size = target_trajectory.shape[0]
-    num_path = path_xy.shape[0]
-    batch_indices = torch.arange(batch_size, device=target_trajectory.device)
-    expanded_path_xy = path_xy[None, :, :, :].expand(batch_size, -1, -1, -1)
-    gather_index = endpoint_index[:, None, None, None].expand(batch_size, num_path, 1, 2)
-    path_endpoint = torch.gather(expanded_path_xy, dim=2, index=gather_index).squeeze(2)
-    target_endpoint = target_trajectory[batch_indices, endpoint_index, :2]
-    endpoint_l2 = (path_endpoint - target_endpoint[:, None]).pow(2).sum(dim=-1).sqrt()
-    cost = path_l2 + endpoint_l2 * float(endpoint_weight)
-
-    k = min(int(positive_topk), cost.shape[1])
-    top_cost, top_indices = torch.topk(cost, k=k, dim=1, largest=False)
-    weights = torch.softmax(-top_cost / max(float(temperature), 1.0e-6), dim=1)
     log_probs = F.log_softmax(path_scores, dim=1)
-    selected_log_probs = torch.gather(log_probs, 1, top_indices)
-    return -(weights.detach() * selected_log_probs).sum(dim=1).mean()
-
+    selected_log_probs = torch.gather(log_probs, 1, long_path_indices)
+    per_sample = -(long_path_weights.detach() * selected_log_probs).sum(dim=1)
+    valid = long_path_valid.bool()
+    if not bool(valid.any()):
+        return path_scores.sum() * 0.0
+    return per_sample[valid].mean()
 
 def compute_candidate_collision(
     candidate_trajectories: torch.Tensor,
@@ -227,6 +218,15 @@ def unsafe_margin_loss(
     return F.relu(best_unsafe[valid] + float(margin) - best_safe[valid]).mean()
 
 
+def compute_planning_scores(
+    trajectory_scores: torch.Tensor,
+    no_collision_logits: torch.Tensor,
+    collision_penalty: float,
+) -> torch.Tensor:
+    collision_prob = torch.sigmoid(-no_collision_logits)
+    return trajectory_scores - float(collision_penalty) * collision_prob
+
+
 def compute_trajectory_errors(
     candidate_trajectories: torch.Tensor,
     planning_scores: torch.Tensor,
@@ -271,6 +271,7 @@ def run_one_epoch(
         "no_collision_loss": 0.0,
         "unsafe_margin_loss": 0.0,
         "path_acc": 0.0,
+        "long_path_topk_recall": 0.0,
         "velocity_acc": 0.0,
         "trajectory_pair_acc": 0.0,
         "traj_l2_error": 0.0,
@@ -284,7 +285,14 @@ def run_one_epoch(
 
     for batch in dataloader:
         batch = move_batch_to_device(batch, device)
-        forced_extra_path = batch["path_index"][:, None]
+        forced_long_topk = min(
+            max(int(args.forced_long_path_topk), 0),
+            batch["long_path_indices"].shape[1],
+        )
+        forced_paths = [batch["path_index"][:, None]]
+        if forced_long_topk > 0:
+            forced_paths.append(batch["long_path_indices"][:, :forced_long_topk])
+        forced_extra_path = torch.cat(forced_paths, dim=1)
 
         with torch.set_grad_enabled(is_train):
             output = model(
@@ -317,14 +325,11 @@ def run_one_epoch(
                 endpoint_weight=args.endpoint_weight,
             )
 
-            path_loss = soft_path_human_loss(
+            path_loss = long_path_human_loss(
                 path_scores=output["path_scores"],
-                path_vocab=vocab.path,
-                target_trajectory=batch["target_trajectory"],
-                target_mask=batch["target_trajectory_mask"],
-                positive_topk=args.human_positive_topk,
-                temperature=args.human_temperature,
-                endpoint_weight=args.endpoint_weight,
+                long_path_indices=batch["long_path_indices"],
+                long_path_weights=batch["long_path_weights"],
+                long_path_valid=batch["long_path_valid"],
             )
             velocity_loss = F.cross_entropy(
                 output["velocity_scores"],
@@ -342,7 +347,11 @@ def run_one_epoch(
                 output["no_collision_logits"],
                 no_collision_target,
             )
-            planning_scores = output["trajectory_scores"] + output["no_collision_logits"]
+            planning_scores = compute_planning_scores(
+                trajectory_scores=output["trajectory_scores"],
+                no_collision_logits=output["no_collision_logits"],
+                collision_penalty=args.collision_penalty,
+            )
             margin_loss = unsafe_margin_loss(
                 planning_scores=planning_scores,
                 candidate_collision=candidate_collision,
@@ -390,7 +399,23 @@ def run_one_epoch(
         metric_sums["trajectory_loss"] += float(trajectory_loss.detach())
         metric_sums["no_collision_loss"] += float(no_collision_loss.detach())
         metric_sums["unsafe_margin_loss"] += float(margin_loss.detach())
-        metric_sums["path_acc"] += float((path_pred == batch["path_index"]).float().mean())
+        long_path_target = batch["long_path_indices"][:, 0]
+        long_path_valid = batch["long_path_valid"].bool()
+        if bool(long_path_valid.any()):
+            path_acc = (path_pred[long_path_valid] == long_path_target[long_path_valid]).float().mean()
+        else:
+            path_acc = path_pred.float().sum() * 0.0
+        metric_sums["path_acc"] += float(path_acc.detach())
+        model_topk_path = output["model_topk_path_indices"]
+        supervised_long_paths = batch["long_path_indices"][:, :forced_long_topk]
+        if forced_long_topk > 0 and bool(long_path_valid.any()):
+            long_recall_match = (
+                model_topk_path[:, :, None] == supervised_long_paths[:, None, :]
+            ).any(dim=1).any(dim=1)
+            long_path_topk_recall = long_recall_match[long_path_valid].float().mean()
+        else:
+            long_path_topk_recall = path_pred.float().sum() * 0.0
+        metric_sums["long_path_topk_recall"] += float(long_path_topk_recall.detach())
         metric_sums["velocity_acc"] += float(
             (velocity_pred == batch["velocity_index"]).float().mean()
         )
@@ -439,6 +464,11 @@ def main() -> None:
         rebuild_cache=args.rebuild_cache,
         path_chunk_size=args.path_chunk_size,
         label_batch_size=args.label_batch_size,
+        long_path_horizon=args.long_path_horizon,
+        long_path_compare_points=args.long_path_compare_points,
+        long_path_positive_topk=args.long_path_positive_topk,
+        long_path_temperature=args.long_path_temperature,
+        long_path_min_progress=args.long_path_min_progress,
     )
     val_dataset = HumanDriveDataset(
         episode_paths=val_paths,
@@ -447,6 +477,11 @@ def main() -> None:
         rebuild_cache=args.rebuild_cache,
         path_chunk_size=args.path_chunk_size,
         label_batch_size=args.label_batch_size,
+        long_path_horizon=args.long_path_horizon,
+        long_path_compare_points=args.long_path_compare_points,
+        long_path_positive_topk=args.long_path_positive_topk,
+        long_path_temperature=args.long_path_temperature,
+        long_path_min_progress=args.long_path_min_progress,
     )
     print(f"samples: train={len(train_dataset)} val={len(val_dataset)}")
 
@@ -522,6 +557,7 @@ def main() -> None:
             f"train loss {train_metrics['loss']:.4f} "
             f"traj_l2 {train_metrics['traj_l2_error']:.3f} "
             f"col {train_metrics['pred_collision_rate']:.3f} "
+            f"path_rec {train_metrics['long_path_topk_recall']:.3f} "
             f"pair {train_metrics['trajectory_pair_acc']:.3f} | "
             f"val loss {val_metrics['loss']:.4f} "
             f"traj_l2 {val_metrics['traj_l2_error']:.3f} "
@@ -529,6 +565,7 @@ def main() -> None:
             f"col {val_metrics['pred_collision_rate']:.3f} "
             f"safe {val_metrics['candidate_safe_rate']:.3f} "
             f"no_col {val_metrics['no_collision_acc']:.3f} "
+            f"path_rec {val_metrics['long_path_topk_recall']:.3f} "
             f"pair {val_metrics['trajectory_pair_acc']:.3f}"
             f"{suffix}",
             flush=True,
