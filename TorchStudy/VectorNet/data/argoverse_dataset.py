@@ -8,6 +8,7 @@ import numpy as np
 from torch.utils.data import Dataset
 
 from data.line import Line, LineKind, SceneSample
+from data.argoverse_map import ArgoverseMap
 
 
 class ArgoverseForecastingDataset(Dataset):
@@ -28,10 +29,24 @@ class ArgoverseForecastingDataset(Dataset):
         history_steps: int = 20,
         future_steps: int = 30,
         max_samples: int | None = None,
+        map_dir: str | Path | None = None,
+        use_map: bool = False,
+        lane_radius: float = 60.0,
+        max_lanes: int | None = 32,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.history_steps = history_steps
         self.future_steps = future_steps
+        self.use_map = use_map
+        self.lane_radius = lane_radius
+        self.max_lanes = max_lanes
+
+        if self.use_map:
+            if map_dir is None:
+                raise ValueError("map_dir must be provided when use_map=True.")
+            self.map = ArgoverseMap(map_dir)
+        else:
+            self.map = None
 
         self.csv_paths = sorted(self.data_dir.glob("*.csv"))
 
@@ -47,7 +62,7 @@ class ArgoverseForecastingDataset(Dataset):
     def __getitem__(self, idx: int) -> SceneSample:
         csv_path = self.csv_paths[idx]
         rows = self._read_csv(csv_path)
-
+        city_name = str(rows[0]["city_name"])
         timestamps = sorted({row["timestamp"] for row in rows})
         required_steps = self.history_steps + self.future_steps
 
@@ -161,6 +176,40 @@ class ArgoverseForecastingDataset(Dataset):
             line_id += 1
             next_agent_id += 1
 
+        if self.use_map:
+            assert self.map is not None
+
+            lane_centerlines = self.map.get_lane_centerlines_near(
+                city_name=city_name,
+                center=origin,
+                radius=self.lane_radius,
+            )
+            lane_centerlines = self._select_nearest_lanes(
+                lanes=lane_centerlines,
+                center=origin,
+            )
+
+            for lane in lane_centerlines:
+                normalized_lane = self._normalize_points(
+                    points=lane,
+                    origin=origin,
+                    heading=heading,
+                )
+
+                # 有些 lane 在局部坐标下仍然很长，第一版先保留原始点。
+                # Line 至少需要 2 个点。
+                if normalized_lane.shape[0] < 2:
+                    continue
+
+                lines.append(
+                    Line(
+                        points=normalized_lane,
+                        kind=LineKind.LANE_LINE,
+                        line_id=line_id,
+                    )
+                )
+                line_id += 1
+
         return SceneSample(
             lines=lines,
             target_agent_id=target_agent_id,
@@ -239,6 +288,22 @@ class ArgoverseForecastingDataset(Dataset):
         )
 
         return translated @ rotation.T
+
+    def _select_nearest_lanes(
+        self,
+        lanes: List[np.ndarray],
+        center: np.ndarray,
+    ) -> List[np.ndarray]:
+        if self.max_lanes is None or len(lanes) <= self.max_lanes:
+            return lanes
+
+        center = np.asarray(center, dtype=np.float32)
+
+        def lane_distance(lane: np.ndarray) -> float:
+            distances = np.linalg.norm(lane - center, axis=1)
+            return float(np.min(distances))
+
+        return sorted(lanes, key=lane_distance)[: self.max_lanes]
 
     def _get_track_points(
         self,

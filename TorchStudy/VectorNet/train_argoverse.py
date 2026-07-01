@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
@@ -122,11 +124,17 @@ def main() -> None:
         "TorchStudy/VectorNet/datasets/argoverse1/val/" "forecasting_val_v1.1/val/data"
     )
 
+    map_dir = "TorchStudy/VectorNet/datasets/argoverse1/map/hd_maps/map_files"
+
     train_dataset = ArgoverseForecastingDataset(
         data_dir=train_data_dir,
         history_steps=20,
         future_steps=30,
         max_samples=1000,
+        map_dir=map_dir,
+        use_map=True,
+        lane_radius=60.0,
+        max_lanes=64,
     )
 
     val_dataset = ArgoverseForecastingDataset(
@@ -134,6 +142,10 @@ def main() -> None:
         history_steps=20,
         future_steps=30,
         max_samples=200,
+        map_dir=map_dir,
+        use_map=True,
+        lane_radius=60.0,
+        max_lanes=64,
     )
 
     train_loader = DataLoader(
@@ -164,6 +176,10 @@ def main() -> None:
     )
 
     num_epochs = 10
+    checkpoint_dir = Path("TorchStudy/VectorNet/outputs/checkpoints")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    best_checkpoint_path = checkpoint_dir / "best_argoverse.pt"
+    best_val_ade = float("inf")
 
     for epoch in range(num_epochs):
         train_loss, train_ade = train_one_epoch(
@@ -179,12 +195,29 @@ def main() -> None:
             device=device,
         )
 
+        is_best = val_ade < best_val_ade
+        if is_best:
+            best_val_ade = val_ade
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_loss": val_loss,
+                    "val_ade": val_ade,
+                    "train_loss": train_loss,
+                    "train_ade": train_ade,
+                },
+                best_checkpoint_path,
+            )
+
         print(
             f"epoch {epoch + 1:02d} "
             f"train_loss={train_loss:.4f} "
             f"train_ade={train_ade:.4f} "
             f"val_loss={val_loss:.4f} "
             f"val_ade={val_ade:.4f}"
+            f"{' *best*' if is_best else ''}"
         )
 
 
