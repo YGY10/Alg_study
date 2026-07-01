@@ -11,9 +11,10 @@ import termios
 import threading
 import time
 import tty
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Tuple
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
@@ -49,6 +50,15 @@ from teacher import EgoState, TeacherConfig, draw_rectangle_world
 DEFAULT_OUTPUT_DIR = TOY_ROOT / "outputs" / "human_drive"
 DEFAULT_EPISODE_DIR = TOY_ROOT / "human_drive" / "episodes"
 TIME_STEPS = np.arange(1, 9, dtype=np.float32) * 0.5
+SceneKey = Tuple[str, int, int, int]
+LegacySceneKey = Tuple[int, int]
+COLLECTION_TARGETS = {
+    "straight": (500, 800),
+    "low_speed_avoid": (300, 500),
+    "follow_stop": (300, 500),
+    "dense_front": (300, 500),
+}
+MISSING_SCENE_MODE = "<missing_scene_mode>"
 
 
 @dataclass
@@ -231,6 +241,89 @@ def save_episode(
     return output_path
 
 
+def scene_index_from_filename(path: Path) -> int | None:
+    stem = path.stem
+    marker = "_scene_"
+    if marker not in stem:
+        return None
+    try:
+        return int(stem.rsplit(marker, maxsplit=1)[1])
+    except ValueError:
+        return None
+
+
+def load_saved_scene_keys(
+    episode_dir: Path,
+) -> tuple[set[SceneKey], set[LegacySceneKey]]:
+    scene_keys: set[SceneKey] = set()
+    legacy_scene_keys: set[LegacySceneKey] = set()
+    if not episode_dir.is_dir():
+        return scene_keys, legacy_scene_keys
+
+    for path in sorted(episode_dir.glob("*.json")):
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                record = json.load(file)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        scene_index = record.get("scene_index", scene_index_from_filename(path))
+        scene_attempt = record.get("scene_attempt", 0)
+        try:
+            scene_index = int(scene_index)
+            scene_attempt = int(scene_attempt)
+        except (TypeError, ValueError):
+            continue
+
+        scene_mode = record.get("scene_mode")
+        seed_offset = record.get("seed_offset")
+        if scene_mode is None or seed_offset is None:
+            legacy_scene_keys.add((scene_index, scene_attempt))
+            continue
+
+        try:
+            scene_keys.add(
+                (
+                    str(scene_mode),
+                    int(seed_offset),
+                    scene_index,
+                    scene_attempt,
+                )
+            )
+        except (TypeError, ValueError):
+            legacy_scene_keys.add((scene_index, scene_attempt))
+
+    return scene_keys, legacy_scene_keys
+
+
+def load_episode_progress(episode_dir: Path) -> Counter[str]:
+    progress: Counter[str] = Counter()
+    if not episode_dir.is_dir():
+        return progress
+
+    for path in sorted(episode_dir.glob("*.json")):
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                record = json.load(file)
+        except (OSError, json.JSONDecodeError):
+            progress["<parse_failed>"] += 1
+            continue
+        progress[str(record.get("scene_mode") or MISSING_SCENE_MODE)] += 1
+    return progress
+
+
+def format_scene_key(
+    scene_mode: str,
+    seed_offset: int,
+    scene_index: int,
+    scene_attempt: int,
+) -> str:
+    return (
+        f"mode={scene_mode} seed_offset={seed_offset} "
+        f"scene={scene_index} attempt={scene_attempt}"
+    )
+
+
 class HumanDriveSimulator:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -274,15 +367,73 @@ class HumanDriveSimulator:
         self.terminal_original_attrs: list[Any] | None = None
         self.terminal_reader_started = False
         self.used_scene_indices: set[int] = set()
+        self.exit_progress_printed = False
+        self.saved_scene_keys, self.legacy_saved_scene_keys = load_saved_scene_keys(
+            self.args.episode_dir
+        )
+        self.episode_progress = load_episode_progress(self.args.episode_dir)
+        print(
+            f"[existing episodes] exact={len(self.saved_scene_keys)} "
+            f"legacy={len(self.legacy_saved_scene_keys)} "
+            f"dir={self.args.episode_dir}"
+        )
+        self.print_collection_progress(prefix="[current progress]")
+
+    def current_scene_key(self, scene_index: int | None = None) -> SceneKey:
+        return (
+            str(self.args.scene_mode),
+            int(self.args.seed_offset),
+            int(self.scene_index if scene_index is None else scene_index),
+            int(self.args.scene_attempt),
+        )
+
+    def scene_already_saved(self, scene_index: int | None = None) -> bool:
+        key = self.current_scene_key(scene_index)
+        legacy_key = (key[2], key[3])
+        return key in self.saved_scene_keys or legacy_key in self.legacy_saved_scene_keys
+
+    def print_collection_progress(self, prefix: str = "[collection progress]") -> None:
+        total = sum(self.episode_progress.values())
+        print(f"{prefix} total={total}")
+        for mode, (target_min, target_max) in COLLECTION_TARGETS.items():
+            count = int(self.episode_progress.get(mode, 0))
+            need_min = max(target_min - count, 0)
+            need_max = max(target_max - count, 0)
+            print(
+                f"  {mode}: {count}/{target_min}-{target_max} "
+                f"need_min={need_min} need_high={need_max}"
+            )
+        missing = int(self.episode_progress.get(MISSING_SCENE_MODE, 0))
+        if missing > 0:
+            print(f"  {MISSING_SCENE_MODE}: {missing}")
+
+    def print_exit_progress(self) -> None:
+        if self.exit_progress_printed:
+            return
+        self.exit_progress_printed = True
+        self.print_collection_progress(prefix="[exit progress]")
 
     def sample_unused_scene_index(self) -> int:
         if len(self.used_scene_indices) >= self.args.num_samples:
             self.used_scene_indices.clear()
         for _ in range(1000):
             scene_index = random.randrange(self.args.num_samples)
-            if scene_index not in self.used_scene_indices:
+            if (
+                scene_index not in self.used_scene_indices
+                and not self.scene_already_saved(scene_index)
+            ):
                 return scene_index
-        return random.randrange(self.args.num_samples)
+        for scene_index in range(self.args.num_samples):
+            if (
+                scene_index not in self.used_scene_indices
+                and not self.scene_already_saved(scene_index)
+            ):
+                return scene_index
+        raise RuntimeError(
+            "No unused scene remains for "
+            f"mode={self.args.scene_mode}, seed_offset={self.args.seed_offset}, "
+            f"scene_attempt={self.args.scene_attempt}"
+        )
 
     def reset_scene(
         self,
@@ -294,6 +445,11 @@ class HumanDriveSimulator:
             if scene_index is not None
             else self.sample_unused_scene_index()
         )
+        if scene_index is not None and self.scene_already_saved(self.scene_index):
+            print(
+                "[existing scene] this requested scene already has an episode; "
+                "it can be inspected or retried, but save will be skipped"
+            )
         if mark_used:
             self.used_scene_indices.add(self.scene_index)
         self.scene_attempt = int(self.args.scene_attempt)
@@ -329,6 +485,7 @@ class HumanDriveSimulator:
         return {
             "source": "human_drive_v1",
             "scene_mode": str(self.args.scene_mode),
+            "seed_offset": int(self.args.seed_offset),
             "scene_index": int(self.scene_index),
             "scene_attempt": int(self.scene_attempt),
             "route_path_index": int(self.route_path_index),
@@ -349,6 +506,7 @@ class HumanDriveSimulator:
         if key == "escape" or raw_key == "Q":
             self.status = "quit"
             self.done = True
+            self.print_exit_progress()
             self.restore_terminal_mode()
             plt.close(self.fig)
             return
@@ -362,10 +520,22 @@ class HumanDriveSimulator:
             if self.status == "driving":
                 self.status = "manual_finish"
             self.done = True
+            if self.scene_already_saved(self.scene_index):
+                key = self.current_scene_key(self.scene_index)
+                print(
+                    "[not saved] duplicate scene already exists: "
+                    + format_scene_key(*key)
+                )
+                self.reset_scene()
+                print(f"[new scene] scene={self.scene_index} not saved yet")
+                self.draw()
+                return
             output_path = save_episode(
                 self.args.episode_dir,
                 self.build_episode_record(),
             )
+            self.saved_scene_keys.add(self.current_scene_key(self.scene_index))
+            self.episode_progress[str(self.args.scene_mode)] += 1
             print(
                 f"[saved] scene={self.scene_index} steps={len(self.steps)} "
                 f"status={self.status} path={output_path}"
@@ -645,6 +815,7 @@ class HumanDriveSimulator:
         try:
             plt.show()
         finally:
+            self.print_exit_progress()
             self.restore_terminal_mode()
 
 

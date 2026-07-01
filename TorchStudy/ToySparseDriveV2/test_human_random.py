@@ -59,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--path-chunk-size", type=int, default=32)
     parser.add_argument("--label-batch-size", type=int, default=64)
+    parser.add_argument("--model-topk-path", type=int, default=None)
     parser.add_argument("--rebuild-cache", action="store_true")
     parser.add_argument(
         "--use-safety-score",
@@ -727,6 +728,9 @@ def main() -> None:
     collision_penalty = float(
         choose_arg(args.collision_penalty, ckpt_args.get("collision_penalty"), 8.0)
     )
+    model_topk_path = int(
+        choose_arg(args.model_topk_path, ckpt_args.get("model_topk_path"), 8)
+    )
     max_episodes = choose_arg(
         args.max_episodes,
         ckpt_args.get("max_episodes"),
@@ -788,7 +792,7 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     vocab = vocab_cpu.to(device)
-    model = ToySparseDriveV2Model().to(device)
+    model = ToySparseDriveV2Model(topk_path=model_topk_path).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
@@ -804,6 +808,11 @@ def main() -> None:
             velocity_vocab=vocab.velocity,
             trajectory_vocab=vocab.trajectory,
             ego_state=batch["ego_state"],
+            goal_xy=batch["goal_xy"],
+            route_path=batch["route_path"],
+            obstacle_centers=batch["obstacle_centers"],
+            obstacle_sizes=batch["obstacle_sizes"],
+            obstacle_mask=batch["obstacle_mask"],
         )
         pred = select_prediction(
             output,
@@ -875,6 +884,7 @@ def main() -> None:
     print(f"checkpoint epoch: {checkpoint.get('epoch', 'n/a')}")
     print(f"checkpoint val_metrics: {checkpoint.get('val_metrics', 'n/a')}")
     print(f"device: {device}")
+    print(f"model_topk_path: {model_topk_path}")
     print(f"episodes: total={len(episode_paths)} val={len(val_paths)}")
     print(f"val samples: {len(val_dataset)}")
     print(f"sample_index: {sample_index}")

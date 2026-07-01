@@ -619,6 +619,169 @@ Validation with ego speed 1 m/s selected v207 with initial acceleration about
 1.996 m/s^2 and `dyn_invalid=False`, replacing the previously selected v151
 profile that jumped to about 9.9 m/s at t=0.5 s.
 
+## 2026-07-01 Update: Human Data Training + Auto Review Collector
+
+The current active work is no longer the synthetic `train.py` flow above. The
+human-driving flow is now the main SparseDriveV2 toy experiment.
+
+Important human-driving files:
+
+- `train_human.py`
+  Main human-data training entry.
+
+- `human_drive/human_dataset.py`
+  Loads json episodes from `human_drive/episodes` and builds short 4s trajectory
+  targets plus long-horizon path labels.
+
+- `test_human_random.py`
+  Human-data checkpoint testing and diagnostics.
+
+- `debug_long_path_label.py`
+  Single-sample long path label debugger. Useful for checking how a human future
+  trajectory maps to path vocab entries.
+
+Human path labels:
+
+- 4s trajectory target is still the short-term human future.
+- Path supervision uses a longer human future, default `long_path_horizon=8.0`.
+- Long path matching only compares the human-driven length range; it does not
+  punish the unobserved tail of the vocab path.
+- `human_dataset.py` now stores full-vocab `long_path_costs` in cache and
+  returns them per sample. Rebuild cache after cache-format changes.
+
+Training changes in `train_human.py`:
+
+- Model path proposal count is configurable through `--model-topk-path`; recent
+  runs used `20`.
+- Candidate forcing is split:
+  - `--forced-long-path-topk` for train-time teacher anchors.
+  - `--val-forced-long-path-topk` for validation. Use `0` for free-run validation.
+- `path_loss` now uses a full-vocab soft target from `long_path_costs`, not only
+  the cached positive top-k labels.
+- `path_rec` now measures the model's own top-k path recall against long-path
+  target top-k. This is the key path proposal metric.
+- Velocity loss may remain zero; short-term speed is already constrained by
+  trajectory loss.
+
+Model changes in `models/model.py`:
+
+- Path scorer now receives explicit geometric features in addition to raster/CNN
+  evidence and path geometry.
+- Explicit features include path endpoint/start, endpoint-to-goal vector and
+  distance, terminal heading alignment to goal, route distance features,
+  obstacle clearance/collision flag, and path length.
+- `forward()` accepts optional `goal_xy`, `route_path`, `obstacle_centers`,
+  `obstacle_sizes`, and `obstacle_mask`. Existing synthetic callers can omit
+  them.
+
+Observed training behavior:
+
+- Free-run validation is much harsher than train candidate forcing.
+- Train `path_rec` can rise while validation `path_rec` stays around 0.3-0.45,
+  indicating path scorer generalization is currently a bottleneck.
+- Continuing to train the same ~300 episode set for many epochs mostly overfits.
+  More balanced human/auto data is likely more useful than very long training on
+  the same distribution.
+
+Data collection changes:
+
+- `human_drive/drive_sim.py` now saves `seed_offset` in episode json.
+- It scans existing `human_drive/episodes/*.json` on startup and avoids
+  generating already-saved scenes.
+- Exact duplicate key:
+
+```text
+scene_mode + seed_offset + scene_index + scene_attempt
+```
+
+- Old episodes without `scene_mode` or `seed_offset` are treated as legacy keys
+  by `(scene_index, scene_attempt)` so they are not accidentally duplicated.
+- At startup and exit, `drive_sim.py` prints collection progress against target
+  counts:
+
+```text
+straight: 500-800
+low_speed_avoid: 300-500
+follow_stop: 300-500
+dense_front: 300-500
+```
+
+Auto review collector:
+
+- `human_drive/auto_collect.py`
+  Generates toy scenes with existing dataset code, runs an auto policy online,
+  displays a Matplotlib review GUI, and lets the user save or discard.
+
+- `human_drive/auto_policy.py`
+  Contains the replaceable strategy entry point:
+
+```python
+def plan_auto_action(
+    observation: AutoDriveObservation,
+    scene: AutoDriveScene,
+    config: AutoPolicyConfig,
+) -> DriveAction:
+    ...
+```
+
+The auto collector reuses the same scene generation, vehicle step, collision,
+goal check, episode save, and duplicate-scene logic as `drive_sim.py`.
+
+Run GUI review mode:
+
+```bash
+cd /home/yihang/Documents/Alg_study/TorchStudy/ToySparseDriveV2
+./scripts/run_gui.sh conda run -n torch310 python -u human_drive/auto_collect.py \
+  --review-gui \
+  --scene-mode straight
+```
+
+Review controls:
+
+```text
+enter/f: save current auto episode
+r: discard and move to next scene
+q/esc: quit
+```
+
+Use preview dirs before writing into the real dataset:
+
+```bash
+./scripts/run_gui.sh conda run -n torch310 python -u human_drive/auto_collect.py \
+  --review-gui \
+  --scene-mode straight \
+  --episode-dir outputs/auto_collect_review_preview/episodes \
+  --output-dir outputs/auto_collect_review_preview
+```
+
+Current `auto_policy.py` planning method:
+
+- The public interface is still one-step action planning.
+- Internally it currently follows an EPSILON-style structure:
+
+```text
+behavior branching
+  -> spatio-temporal semantic corridor (SSC)
+  -> Bezier trajectory QP
+  -> trajectory tracking to DriveAction(accel, steer)
+```
+
+- This is more structured than the previous action-lattice rollout, but it is
+  also more route/Frenet based. If the desired behavior is "goal first, route
+  only as weak reference", watch route bias carefully.
+- `auto_collect.py` default `--goal-threshold` is now `1.0`; older `4.0` could
+  mark `goal_reached` visually too early.
+
+Do not mix auto episodes with pure human episodes silently. Auto-generated
+episodes are marked with:
+
+```json
+"source": "auto_drive_v1",
+"driver": "auto_normal_v1"
+```
+
+Use these fields later for filtering or lower training weight if needed.
+
 ## 2026-06-24 Update: Route Cost Uses Frenet Lateral Offset
 
 Teacher route cost no longer uses nearest distance to discrete route points.

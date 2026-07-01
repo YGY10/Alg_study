@@ -189,6 +189,7 @@ class HumanDriveDataset(Dataset):
         self.velocity_indices: np.ndarray
         self.long_path_indices: np.ndarray
         self.long_path_weights: np.ndarray
+        self.long_path_costs: np.ndarray
         self.long_path_valid: np.ndarray
         if (
             self.cache_path is not None
@@ -236,6 +237,7 @@ class HumanDriveDataset(Dataset):
                 "velocity_indices",
                 "long_path_indices",
                 "long_path_weights",
+                "long_path_costs",
                 "long_path_valid",
                 "long_path_horizon",
                 "long_path_compare_points",
@@ -272,6 +274,7 @@ class HumanDriveDataset(Dataset):
             self.velocity_indices = data["velocity_indices"].astype(np.int64)
             self.long_path_indices = data["long_path_indices"].astype(np.int64)
             self.long_path_weights = data["long_path_weights"].astype(np.float32)
+            self.long_path_costs = data["long_path_costs"].astype(np.float32)
             self.long_path_valid = data["long_path_valid"].astype(bool)
 
     def _build_label_cache(self) -> None:
@@ -342,11 +345,13 @@ class HumanDriveDataset(Dataset):
         (
             long_path_indices,
             long_path_weights,
+            long_path_costs,
             long_path_valid,
         ) = self._build_long_path_labels()
 
         self.long_path_indices = long_path_indices
         self.long_path_weights = long_path_weights
+        self.long_path_costs = long_path_costs
         self.long_path_valid = long_path_valid
 
         if self.cache_path is not None:
@@ -362,6 +367,7 @@ class HumanDriveDataset(Dataset):
                 velocity_indices=self.velocity_indices,
                 long_path_indices=self.long_path_indices,
                 long_path_weights=self.long_path_weights,
+                long_path_costs=self.long_path_costs,
                 long_path_valid=self.long_path_valid,
                 long_path_horizon=np.asarray(self.long_path_horizon, dtype=np.float32),
                 long_path_compare_points=np.asarray(
@@ -384,11 +390,16 @@ class HumanDriveDataset(Dataset):
 
     def _build_long_path_labels(
         self,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         num_samples = len(self.samples)
         topk = min(self.long_path_positive_topk, self.vocab.num_path)
         long_path_indices = np.zeros((num_samples, topk), dtype=np.int64)
         long_path_weights = np.full((num_samples, topk), 1.0 / topk, dtype=np.float32)
+        long_path_costs = np.full(
+            (num_samples, self.vocab.num_path),
+            np.inf,
+            dtype=np.float32,
+        )
         long_path_valid = np.zeros((num_samples,), dtype=bool)
 
         path_xy = self.vocab.path[..., :2].cpu().float()
@@ -446,6 +457,7 @@ class HumanDriveDataset(Dataset):
             )
             path_points = lower_xy + alpha * (upper_xy - lower_xy)
             cost = torch.linalg.norm(path_points - human_points[None, :, :], dim=-1).mean(dim=-1)
+            long_path_costs[sample_index] = cost.numpy().astype(np.float32)
 
             top_cost, top_indices = torch.topk(cost, k=topk, largest=False)
             top_indices_np = top_indices.numpy().astype(np.int64)
@@ -455,7 +467,7 @@ class HumanDriveDataset(Dataset):
             )
             long_path_valid[sample_index] = True
 
-        return long_path_indices, long_path_weights, long_path_valid
+        return long_path_indices, long_path_weights, long_path_costs, long_path_valid
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -598,6 +610,7 @@ class HumanDriveDataset(Dataset):
             ),
             "long_path_indices": torch.from_numpy(self.long_path_indices[index]).long(),
             "long_path_weights": torch.from_numpy(self.long_path_weights[index]).float(),
+            "long_path_costs": torch.from_numpy(self.long_path_costs[index]).float(),
             "long_path_valid": torch.tensor(
                 bool(self.long_path_valid[index]),
                 dtype=torch.bool,

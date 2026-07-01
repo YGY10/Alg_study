@@ -54,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--path-chunk-size", type=int, default=32)
     parser.add_argument("--label-batch-size", type=int, default=64)
+    parser.add_argument("--model-topk-path", type=int, default=20)
     parser.add_argument("--long-path-horizon", type=float, default=8.0)
     parser.add_argument("--long-path-compare-points", type=int, default=32)
     parser.add_argument("--long-path-positive-topk", type=int, default=8)
@@ -63,7 +64,19 @@ def parse_args() -> argparse.Namespace:
         "--forced-long-path-topk",
         type=int,
         default=4,
-        help="Add this many long-path teacher anchors to trajectory candidates during training/validation.",
+        help="Add this many long-path teacher anchors to trajectory candidates during training.",
+    )
+    parser.add_argument(
+        "--val-forced-long-path-topk",
+        type=int,
+        default=0,
+        help="Add teacher anchors during validation. Default 0 means free-run validation.",
+    )
+    parser.add_argument(
+        "--path-recall-target-topk",
+        type=int,
+        default=4,
+        help="Measure model path top-k recall against this many long-path labels.",
     )
     parser.add_argument("--path-loss-weight", type=float, default=0.2)
     parser.add_argument("--velocity-loss-weight", type=float, default=0.0)
@@ -140,17 +153,22 @@ def trajectory_distance_to_human(
 
 def long_path_human_loss(
     path_scores: torch.Tensor,
-    long_path_indices: torch.Tensor,
-    long_path_weights: torch.Tensor,
+    long_path_costs: torch.Tensor,
     long_path_valid: torch.Tensor,
+    temperature: float,
 ) -> torch.Tensor:
-    log_probs = F.log_softmax(path_scores, dim=1)
-    selected_log_probs = torch.gather(log_probs, 1, long_path_indices)
-    per_sample = -(long_path_weights.detach() * selected_log_probs).sum(dim=1)
     valid = long_path_valid.bool()
     if not bool(valid.any()):
         return path_scores.sum() * 0.0
-    return per_sample[valid].mean()
+
+    valid_scores = path_scores[valid]
+    valid_costs = long_path_costs[valid].to(path_scores.device).float()
+    target_probs = torch.softmax(
+        -valid_costs / max(float(temperature), 1.0e-6),
+        dim=1,
+    )
+    log_probs = F.log_softmax(valid_scores, dim=1)
+    return -(target_probs.detach() * log_probs).sum(dim=1).mean()
 
 def compute_candidate_collision(
     candidate_trajectories: torch.Tensor,
@@ -285,14 +303,19 @@ def run_one_epoch(
 
     for batch in dataloader:
         batch = move_batch_to_device(batch, device)
+        forced_long_topk_arg = (
+            args.forced_long_path_topk if is_train else args.val_forced_long_path_topk
+        )
         forced_long_topk = min(
-            max(int(args.forced_long_path_topk), 0),
+            max(int(forced_long_topk_arg), 0),
             batch["long_path_indices"].shape[1],
         )
-        forced_paths = [batch["path_index"][:, None]]
+        forced_paths = []
+        if is_train or forced_long_topk > 0:
+            forced_paths.append(batch["path_index"][:, None])
         if forced_long_topk > 0:
             forced_paths.append(batch["long_path_indices"][:, :forced_long_topk])
-        forced_extra_path = torch.cat(forced_paths, dim=1)
+        forced_extra_path = torch.cat(forced_paths, dim=1) if forced_paths else None
 
         with torch.set_grad_enabled(is_train):
             output = model(
@@ -301,14 +324,20 @@ def run_one_epoch(
                 velocity_vocab=vocab.velocity,
                 trajectory_vocab=vocab.trajectory,
                 ego_state=batch["ego_state"],
+                goal_xy=batch["goal_xy"],
+                route_path=batch["route_path"],
+                obstacle_centers=batch["obstacle_centers"],
+                obstacle_sizes=batch["obstacle_sizes"],
+                obstacle_mask=batch["obstacle_mask"],
                 extra_path_indices=forced_extra_path,
             )
-            target_candidate = find_target_candidate_index(
-                candidate_path_indices=output["candidate_path_indices"],
-                candidate_velocity_indices=output["candidate_velocity_indices"],
-                target_path_index=batch["path_index"],
-                target_velocity_index=batch["velocity_index"],
-            )
+            if forced_extra_path is not None:
+                find_target_candidate_index(
+                    candidate_path_indices=output["candidate_path_indices"],
+                    candidate_velocity_indices=output["candidate_velocity_indices"],
+                    target_path_index=batch["path_index"],
+                    target_velocity_index=batch["velocity_index"],
+                )
             candidate_collision = compute_candidate_collision(
                 candidate_trajectories=output["candidate_trajectories"],
                 obstacle_centers=batch["obstacle_centers"],
@@ -327,9 +356,9 @@ def run_one_epoch(
 
             path_loss = long_path_human_loss(
                 path_scores=output["path_scores"],
-                long_path_indices=batch["long_path_indices"],
-                long_path_weights=batch["long_path_weights"],
+                long_path_costs=batch["long_path_costs"],
                 long_path_valid=batch["long_path_valid"],
+                temperature=args.long_path_temperature,
             )
             velocity_loss = F.cross_entropy(
                 output["velocity_scores"],
@@ -407,10 +436,14 @@ def run_one_epoch(
             path_acc = path_pred.float().sum() * 0.0
         metric_sums["path_acc"] += float(path_acc.detach())
         model_topk_path = output["model_topk_path_indices"]
-        supervised_long_paths = batch["long_path_indices"][:, :forced_long_topk]
-        if forced_long_topk > 0 and bool(long_path_valid.any()):
+        recall_target_topk = min(
+            max(int(args.path_recall_target_topk), 1),
+            batch["long_path_indices"].shape[1],
+        )
+        recall_long_paths = batch["long_path_indices"][:, :recall_target_topk]
+        if bool(long_path_valid.any()):
             long_recall_match = (
-                model_topk_path[:, :, None] == supervised_long_paths[:, None, :]
+                model_topk_path[:, :, None] == recall_long_paths[:, None, :]
             ).any(dim=1).any(dim=1)
             long_path_topk_recall = long_recall_match[long_path_valid].float().mean()
         else:
@@ -484,6 +517,13 @@ def main() -> None:
         long_path_min_progress=args.long_path_min_progress,
     )
     print(f"samples: train={len(train_dataset)} val={len(val_dataset)}")
+    print(
+        "candidate forcing: "
+        f"model_topk_path={args.model_topk_path} "
+        f"train_long_topk={args.forced_long_path_topk} "
+        f"val_long_topk={args.val_forced_long_path_topk} "
+        f"path_recall_target_topk={args.path_recall_target_topk}"
+    )
 
     train_loader = DataLoader(
         train_dataset,
@@ -503,7 +543,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
     vocab = vocab_cpu.to(device)
-    model = ToySparseDriveV2Model().to(device)
+    model = ToySparseDriveV2Model(topk_path=args.model_topk_path).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
