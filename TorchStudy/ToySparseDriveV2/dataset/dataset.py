@@ -50,15 +50,15 @@ def make_scene_sampling_config(mode: str) -> SceneSamplingConfig:
         return SceneSamplingConfig(
             mode=mode,
             ego_speed_range=(3.0, 8.0),
-            goal_x_range=(30.0, 50.0),
-            goal_y_range=(-8.0, 8.0),
-            obstacle_x_range=(10.0, 45.0),
+            goal_x_range=(20.0, 50.0),
+            goal_y_range=(-20.0, 20.0),
+            obstacle_x_range=(8.0, 25.0),
             obstacle_y_range=(-10.0, 10.0),
-            obstacle_vx_range=(0.0, 4.0),
+            obstacle_vx_range=(3.0, 8.0),
             obstacle_vy_range=(-0.5, 0.5),
             route_aware_probability=0.9,
             min_obstacles=4,
-            max_obstacles=10,
+            max_obstacles=6,
         )
     if mode == "low_speed_avoid":
         return SceneSamplingConfig(

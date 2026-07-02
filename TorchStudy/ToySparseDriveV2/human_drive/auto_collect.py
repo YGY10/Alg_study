@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+import json
 import math
 import random
 import sys
@@ -44,6 +46,54 @@ AUTO_DRIVER_NAME = "auto_normal_v1"
 AUTO_SOURCE = "auto_drive_v1"
 
 
+def status_episode_dir(base_dir: Path, status: str) -> Path:
+    safe_status = "".join(
+        char if char.isalnum() or char in {"_", "-"} else "_"
+        for char in str(status or "unknown")
+    )
+    return base_dir / safe_status
+
+
+def load_auto_collection_progress(episode_dir: Path) -> tuple[Counter[str], Counter[str]]:
+    status_counts: Counter[str] = Counter()
+    mode_counts: Counter[str] = Counter()
+    if not episode_dir.is_dir():
+        return status_counts, mode_counts
+
+    for path in sorted(episode_dir.rglob("*.json")):
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                record = json.load(file)
+        except (OSError, json.JSONDecodeError):
+            status_counts["<parse_failed>"] += 1
+            continue
+        status = str(record.get("status") or path.parent.name or "unknown")
+        scene_mode = str(record.get("scene_mode") or "unknown")
+        status_counts[status] += 1
+        mode_counts[scene_mode] += 1
+    return status_counts, mode_counts
+
+
+def build_start_to_goal_route(
+    goal_xy: np.ndarray,
+    num_points: int = 70,
+    extend_after_goal_m: float = 20.0,
+) -> np.ndarray:
+    start = np.array([0.0, 0.0], dtype=np.float32)
+    goal = np.asarray(goal_xy, dtype=np.float32)
+    direction = goal - start
+    distance = float(np.linalg.norm(direction))
+    if distance > 1.0e-6:
+        unit = direction / distance
+    else:
+        unit = np.array([1.0, 0.0], dtype=np.float32)
+    route_end = goal + unit * float(extend_after_goal_m)
+    xy = np.linspace(start, route_end, int(num_points), dtype=np.float32)
+    yaw = math.atan2(float(unit[1]), float(unit[0]))
+    yaw_col = np.full((xy.shape[0], 1), yaw, dtype=np.float32)
+    return np.concatenate([xy, yaw_col], axis=1)
+
+
 def make_episode_record(
     args: argparse.Namespace,
     policy_config: AutoPolicyConfig,
@@ -74,7 +124,10 @@ def make_episode_record(
         "status": status,
         "steps": steps,
         "ego_history": ego_history,
-        "controller": policy_config.to_metadata(),
+        "controller": {
+            **policy_config.to_metadata(),
+            "planning_route": "origin_to_goal_extended_line",
+        },
     }
 
 
@@ -85,6 +138,7 @@ def plot_episode(
     obstacles: list[dict[str, Any]],
     ego_history: list[list[float]],
     title: str,
+    planning_route_path: np.ndarray | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(8, 8))
@@ -107,8 +161,17 @@ def plot_episode(
         route_path[:, 0],
         color="#1f77b4",
         linewidth=1.5,
-        label="route",
+        label="original route",
     )
+    if planning_route_path is not None:
+        ax.plot(
+            planning_route_path[:, 1],
+            planning_route_path[:, 0],
+            color="#ff7f0e",
+            linestyle="--",
+            linewidth=1.5,
+            label="planner route",
+        )
     ax.plot(
         history[:, 1],
         history[:, 0],
@@ -172,6 +235,30 @@ class AutoCollector:
         legacy_key = (key[2], key[3])
         return key in self.saved_scene_keys or legacy_key in self.legacy_scene_keys
 
+    def print_collection_progress(self, prefix: str = "[auto collection progress]") -> None:
+        status_counts, mode_counts = load_auto_collection_progress(self.args.episode_dir)
+        total = sum(status_counts.values())
+        print(f"{prefix} dir={self.args.episode_dir} total_saved={total}")
+        if status_counts:
+            status_text = ", ".join(
+                f"{key}={status_counts[key]}" for key in sorted(status_counts)
+            )
+            print(f"  by_status: {status_text}")
+        if mode_counts:
+            mode_text = ", ".join(
+                f"{key}={mode_counts[key]}" for key in sorted(mode_counts)
+            )
+            print(f"  by_scene_mode: {mode_text}")
+        print(
+            "  current_session: "
+            f"saved={self.stats['saved']} "
+            f"skipped_existing={self.stats['skipped_existing']} "
+            f"discarded_collision={self.stats['discarded_collision']} "
+            f"discarded_stuck={self.stats['discarded_stuck']} "
+            f"discarded_timeout={self.stats['discarded_timeout']} "
+            f"discarded_other={self.stats['discarded_other']}"
+        )
+
     def sample_scene_index(self) -> int | None:
         for _ in range(1000):
             scene_index = random.randrange(self.args.num_samples)
@@ -215,6 +302,7 @@ class AutoCollector:
             route_path=route_path,
             goal_xy=goal_xy,
             obstacles=obstacles,
+            planning_route_path=build_start_to_goal_route(goal_xy),
         )
         return route_path_index, scene, state, ego_state.size_xy
 
@@ -306,6 +394,7 @@ class AutoCollector:
             ego_history=ego_history,
         )
         record["_debug_route_path"] = scene.route_path
+        record["_debug_planning_route_path"] = scene.planning_route_path
         record["_debug_goal_xy"] = scene.goal_xy
         return status, record
 
@@ -315,6 +404,7 @@ class AutoCollector:
         if self.stats["saved"] > self.args.save_debug_plots:
             return
         route_path = record.pop("_debug_route_path")
+        planning_route_path = record.pop("_debug_planning_route_path", None)
         goal_xy = record.pop("_debug_goal_xy")
         output_path = (
             self.args.debug_plot_dir
@@ -327,56 +417,65 @@ class AutoCollector:
             obstacles=record["obstacles"],
             ego_history=record["ego_history"],
             title=f"auto collect | {self.args.scene_mode} | scene {scene_index} | {status}",
+            planning_route_path=planning_route_path,
         )
         print(f"debug plot: {output_path}")
 
     def collect(self) -> None:
         attempts = 0
-        while (
-            self.stats["saved"] < self.args.num_episodes
-            and attempts < self.args.max_attempts
-        ):
-            attempts += 1
-            scene_index = self.sample_scene_index()
-            if scene_index is None:
-                print("no unused scene remains")
-                break
-            status, record = self.run_scene(scene_index)
-            if record is None:
-                self.stats["discarded_other"] += 1
-                continue
-            if status == "goal_reached" or (
-                status == "timeout" and self.args.save_timeout
+        try:
+            while (
+                self.stats["saved"] < self.args.num_episodes
+                and attempts < self.args.max_attempts
             ):
-                route_path = record.pop("_debug_route_path")
-                goal_xy = record.pop("_debug_goal_xy")
-                output_path = save_episode(self.args.episode_dir, record)
-                self.saved_scene_keys.add(self.scene_key(scene_index))
-                self.stats["saved"] += 1
-                record["_debug_route_path"] = route_path
-                record["_debug_goal_xy"] = goal_xy
-                if self.stats["saved"] <= self.args.save_debug_plots:
-                    self.maybe_save_debug_plot(record, scene_index, status)
-                print(
-                    f"[saved] {self.stats['saved']}/{self.args.num_episodes} "
-                    f"scene={scene_index} status={status} steps={len(record['steps'])} "
-                    f"path={output_path}"
-                )
-                continue
-            if status == "collision":
-                self.stats["discarded_collision"] += 1
-            elif status == "timeout":
-                self.stats["discarded_timeout"] += 1
-            elif status == "stuck":
-                self.stats["discarded_stuck"] += 1
-            else:
-                self.stats["discarded_other"] += 1
-
-        print("summary:")
-        for key, value in self.stats.items():
-            print(f"  {key}: {value}")
-        print(f"  attempts: {attempts}")
-
+                attempts += 1
+                scene_index = self.sample_scene_index()
+                if scene_index is None:
+                    print("no unused scene remains")
+                    break
+                status, record = self.run_scene(scene_index)
+                if record is None:
+                    self.stats["discarded_other"] += 1
+                    continue
+                if status == "goal_reached" or (
+                    status == "timeout" and self.args.save_timeout
+                ):
+                    route_path = record.pop("_debug_route_path")
+                    planning_route_path = record.pop("_debug_planning_route_path", None)
+                    goal_xy = record.pop("_debug_goal_xy")
+                    output_path = save_episode(
+                        status_episode_dir(self.args.episode_dir, status),
+                        record,
+                    )
+                    self.saved_scene_keys.add(self.scene_key(scene_index))
+                    self.stats["saved"] += 1
+                    record["_debug_route_path"] = route_path
+                    record["_debug_planning_route_path"] = planning_route_path
+                    record["_debug_goal_xy"] = goal_xy
+                    if self.stats["saved"] <= self.args.save_debug_plots:
+                        self.maybe_save_debug_plot(record, scene_index, status)
+                    print(
+                        f"[saved] {self.stats['saved']}/{self.args.num_episodes} "
+                        f"scene={scene_index} status={status} steps={len(record['steps'])} "
+                        f"path={output_path}"
+                    )
+                    continue
+                if status == "collision":
+                    self.stats["discarded_collision"] += 1
+                elif status == "timeout":
+                    self.stats["discarded_timeout"] += 1
+                elif status == "stuck":
+                    self.stats["discarded_stuck"] += 1
+                else:
+                    self.stats["discarded_other"] += 1
+        except KeyboardInterrupt:
+            print("\n[interrupted]")
+        finally:
+            print("summary:")
+            for key, value in self.stats.items():
+                print(f"  {key}: {value}")
+            print(f"  attempts: {attempts}")
+            self.print_collection_progress(prefix="[exit progress]")
 
 class AutoReviewApp(AutoCollector):
     def __init__(self, args: argparse.Namespace) -> None:
@@ -406,6 +505,7 @@ class AutoReviewApp(AutoCollector):
             f"[review summary] saved={self.review_saved} "
             f"discarded={self.review_discarded}"
         )
+        self.print_collection_progress(prefix="[exit progress]")
 
     def reset_scene(self) -> None:
         scene_index = self.sample_scene_index()
@@ -501,7 +601,10 @@ class AutoReviewApp(AutoCollector):
             )
 
     def save_current(self) -> None:
-        output_path = save_episode(self.args.episode_dir, self.build_current_record())
+        output_path = save_episode(
+            status_episode_dir(self.args.episode_dir, self.status),
+            self.build_current_record(),
+        )
         self.saved_scene_keys.add(self.scene_key(self.scene_index))
         self.review_saved += 1
         print(
@@ -566,8 +669,17 @@ class AutoReviewApp(AutoCollector):
             self.scene.route_path[:, 0],
             color="#1f77b4",
             linewidth=1.4,
-            label="route",
+            label="original route",
         )
+        if self.scene.planning_route_path is not None:
+            self.ax_scene.plot(
+                self.scene.planning_route_path[:, 1],
+                self.scene.planning_route_path[:, 0],
+                color="#ff7f0e",
+                linestyle="--",
+                linewidth=1.5,
+                label="planner route",
+            )
         self.ax_scene.plot(
             history[:, 1],
             history[:, 0],

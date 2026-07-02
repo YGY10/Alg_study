@@ -260,7 +260,7 @@ def load_saved_scene_keys(
     if not episode_dir.is_dir():
         return scene_keys, legacy_scene_keys
 
-    for path in sorted(episode_dir.glob("*.json")):
+    for path in sorted(episode_dir.rglob("*.json")):
         try:
             with path.open("r", encoding="utf-8") as file:
                 record = json.load(file)
@@ -301,7 +301,7 @@ def load_episode_progress(episode_dir: Path) -> Counter[str]:
     if not episode_dir.is_dir():
         return progress
 
-    for path in sorted(episode_dir.glob("*.json")):
+    for path in sorted(episode_dir.rglob("*.json")):
         try:
             with path.open("r", encoding="utf-8") as file:
                 record = json.load(file)
