@@ -782,6 +782,142 @@ episodes are marked with:
 
 Use these fields later for filtering or lower training weight if needed.
 
+
+## 2026-07-02 Update: Auto Collection Quality Pass
+
+The active data-collection focus is high-quality auto-reviewed data, not raw
+quantity. The current recommendation is to build a clean curriculum before
+mixing scenarios:
+
+```text
+straight: validate simple goal-directed driving first
+low_speed_avoid: conservative obstacle avoidance
+follow_stop: explicit safe-wait / stop behavior
+dense_front: only after simpler modes are stable
+```
+
+Do not assume more episodes fix bad behavior. If 50-100 clean `straight`
+episodes cannot train a stable sanity-check model, inspect the policy, labels,
+or model inputs before collecting hundreds more of the same biased data.
+
+### Auto Collector Save Layout
+
+`human_drive/auto_collect.py` now saves confirmed auto-review episodes into
+status subdirectories:
+
+```text
+<episode_dir>/goal_reached/*.json
+<episode_dir>/stuck/*.json
+<episode_dir>/timeout/*.json
+<episode_dir>/collision/*.json
+```
+
+This applies to GUI review saves (`enter/f`) and batch auto saves. The episode
+JSON still stores the final `status` field. `human_drive/drive_sim.py` and the
+auto collector now scan episode dirs recursively for duplicate-scene detection
+and progress accounting, so subdirectory saves are still de-duplicated by:
+
+```text
+scene_mode + seed_offset + scene_index + scene_attempt
+```
+
+`train_human.py` currently does not recursively read subdirectories. To train on
+confirmed successful auto episodes, pass the `goal_reached` directory directly.
+
+### Auto Collector Exit Progress
+
+`auto_collect.py` now prints cumulative disk progress when exiting GUI review or
+batch mode. It recursively counts all JSON files under `--episode-dir` and
+prints counts by status and scene mode, plus current-session counters.
+
+Expected example:
+
+```text
+[exit progress] dir=outputs/auto_collect_review_preview/episodes total_saved=74
+  by_status: goal_reached=74
+  by_scene_mode: straight=74
+  current_session: saved=20 skipped_existing=0 discarded_collision=0 discarded_stuck=0 discarded_timeout=0 discarded_other=0
+```
+
+As of the 2026-07-02 preview run, the current preview collection has:
+
+```text
+outputs/auto_collect_review_preview/episodes/goal_reached: 74 straight episodes
+```
+
+This is enough for a first sanity training run. Do not require 300 episodes
+before checking whether the learned behavior improves.
+
+### Planner Route and Goal Handling
+
+For auto collection, the planner now treats the route as an open-space line from
+origin through the goal and extended beyond the goal by 20 m:
+
+```text
+planning route: (0, 0) -> goal -> 20 m past goal
+```
+
+The original dataset route is still saved in episode JSON. The planner route is
+only used internally by `AutoDriveScene.route_xy` for Frenet planning. The
+controller metadata records:
+
+```json
+"planning_route": "origin_to_goal_extended_line"
+```
+
+Reason: the user wants position-only goal completion, not terminal stopping.
+If the planner route ends exactly at the goal, the QP clamps `s_ref/s_max` at the
+route endpoint and naturally slows down near goal. Extending the planning route
+lets the car keep moving normally until `reached_goal()` ends the episode.
+
+`auto_policy.py` also no longer reduces target speed merely because the ego is
+near the goal. `target_speed_near_goal()` still exists as a utility, but the
+main behavior generator and legacy fallback no longer use it for terminal
+braking. Goal success remains position-only:
+
+```text
+distance(ego_xy, goal_xy) <= goal_threshold
+```
+
+Velocity at goal is not part of the success condition.
+
+### Stuck Data Policy
+
+`stuck` should not automatically mean bad data. It can mean either:
+
+```text
+stuck_safe_wait: real obstacle-induced waiting, useful for follow/stop training
+stuck_planner_fail: policy failure, usually should not enter main training
+```
+
+For now, status subdirectories make this reviewable. Main sanity training should
+start from `goal_reached`. Add selected `stuck` only after manually confirming it
+represents safe waiting rather than planner failure.
+
+### Current Auto Training Command
+
+For the current preview straight data, train only the successful status folder:
+
+```bash
+cd /home/yihang/Documents/Alg_study/TorchStudy/ToySparseDriveV2
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -u train_human.py \
+  --episode-dir outputs/auto_collect_review_preview/episodes/goal_reached \
+  --checkpoint-dir outputs/checkpoints_auto_straight_goal74 \
+  --cache-dir outputs/cache_auto_straight_goal74 \
+  --rebuild-cache \
+  --learning-rate 5e-4 \
+  --path-loss-weight 0.1 \
+  --model-topk-path 20 \
+  --forced-long-path-topk 8 \
+  --val-forced-long-path-topk 0 \
+  --human-temperature 1.0 \
+  --epochs 40
+```
+
+First inspect validation behavior and `test_human_random.py` diagnostics before
+collecting much more data. Suggested first target is 80-100 clean `straight`
+episodes, then optionally 150-200 if the trend is good.
+
 ## 2026-06-24 Update: Route Cost Uses Frenet Lateral Offset
 
 Teacher route cost no longer uses nearest distance to discrete route points.
