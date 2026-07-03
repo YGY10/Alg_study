@@ -160,13 +160,127 @@ def has_collision(
     return False
 
 
+# def reached_goal(
+#     state: DriveState,
+#     goal_xy: np.ndarray,
+#     threshold: float,
+# ) -> bool:
+#     ego_xy = np.array([state.x, state.y], dtype=np.float32)
+#     return bool(np.linalg.norm(ego_xy - goal_xy) <= threshold)
+
+
+def point_to_segment_distance(
+    point: np.ndarray,
+    a: np.ndarray,
+    b: np.ndarray,
+) -> float:
+    point = np.asarray(point, dtype=np.float32)
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+
+    ab = b - a
+    denom = float(np.dot(ab, ab))
+    if denom < 1.0e-8:
+        return float(np.linalg.norm(point - a))
+
+    t = float(np.dot(point - a, ab) / denom)
+    t = max(0.0, min(1.0, t))
+    closest = a + t * ab
+    return float(np.linalg.norm(point - closest))
+
+
 def reached_goal(
     state: DriveState,
     goal_xy: np.ndarray,
     threshold: float,
+    prev_state: DriveState | None = None,
+    passed_threshold: float | None = None,
+    debug: bool = False,
 ) -> bool:
-    ego_xy = np.array([state.x, state.y], dtype=np.float32)
-    return bool(np.linalg.norm(ego_xy - goal_xy) <= threshold)
+    """Position-only goal check.
+
+    Rules:
+      1. current ego point inside threshold -> reached;
+      2. previous-current motion segment crosses goal circle -> reached;
+      3. if the ego has just passed the goal, allow a slightly relaxed radius.
+
+    This is designed for pass-through goals where speed is not required to be 0.
+    """
+    goal_xy = np.asarray(goal_xy, dtype=np.float32)
+    curr_xy = np.array([state.x, state.y], dtype=np.float32)
+
+    threshold = float(threshold)
+    relaxed_threshold = float(
+        max(threshold, passed_threshold if passed_threshold is not None else threshold)
+    )
+
+    curr_dist = float(np.linalg.norm(curr_xy - goal_xy))
+
+    # 1. 当前帧已经进圈
+    if curr_dist <= threshold:
+        if debug:
+            print(
+                f"[reached_goal] current hit: "
+                f"curr_dist={curr_dist:.2f}, threshold={threshold:.2f}"
+            )
+        return True
+
+    # 没有上一帧时，只能做当前点判断。
+    if prev_state is None:
+        return False
+
+    prev_xy = np.array([prev_state.x, prev_state.y], dtype=np.float32)
+    move_vec = curr_xy - prev_xy
+    move_len2 = float(np.dot(move_vec, move_vec))
+
+    if move_len2 < 1.0e-8:
+        return False
+
+    goal_vec = goal_xy - prev_xy
+    t_raw = float(np.dot(goal_vec, move_vec) / move_len2)
+
+    # goal 到上一帧-当前帧运动线段的距离
+    seg_dist = point_to_segment_distance(goal_xy, prev_xy, curr_xy)
+
+    # 2. 当前这一步穿过了 goal 附近。
+    # 0 <= t_raw <= 1 表示 goal 的投影点落在 prev->curr 这一段运动里。
+    if 0.0 <= t_raw <= 1.0 and seg_dist <= relaxed_threshold:
+        if debug:
+            print(
+                f"[reached_goal] segment hit: "
+                f"seg_dist={seg_dist:.2f}, "
+                f"threshold={threshold:.2f}, "
+                f"relaxed={relaxed_threshold:.2f}, "
+                f"t={t_raw:.2f}, "
+                f"curr_dist={curr_dist:.2f}"
+            )
+        return True
+
+    # 3. 已经越过 goal 后，允许稍微放松。
+    # t_raw < 0 表示 goal 在上一帧位置的后方，也就是当前已经越过过头。
+    # 这里仍然要求当前距离不能太远，避免很远处误判。
+    if t_raw < 0.0 and curr_dist <= relaxed_threshold:
+        if debug:
+            print(
+                f"[reached_goal] passed relaxed hit: "
+                f"curr_dist={curr_dist:.2f}, "
+                f"relaxed={relaxed_threshold:.2f}, "
+                f"t={t_raw:.2f}, "
+                f"seg_dist={seg_dist:.2f}"
+            )
+        return True
+
+    if debug:
+        print(
+            f"[reached_goal] miss: "
+            f"curr_dist={curr_dist:.2f}, "
+            f"seg_dist={seg_dist:.2f}, "
+            f"threshold={threshold:.2f}, "
+            f"relaxed={relaxed_threshold:.2f}, "
+            f"t={t_raw:.2f}"
+        )
+
+    return False
 
 
 def draw_obstacles(
@@ -390,7 +504,9 @@ class HumanDriveSimulator:
     def scene_already_saved(self, scene_index: int | None = None) -> bool:
         key = self.current_scene_key(scene_index)
         legacy_key = (key[2], key[3])
-        return key in self.saved_scene_keys or legacy_key in self.legacy_saved_scene_keys
+        return (
+            key in self.saved_scene_keys or legacy_key in self.legacy_saved_scene_keys
+        )
 
     def print_collection_progress(self, prefix: str = "[collection progress]") -> None:
         total = sum(self.episode_progress.values())
@@ -459,7 +575,9 @@ class HumanDriveSimulator:
             self.goal_xy,
             ego_state,
             raw_obstacles,
-        ) = self.dataset.generate_scene(self.scene_index, scene_attempt=self.scene_attempt)
+        ) = self.dataset.generate_scene(
+            self.scene_index, scene_attempt=self.scene_attempt
+        )
         self.ego_size_xy = ego_state.size_xy
         self.obstacles = [
             obstacle_to_dict(obstacle, obstacle_index)
@@ -473,7 +591,9 @@ class HumanDriveSimulator:
         )
         self.time_s = 0.0
         self.steps = []
-        self.ego_history = [[self.state.x, self.state.y, self.state.yaw, self.state.speed]]
+        self.ego_history = [
+            [self.state.x, self.state.y, self.state.yaw, self.state.speed]
+        ]
         self.done = False
         self.status = "driving"
         self.pending_accel = None
@@ -684,7 +804,9 @@ class HumanDriveSimulator:
         if self.terminal_original_attrs is None:
             return
         try:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.terminal_original_attrs)
+            termios.tcsetattr(
+                sys.stdin, termios.TCSADRAIN, self.terminal_original_attrs
+            )
         finally:
             self.terminal_original_attrs = None
 

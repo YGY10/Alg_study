@@ -32,7 +32,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--episode-dir",
         type=Path,
-        default=PROJECT_ROOT / "human_drive" / "episodes",
+        action="append",
+        default=None,
+        help="Directory containing episode json files. Can be repeated.",
     )
     parser.add_argument(
         "--cache-dir",
@@ -103,6 +105,14 @@ def split_episode_paths(
     rng.shuffle(paths)
     num_val = max(1, int(round(len(paths) * val_ratio)))
     return paths[num_val:], paths[:num_val]
+
+
+def collect_episode_paths(episode_dirs: list[Path] | None) -> list[Path]:
+    dirs = episode_dirs or [PROJECT_ROOT / "human_drive" / "episodes"]
+    paths: list[Path] = []
+    for episode_dir in dirs:
+        paths.extend(sorted(Path(episode_dir).glob("*.json")))
+    return sorted({path.resolve(): path for path in paths}.values())
 
 
 def move_batch_to_device(
@@ -476,7 +486,7 @@ def run_one_epoch(
 
 def main() -> None:
     args = parse_args()
-    episode_paths = sorted(args.episode_dir.glob("*.json"))
+    episode_paths = collect_episode_paths(args.episode_dir)
     if args.max_episodes is not None:
         episode_paths = episode_paths[: args.max_episodes]
     if len(episode_paths) < 2:

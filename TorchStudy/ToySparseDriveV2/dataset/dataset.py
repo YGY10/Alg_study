@@ -49,13 +49,13 @@ def make_scene_sampling_config(mode: str) -> SceneSamplingConfig:
     if mode == "straight":
         return SceneSamplingConfig(
             mode=mode,
-            ego_speed_range=(3.0, 8.0),
-            goal_x_range=(20.0, 50.0),
-            goal_y_range=(-20.0, 20.0),
-            obstacle_x_range=(8.0, 25.0),
-            obstacle_y_range=(-10.0, 10.0),
-            obstacle_vx_range=(3.0, 8.0),
-            obstacle_vy_range=(-0.5, 0.5),
+            ego_speed_range=(0.0, 8.0),
+            goal_x_range=(10.0, 30.0),
+            goal_y_range=(-5.0, 5.0),
+            obstacle_x_range=(6.0, 10.0),
+            obstacle_y_range=(-5.0, 5.0),
+            obstacle_vx_range=(3.0, 6.0),
+            obstacle_vy_range=(-0.8, 0.8),
             route_aware_probability=0.9,
             min_obstacles=4,
             max_obstacles=6,
@@ -63,16 +63,16 @@ def make_scene_sampling_config(mode: str) -> SceneSamplingConfig:
     if mode == "low_speed_avoid":
         return SceneSamplingConfig(
             mode=mode,
-            ego_speed_range=(0.0, 3.0),
-            goal_x_range=(25.0, 45.0),
-            goal_y_range=(-15.0, 15.0),
-            obstacle_x_range=(8.0, 30.0),
-            obstacle_y_range=(-8.0, 8.0),
-            obstacle_vx_range=(0.0, 2.0),
-            obstacle_vy_range=(-0.4, 0.4),
+            ego_speed_range=(3.0, 6.0),
+            goal_x_range=(20.0, 45.0),
+            goal_y_range=(1.0, 15.0),
+            obstacle_x_range=(10.0, 20.0),
+            obstacle_y_range=(1.0, 10.0),
+            obstacle_vx_range=(0.0, 0.5),
+            obstacle_vy_range=(-0.05, 0.05),
             route_aware_probability=0.9,
-            min_obstacles=4,
-            max_obstacles=9,
+            min_obstacles=2,
+            max_obstacles=2,
         )
     if mode == "follow_stop":
         return SceneSamplingConfig(

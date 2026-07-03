@@ -26,7 +26,13 @@ from auto_policy import (
     AutoPolicyConfig,
     plan_auto_action,
 )
-from dataset import ToySparseDriveV2Dataset, make_scene_sampling_config
+from dataset import (
+    ToySparseDriveV2Dataset,
+    make_scene_sampling_config,
+    obstacle_is_valid_for_scene,
+    obstacle_overlaps_ego_initially,
+    sample_mixed_obstacle,
+)
 from drive_sim import (
     DEFAULT_EPISODE_DIR,
     DEFAULT_OUTPUT_DIR,
@@ -46,6 +52,106 @@ AUTO_DRIVER_NAME = "auto_normal_v1"
 AUTO_SOURCE = "auto_drive_v1"
 
 
+def point_to_segment_distance(
+    point: np.ndarray,
+    a: np.ndarray,
+    b: np.ndarray,
+) -> float:
+    """Distance from a point to the finite segment [a, b]."""
+    point = np.asarray(point, dtype=np.float32)
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+
+    ab = b - a
+    denom = float(np.dot(ab, ab))
+    if denom < 1.0e-8:
+        return float(np.linalg.norm(point - a))
+
+    ratio = float(np.dot(point - a, ab) / denom)
+    ratio = max(0.0, min(1.0, ratio))
+    closest = a + ratio * ab
+    return float(np.linalg.norm(point - closest))
+
+
+def reached_goal(
+    state: DriveState,
+    goal_xy: np.ndarray,
+    threshold: float,
+    prev_state: DriveState | None = None,
+    passed_threshold: float | None = None,
+    debug: bool = False,
+) -> bool:
+    """Position-only goal check that supports pass-through goals.
+
+    The old check only tested the current ego point against one radius. That can
+    miss the goal when the ego moves more than the radius between two simulation
+    ticks. This version also checks whether the previous-current motion segment
+    crossed near the goal and allows a slightly relaxed radius for pass-through
+    scenes where stopping at the goal is not required.
+    """
+    goal_xy = np.asarray(goal_xy, dtype=np.float32)
+    curr_xy = np.array([state.x, state.y], dtype=np.float32)
+
+    threshold = float(threshold)
+    relaxed_threshold = float(
+        max(threshold, passed_threshold if passed_threshold is not None else threshold)
+    )
+
+    curr_dist = float(np.linalg.norm(curr_xy - goal_xy))
+    if curr_dist <= threshold:
+        if debug:
+            print(
+                "[reached_goal] current hit: "
+                f"curr_dist={curr_dist:.2f}, threshold={threshold:.2f}"
+            )
+        return True
+
+    if prev_state is None:
+        return False
+
+    prev_xy = np.array([prev_state.x, prev_state.y], dtype=np.float32)
+    move_vec = curr_xy - prev_xy
+    move_len2 = float(np.dot(move_vec, move_vec))
+    if move_len2 < 1.0e-8:
+        return False
+
+    goal_vec = goal_xy - prev_xy
+    t_raw = float(np.dot(goal_vec, move_vec) / move_len2)
+    seg_dist = point_to_segment_distance(goal_xy, prev_xy, curr_xy)
+
+    # The goal projection lies on the actual motion segment, and that segment
+    # passes through the relaxed goal disk.
+    if 0.0 <= t_raw <= 1.0 and seg_dist <= relaxed_threshold:
+        if debug:
+            print(
+                "[reached_goal] segment hit: "
+                f"seg_dist={seg_dist:.2f}, threshold={threshold:.2f}, "
+                f"relaxed={relaxed_threshold:.2f}, t={t_raw:.2f}, "
+                f"curr_dist={curr_dist:.2f}"
+            )
+        return True
+
+    # If the ego has just passed the goal, allow a relaxed current-distance
+    # check, but keep it bounded to avoid accepting a far lateral miss.
+    if t_raw < 0.0 and curr_dist <= relaxed_threshold:
+        if debug:
+            print(
+                "[reached_goal] passed relaxed hit: "
+                f"curr_dist={curr_dist:.2f}, relaxed={relaxed_threshold:.2f}, "
+                f"t={t_raw:.2f}, seg_dist={seg_dist:.2f}"
+            )
+        return True
+
+    if debug:
+        print(
+            "[reached_goal] miss: "
+            f"curr_dist={curr_dist:.2f}, seg_dist={seg_dist:.2f}, "
+            f"threshold={threshold:.2f}, relaxed={relaxed_threshold:.2f}, "
+            f"t={t_raw:.2f}"
+        )
+    return False
+
+
 def status_episode_dir(base_dir: Path, status: str) -> Path:
     safe_status = "".join(
         char if char.isalnum() or char in {"_", "-"} else "_"
@@ -54,7 +160,9 @@ def status_episode_dir(base_dir: Path, status: str) -> Path:
     return base_dir / safe_status
 
 
-def load_auto_collection_progress(episode_dir: Path) -> tuple[Counter[str], Counter[str]]:
+def load_auto_collection_progress(
+    episode_dir: Path,
+) -> tuple[Counter[str], Counter[str]]:
     status_counts: Counter[str] = Counter()
     mode_counts: Counter[str] = Counter()
     if not episode_dir.is_dir():
@@ -222,6 +330,58 @@ class AutoCollector:
             "discarded_other": 0,
         }
 
+    def sample_obstacles_for_planner_route(
+        self,
+        scene_index: int,
+        planning_route_path: np.ndarray,
+        ego_state: Any,
+    ) -> list[Any]:
+        seed_sequence = np.random.SeedSequence(
+            [
+                int(self.args.seed_offset),
+                int(scene_index),
+                int(self.args.scene_attempt),
+                7919,
+            ]
+        )
+        rng = np.random.default_rng(seed_sequence)
+        scene_config = self.dataset.scene_config
+        min_obstacles = (
+            scene_config.min_obstacles
+            if scene_config.min_obstacles is not None
+            else self.dataset.min_obstacles
+        )
+        max_obstacles = (
+            scene_config.max_obstacles
+            if scene_config.max_obstacles is not None
+            else self.dataset.max_obstacles
+        )
+        num_obstacles = int(rng.integers(min_obstacles, max_obstacles + 1))
+        obstacles = []
+        for _ in range(num_obstacles):
+            for _sample_attempt in range(100):
+                obstacle = sample_mixed_obstacle(
+                    rng=rng,
+                    grid_config=self.grid_config,
+                    route_path=planning_route_path,
+                    config=scene_config,
+                )
+                if obstacle_is_valid_for_scene(
+                    obstacle
+                ) and not obstacle_overlaps_ego_initially(
+                    obstacle=obstacle,
+                    ego_state=ego_state,
+                    safety_margin=self.teacher_config.safety_margin,
+                ):
+                    obstacles.append(obstacle)
+                    break
+            else:
+                raise RuntimeError(
+                    f"Unable to sample planner-route obstacle for "
+                    f"sample={scene_index}, scene_attempt={self.args.scene_attempt}"
+                )
+        return obstacles
+
     def scene_key(self, scene_index: int) -> tuple[str, int, int, int]:
         return (
             str(self.args.scene_mode),
@@ -235,8 +395,12 @@ class AutoCollector:
         legacy_key = (key[2], key[3])
         return key in self.saved_scene_keys or legacy_key in self.legacy_scene_keys
 
-    def print_collection_progress(self, prefix: str = "[auto collection progress]") -> None:
-        status_counts, mode_counts = load_auto_collection_progress(self.args.episode_dir)
+    def print_collection_progress(
+        self, prefix: str = "[auto collection progress]"
+    ) -> None:
+        status_counts, mode_counts = load_auto_collection_progress(
+            self.args.episode_dir
+        )
         total = sum(status_counts.values())
         print(f"{prefix} dir={self.args.episode_dir} total_saved={total}")
         if status_counts:
@@ -288,6 +452,12 @@ class AutoCollector:
                 scene_index, scene_attempt=self.args.scene_attempt
             )
         )
+        planning_route_path = build_start_to_goal_route(goal_xy)
+        raw_obstacles = self.sample_obstacles_for_planner_route(
+            scene_index=scene_index,
+            planning_route_path=planning_route_path,
+            ego_state=ego_state,
+        )
         obstacles = [
             obstacle_to_dict(obstacle, obstacle_index)
             for obstacle_index, obstacle in enumerate(raw_obstacles)
@@ -302,7 +472,7 @@ class AutoCollector:
             route_path=route_path,
             goal_xy=goal_xy,
             obstacles=obstacles,
-            planning_route_path=build_start_to_goal_route(goal_xy),
+            planning_route_path=planning_route_path,
         )
         return route_path_index, scene, state, ego_state.size_xy
 
@@ -332,6 +502,7 @@ class AutoCollector:
 
         max_steps = int(math.ceil(self.args.max_time / self.args.dt))
         for step_index in range(max_steps):
+            prev_state = state
             before = asdict(state)
             action = self.step_policy(state, scene, time_s, ego_history)
             state = step_ego(
@@ -354,6 +525,12 @@ class AutoCollector:
                 state=state,
                 goal_xy=scene.goal_xy,
                 threshold=self.args.goal_threshold,
+                prev_state=prev_state,
+                passed_threshold=max(
+                    float(self.args.goal_threshold),
+                    float(self.args.goal_passed_threshold),
+                ),
+                debug=bool(getattr(self.args, "debug_goal_check", False)),
             )
             steps.append(
                 {
@@ -477,6 +654,7 @@ class AutoCollector:
             print(f"  attempts: {attempts}")
             self.print_collection_progress(prefix="[exit progress]")
 
+
 class AutoReviewApp(AutoCollector):
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__(args)
@@ -545,6 +723,7 @@ class AutoReviewApp(AutoCollector):
     def auto_step_once(self) -> None:
         if self.status != "driving" or self.scene is None:
             return
+        prev_state = self.state
         before = asdict(self.state)
         action = self.step_policy(self.state, self.scene, self.time_s, self.ego_history)
         self.state = step_ego(
@@ -569,6 +748,12 @@ class AutoReviewApp(AutoCollector):
             state=self.state,
             goal_xy=self.scene.goal_xy,
             threshold=self.args.goal_threshold,
+            prev_state=prev_state,
+            passed_threshold=max(
+                float(self.args.goal_threshold),
+                float(self.args.goal_passed_threshold),
+            ),
+            debug=bool(getattr(self.args, "debug_goal_check", False)),
         )
         self.steps.append(
             {
@@ -587,7 +772,7 @@ class AutoReviewApp(AutoCollector):
             self.status = "goal_reached"
         elif self.time_s >= self.args.max_time:
             self.status = "timeout"
-        elif self.state.speed < 0.25:
+        elif self.state.speed < 0.05:
             self.low_speed_steps += 1
             if self.low_speed_steps * self.args.dt >= self.args.stuck_time:
                 self.status = "stuck"
@@ -784,6 +969,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steer-deg", type=float, default=18.0)
     parser.add_argument("--safety-margin", type=float, default=0.3)
     parser.add_argument("--goal-threshold", type=float, default=1.0)
+    parser.add_argument(
+        "--goal-passed-threshold",
+        type=float,
+        default=2.5,
+        help="Relaxed goal radius used when ego segment passes near the goal.",
+    )
+    parser.add_argument(
+        "--debug-goal-check",
+        action="store_true",
+        help="Print detailed reached_goal debug information.",
+    )
     parser.add_argument("--cruise-speed", type=float, default=6.5)
     parser.add_argument("--speed-kp", type=float, default=0.9)
     parser.add_argument("--lookahead-base", type=float, default=7.0)

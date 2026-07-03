@@ -34,7 +34,9 @@ class AutoPolicyConfig:
     scene representation. It does not require ROS, HD maps, or OOQP.
     """
 
-    name: str = "epsilon_style_ssc_bezier_qp_yawfix_pruned_cached_qp_v3"
+    name: str = (
+        "epsilon_style_ssc_bezier_qp_yawfix_pruned_cached_qp_goalreturn_debug_v5"
+    )
 
     # Vehicle and low-level limits.
     wheelbase: float = 2.8
@@ -44,7 +46,7 @@ class AutoPolicyConfig:
     max_speed: float = 10.0
 
     # Speed control.
-    cruise_speed: float = 6.5
+    cruise_speed: float = 8.0
     speed_kp: float = 0.9
 
     # Legacy target-point parameters used only for emergency fallback.
@@ -98,6 +100,29 @@ class AutoPolicyConfig:
     behavior_bias_weight: float = 1.0
     stop_without_reason_cost: float = 40.0
 
+    # Goal handling.
+    # The planner route may be extended beyond the original goal to avoid
+    # terminal braking, but the original goal should still be treated as a
+    # pass-through mission point. A trajectory is rewarded if any future point
+    # passes near goal_xy; it is not required to stop at the goal.
+    goal_pass_radius: float = 2.0
+    goal_pass_reward: float = 30.0
+    goal_progress_after_pass_scale: float = 0.3
+
+    # PASS behavior should not stay at a fixed lateral offset forever when the
+    # route is artificially extended beyond the mission goal. If the original
+    # goal is reachable inside the planning horizon, construct a lateral
+    # reference that goes ego_l -> pass_l -> goal_l.
+    pass_return_to_goal: bool = True
+    pass_build_distance: float = 8.0
+    pass_return_start_before_goal: float = 10.0
+    pass_return_after_obstacle_buffer: float = 2.0
+    pass_return_trigger_margin: float = 8.0
+
+    # Debug switches. debug_policy prints one line per planning step when True;
+    # all important planner/QP/cost terms are also stored in PlannedTrajectory.debug.
+    debug_policy: bool = False
+
     # Controller tracking.
     tracking_lookahead_time: float = 0.7
     tracking_min_lookahead_index: int = 2
@@ -111,7 +136,7 @@ class AutoPolicyConfig:
     # enable_behavior_pruning reduces candidate behaviors before expensive SSC/QP.
     # enable_qp_cache uses a direct OSQP matrix cache instead of rebuilding a
     # cvxpy problem for every behavior.
-    enable_behavior_pruning: bool = True
+    enable_behavior_pruning: bool = False
     keep_nudge_without_front: bool = False
     max_pruned_behaviors: int = 4
     pass_side_clearance_threshold: float = -0.2
@@ -213,6 +238,7 @@ class SSCCorridor:
     l_max: np.ndarray
     feasible: bool
     reason: str = ""
+    debug: dict[str, Any] | None = None
 
 
 @dataclass
@@ -306,7 +332,37 @@ def plan_auto_action(
     if best is None:
         # Defensive fallback: if all SSC/QP candidates fail, use the old
         # target-point policy instead of returning an arbitrary zero command.
+        if bool(getattr(config, "debug_policy", False)):
+            print(
+                "[auto_policy] no_valid_plan "
+                f"behaviors={[b.name for b in behaviors]} "
+                f"ego_s={ego_proj.s:.2f} ego_l={ego_proj.l:.2f}"
+            )
         return legacy_pure_pursuit_action(observation, scene, config)
+
+    best.debug.update(
+        {
+            "candidate_behaviors": [b.name for b in behaviors],
+            "selected_behavior": best.behavior.name,
+            "selected_mode": best.behavior.mode,
+            "selected_side": best.behavior.side,
+            "ego_s": float(ego_proj.s),
+            "ego_l": float(ego_proj.l),
+            "planner_route_end_s": float(route_s[-1]),
+        }
+    )
+    if bool(getattr(config, "debug_policy", False)):
+        goal_dbg = best.debug.get("goal", {})
+        qp_dbg = best.debug.get("qp", {})
+        corridor_dbg = best.debug.get("corridor", {})
+        print(
+            "[auto_policy] selected "
+            f"behavior={best.behavior.name} source={best.source} cost={best.cost:.2f} "
+            f"ego_s={ego_proj.s:.2f} ego_l={ego_proj.l:.2f} "
+            f"min_goal={goal_dbg.get('min_goal_distance', None)} "
+            f"l_ref_strategy={corridor_dbg.get('l_ref_strategy', None)} "
+            f"terminal_l_target={qp_dbg.get('terminal_l_target', None)}"
+        )
 
     return track_trajectory_to_action(
         trajectory=best,
@@ -589,9 +645,13 @@ def choose_best_pass_side(
 
     threshold = float(getattr(config, "pass_side_clearance_threshold", -0.2))
     best_score = max(left_score, right_score)
+    best_side = "left" if left_score >= right_score else "right"
     if best_score < threshold:
-        return None
-    return "left" if left_score >= right_score else "right"
+        # Keep at least one pass candidate alive. The later SSC/QP and
+        # collision scoring stages can still reject it if it is truly infeasible,
+        # but pruning should not remove all绕行 capability too early.
+        return best_side
+    return best_side
 
 
 def estimate_pass_lateral_clearance_score(
@@ -699,6 +759,178 @@ def estimate_obstacle_route_speed(
 # =============================================================================
 
 
+def build_goal_aware_lateral_reference(
+    observation: AutoDriveObservation,
+    scene: AutoDriveScene,
+    config: AutoPolicyConfig,
+    ego_proj: FrenetProjection,
+    behavior: BehaviorCandidate,
+    times: np.ndarray,
+    s_ref: np.ndarray,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Build l_ref, with PASS returning toward the original goal when useful.
+
+    The planner route may be extended beyond the original goal to avoid terminal
+    braking. In that case a PASS behavior with target_l=+/-pass_lateral_offset
+    should not hold that lateral offset until the horizon end. If the original
+    goal lies inside or just beyond the horizon, this builds a three-stage
+    lateral reference:
+
+        ego_l -> pass_l -> goal_l
+
+    where goal_l is the original goal projected onto the planner route. This
+    makes the generated candidate itself prefer returning toward the mission
+    goal; the evaluation layer no longer has to fight a fixed terminal pass_l.
+    """
+    tau = times / max(float(times[-1]), 1.0e-6)
+    smooth_time = 3.0 * tau * tau - 2.0 * tau * tau * tau
+    default_l_ref = ego_proj.l + (behavior.target_l - ego_proj.l) * smooth_time
+
+    debug: dict[str, Any] = {
+        "l_ref_strategy": "default_behavior_target",
+        "behavior_name": behavior.name,
+        "behavior_mode": behavior.mode,
+        "behavior_target_l": float(behavior.target_l),
+        "ego_s": float(ego_proj.s),
+        "ego_l": float(ego_proj.l),
+        "s_ref_start": float(s_ref[0]) if len(s_ref) else float(ego_proj.s),
+        "s_ref_end": float(s_ref[-1]) if len(s_ref) else float(ego_proj.s),
+    }
+
+    if not bool(getattr(config, "pass_return_to_goal", True)):
+        debug["l_ref_goal_return_disabled"] = True
+        return default_l_ref.astype(np.float32), debug
+
+    if behavior.mode != "pass":
+        return default_l_ref.astype(np.float32), debug
+
+    if len(scene.route_xy) < 2 or len(s_ref) == 0:
+        debug["l_ref_goal_return_skip_reason"] = "empty_route_or_ref"
+        return default_l_ref.astype(np.float32), debug
+
+    goal_proj = project_to_route(
+        xy=np.asarray(scene.goal_xy, dtype=np.float32),
+        route_xy=scene.route_xy,
+        route_s=scene.route_s,
+    )
+    goal_s = float(goal_proj.s)
+    goal_l = clamp(
+        float(goal_proj.l),
+        -float(config.ssc_lateral_bound),
+        float(config.ssc_lateral_bound),
+    )
+    s_end = float(s_ref[-1])
+
+    debug.update(
+        {
+            "goal_s": goal_s,
+            "goal_l": goal_l,
+            "goal_distance_s_from_ego": goal_s - float(ego_proj.s),
+        }
+    )
+
+    # Only activate when the original goal is reachable in/near the horizon.
+    # If it is far ahead, a normal fixed-offset pass is fine.
+    if goal_s <= float(ego_proj.s) + 0.5:
+        debug["l_ref_goal_return_skip_reason"] = "goal_behind_or_too_close_in_s"
+        return default_l_ref.astype(np.float32), debug
+
+    trigger_margin = float(getattr(config, "pass_return_trigger_margin", 8.0))
+    if goal_s > s_end + trigger_margin:
+        debug["l_ref_goal_return_skip_reason"] = "goal_outside_horizon"
+        return default_l_ref.astype(np.float32), debug
+
+    # Avoid returning before the obstacle cluster that likely caused the pass.
+    # This is a cheap debug-friendly estimate; SSC constraints still enforce the
+    # actual pass side later.
+    latest_blocking_s_end = float(ego_proj.s)
+    blocking_count = 0
+    for obstacle in scene.obstacles:
+        center = obstacle_center_at(obstacle, observation.time_s)
+        obs_proj = project_to_route(center, scene.route_xy, scene.route_s)
+        if obs_proj.s < ego_proj.s - 4.0 or obs_proj.s > goal_s + 6.0:
+            continue
+        obs_half_s, obs_half_l = inflated_frenet_box_half_extents(
+            obstacle=obstacle,
+            time_s=observation.time_s,
+            route_yaw=obs_proj.route_yaw,
+            config=config,
+            ego_yaw=ego_proj.route_yaw,
+            extra_s_buffer=0.0,
+            extra_l_buffer=float(config.static_l_buffer),
+        )
+        # Treat near-route obstacles as likely blockers. This matches the
+        # front-obstacle semantics but avoids requiring exact identity matching.
+        if abs(float(obs_proj.l) - float(ego_proj.l)) <= obs_half_l:
+            latest_blocking_s_end = max(
+                latest_blocking_s_end, float(obs_proj.s) + obs_half_s
+            )
+            blocking_count += 1
+
+    return_start_before_goal = float(
+        getattr(config, "pass_return_start_before_goal", 10.0)
+    )
+    after_obstacle_buffer = float(
+        getattr(config, "pass_return_after_obstacle_buffer", 2.0)
+    )
+    return_start_s = max(
+        float(ego_proj.s) + 1.0,
+        goal_s - return_start_before_goal,
+        latest_blocking_s_end + after_obstacle_buffer,
+    )
+
+    # Make sure there is at least a small return segment before/near the goal.
+    # If the blocker extends too close to the goal, this will start as early as
+    # possible but SSC/collision scoring may still reject unsafe plans.
+    if return_start_s >= goal_s - 0.5:
+        return_start_s = max(float(ego_proj.s) + 1.0, goal_s - 0.5)
+
+    pass_build_distance = float(getattr(config, "pass_build_distance", 8.0))
+    pass_build_end_s = min(return_start_s, float(ego_proj.s) + pass_build_distance)
+    pass_l = float(behavior.target_l)
+
+    l_ref = np.zeros_like(s_ref, dtype=np.float32)
+    for i, s_val in enumerate(s_ref):
+        s_i = float(s_val)
+        if s_i <= pass_build_end_s:
+            ratio = clamp(
+                (s_i - float(ego_proj.s))
+                / max(pass_build_end_s - float(ego_proj.s), 1.0e-3),
+                0.0,
+                1.0,
+            )
+            sm = 3.0 * ratio * ratio - 2.0 * ratio * ratio * ratio
+            l_ref[i] = float(ego_proj.l) + (pass_l - float(ego_proj.l)) * sm
+        elif s_i < return_start_s:
+            l_ref[i] = pass_l
+        else:
+            ratio = clamp(
+                (s_i - return_start_s) / max(goal_s - return_start_s, 1.0e-3),
+                0.0,
+                1.0,
+            )
+            sm = 3.0 * ratio * ratio - 2.0 * ratio * ratio * ratio
+            l_ref[i] = pass_l + (goal_l - pass_l) * sm
+
+    debug.update(
+        {
+            "l_ref_strategy": "pass_return_to_goal",
+            "goal_return_active": True,
+            "goal_s": goal_s,
+            "goal_l": goal_l,
+            "pass_l": pass_l,
+            "pass_build_end_s": float(pass_build_end_s),
+            "return_start_s": float(return_start_s),
+            "latest_blocking_s_end": float(latest_blocking_s_end),
+            "blocking_count": int(blocking_count),
+            "terminal_l_ref": float(l_ref[-1]),
+            "l_ref_min": float(np.min(l_ref)),
+            "l_ref_max": float(np.max(l_ref)),
+        }
+    )
+    return l_ref.astype(np.float32), debug
+
+
 def build_ssc_corridor(
     observation: AutoDriveObservation,
     scene: AutoDriveScene,
@@ -727,10 +959,19 @@ def build_ssc_corridor(
     s_ref = ego_proj.s + speed * times
     s_ref = np.minimum(s_ref, route_s_end)
 
-    # Smooth lateral reference from current l to behavior target l.
-    tau = times / max(config.horizon, 1.0e-6)
-    smooth = 3.0 * tau * tau - 2.0 * tau * tau * tau
-    l_ref = ego_proj.l + (behavior.target_l - ego_proj.l) * smooth
+    # Smooth lateral reference. For pass behaviors near the original goal, use
+    # a goal-aware reference: ego_l -> pass_l -> goal_l. This prevents the
+    # route-extension trick from making the car keep a pass offset after it has
+    # already cleared the obstacle and should approach the mission goal.
+    l_ref, corridor_debug = build_goal_aware_lateral_reference(
+        observation=observation,
+        scene=scene,
+        config=config,
+        ego_proj=ego_proj,
+        behavior=behavior,
+        times=times,
+        s_ref=s_ref,
+    )
 
     lat_bound = float(config.ssc_lateral_bound)
     if behavior.mode in {"keep", "follow", "yield", "stop"}:
@@ -751,6 +992,11 @@ def build_ssc_corridor(
     s_max = np.full(n, route_s_end, dtype=np.float32)
     s_min[0] = ego_proj.s
     s_max[0] = ego_proj.s
+
+    pass_l_min_updates = 0
+    pass_l_max_updates = 0
+    stop_s_updates = 0
+    considered_obstacle_time_points = 0
 
     # Apply obstacle semantics.
     for obstacle in scene.obstacles:
@@ -784,6 +1030,8 @@ def build_ssc_corridor(
             ):
                 continue
 
+            considered_obstacle_time_points += 1
+
             # Time-expanded longitudinal overlap with nominal reference.
             longitudinal_overlap = abs(float(s_ref[i]) - obs_proj.s) <= (
                 obs_half_s + max(2.0, speed * config.dynamic_time_buffer)
@@ -793,12 +1041,18 @@ def build_ssc_corridor(
                 if longitudinal_overlap:
                     # Pass to the left of the obstacle.
                     new_min = obs_proj.l + obs_half_l
+                    old_min = float(l_min[i])
                     l_min[i] = max(l_min[i], new_min)
+                    if float(l_min[i]) > old_min + 1.0e-6:
+                        pass_l_min_updates += 1
             elif behavior.side == "right" and behavior.mode == "pass":
                 if longitudinal_overlap:
                     # Pass to the right of the obstacle.
                     new_max = obs_proj.l - obs_half_l
+                    old_max = float(l_max[i])
                     l_max[i] = min(l_max[i], new_max)
+                    if float(l_max[i]) < old_max - 1.0e-6:
+                        pass_l_max_updates += 1
             else:
                 # Keep/follow/yield/stop: stay behind obstacles blocking the
                 # current route-centered corridor.
@@ -808,8 +1062,11 @@ def build_ssc_corridor(
                     # The later the time, the stronger the upper bound. This
                     # creates a valid ST corridor behind the obstacle.
                     if float(s_ref[i]) >= stop_s - 1.0:
+                        old_s_max = float(s_max[i])
                         s_max[i] = min(s_max[i], stop_s)
                         s_ref[i] = min(s_ref[i], stop_s)
+                        if float(s_max[i]) < old_s_max - 1.0e-6:
+                            stop_s_updates += 1
 
     # Stop behavior explicitly chooses a short stopping corridor.
     if behavior.mode == "stop":
@@ -820,6 +1077,22 @@ def build_ssc_corridor(
         for i in range(1, n):
             s_max[i] = min(s_max[i], stop_s + 0.4)
             s_ref[i] = min(s_ref[i], stop_s)
+
+    corridor_debug.update(
+        {
+            "local_l_bound": float(local_bound),
+            "route_s_end": float(route_s_end),
+            "target_speed": float(speed),
+            "pass_l_min_updates": int(pass_l_min_updates),
+            "pass_l_max_updates": int(pass_l_max_updates),
+            "stop_s_updates": int(stop_s_updates),
+            "considered_obstacle_time_points": int(considered_obstacle_time_points),
+            "raw_l_min_min": float(np.min(l_min)),
+            "raw_l_max_max": float(np.max(l_max)),
+            "raw_l_width_min": float(np.min(l_max - l_min)),
+            "raw_s_width_min": float(np.min(s_max - s_min)),
+        }
+    )
 
     # Repair minor numerical issues and check feasibility.
     eps = 1.0e-3
@@ -836,6 +1109,11 @@ def build_ssc_corridor(
                 l_max=l_max,
                 feasible=False,
                 reason=f"l corridor infeasible at i={i}",
+                debug={
+                    **corridor_debug,
+                    "infeasible_index": int(i),
+                    "infeasible_type": "l",
+                },
             )
         if s_min[i] > s_max[i] + eps:
             return SSCCorridor(
@@ -849,6 +1127,11 @@ def build_ssc_corridor(
                 l_max=l_max,
                 feasible=False,
                 reason=f"s corridor infeasible at i={i}",
+                debug={
+                    **corridor_debug,
+                    "infeasible_index": int(i),
+                    "infeasible_type": "s",
+                },
             )
         s_ref[i] = clamp(float(s_ref[i]), float(s_min[i]), float(s_max[i]))
         l_ref[i] = clamp(float(l_ref[i]), float(l_min[i]), float(l_max[i]))
@@ -864,6 +1147,15 @@ def build_ssc_corridor(
         l_max=l_max.astype(np.float32),
         feasible=True,
         reason="ok",
+        debug={
+            **corridor_debug,
+            "final_l_ref_terminal": float(l_ref[-1]),
+            "final_l_min_terminal": float(l_min[-1]),
+            "final_l_max_terminal": float(l_max[-1]),
+            "final_s_ref_terminal": float(s_ref[-1]),
+            "final_s_min_terminal": float(s_min[-1]),
+            "final_s_max_terminal": float(s_max[-1]),
+        },
     )
 
 
@@ -1072,12 +1364,8 @@ def compute_cached_qp_linear_term(
         -2.0 * float(config.qp_l_ref_weight) * (cache.B_l.T @ l_ref)
     ).reshape(-1)
     q += -2.0 * float(config.qp_terminal_s_weight) * float(s_ref[-1]) * cache.e_sT_vec
-    q += (
-        -2.0
-        * float(config.qp_terminal_l_weight)
-        * float(corridor.behavior.target_l)
-        * cache.e_lT_vec
-    )
+    terminal_l_target = float(corridor.l_ref[-1])
+    q += -2.0 * float(config.qp_terminal_l_weight) * terminal_l_target * cache.e_lT_vec
     q += -float(config.qp_progress_weight) * cache.e_sT_vec
     return q.astype(np.float64)
 
@@ -1164,6 +1452,18 @@ def optimize_bezier_trajectory_qp(
                     "qp_status": str(result.info.status),
                     "qp_status_val": int(result.info.status_val),
                     "cached_osqp": True,
+                    "corridor": corridor.debug or {},
+                    "qp": {
+                        "solver": "cached_osqp",
+                        "objective": float(result.info.obj_val),
+                        "terminal_l_target": float(corridor.l_ref[-1]),
+                        "terminal_s_target": float(corridor.s_ref[-1]),
+                        "behavior_target_l": float(corridor.behavior.target_l),
+                        "l_ref_terminal": float(corridor.l_ref[-1]),
+                        "s_ref_terminal": float(corridor.s_ref[-1]),
+                        "status": str(result.info.status),
+                        "status_val": int(result.info.status_val),
+                    },
                 },
             )
         except Exception as exc:  # robust fallback for missing osqp/API issues
@@ -1245,9 +1545,8 @@ def optimize_bezier_trajectory_qp_cvxpy(
         obj += config.qp_s_jerk_weight * cp.sum_squares(d3 @ s_eval)
         obj += config.qp_l_jerk_weight * cp.sum_squares(d3 @ l_eval)
 
-    obj += config.qp_terminal_l_weight * cp.square(
-        l_eval[-1] - corridor.behavior.target_l
-    )
+    terminal_l_target = float(corridor.l_ref[-1])
+    obj += config.qp_terminal_l_weight * cp.square(l_eval[-1] - terminal_l_target)
     obj += config.qp_terminal_s_weight * cp.square(s_eval[-1] - corridor.s_ref[-1])
 
     # Linear progress reward. This remains convex because minimizing a negative
@@ -1284,7 +1583,20 @@ def optimize_bezier_trajectory_qp_cvxpy(
         scene=scene,
         base_cost=float(problem.value) if problem.value is not None else 0.0,
         valid=True,
-        debug={"qp_status": problem.status},
+        debug={
+            "qp_status": problem.status,
+            "corridor": corridor.debug or {},
+            "qp": {
+                "solver": "cvxpy",
+                "objective": float(problem.value) if problem.value is not None else 0.0,
+                "terminal_l_target": float(corridor.l_ref[-1]),
+                "terminal_s_target": float(corridor.s_ref[-1]),
+                "behavior_target_l": float(corridor.behavior.target_l),
+                "l_ref_terminal": float(corridor.l_ref[-1]),
+                "s_ref_terminal": float(corridor.s_ref[-1]),
+                "status": str(problem.status),
+            },
+        },
     )
 
 
@@ -1340,7 +1652,7 @@ def optimize_bezier_trajectory_sampling(
                 scene=scene,
                 base_cost=0.0,
                 valid=True,
-                debug={"fallback": True},
+                debug={"fallback": True, "corridor": corridor.debug or {}},
             )
             plan = evaluate_planned_trajectory(
                 plan=plan,
@@ -1485,9 +1797,25 @@ def evaluate_planned_trajectory(
         )
         heading_error_sum += abs(wrap_angle(float(state_i.yaw) - proj_i.route_yaw))
 
-    final_xy = np.array([plan.x[-1], plan.y[-1]], dtype=np.float32)
-    final_goal_distance = float(np.linalg.norm(final_xy - scene.goal_xy))
+    # Goal is a pass-through mission point, not a required stop point.
+    # When planning_route_path is extended beyond the original goal, using only
+    # final_goal_distance would incorrectly prefer plans whose horizon endpoint
+    # stays near the extended route. Use the closest point along the planned
+    # trajectory instead: any point passing near scene.goal_xy is rewarded.
+    goal_xy = np.asarray(scene.goal_xy, dtype=np.float32)
+    plan_xy = np.stack([plan.x, plan.y], axis=1).astype(np.float32)
+    goal_distances = np.linalg.norm(plan_xy - goal_xy[None, :], axis=1)
+    min_goal_distance = float(np.min(goal_distances))
+    min_goal_index = int(np.argmin(goal_distances))
+    final_goal_distance = float(goal_distances[-1])
+    goal_reached_in_plan = min_goal_distance <= float(config.goal_pass_radius)
+
     progress = max(0.0, float(plan.s[-1]) - ego_proj.s)
+    if goal_reached_in_plan:
+        effective_progress = float(config.goal_progress_after_pass_scale) * progress
+    else:
+        effective_progress = progress
+
     mean_abs_l = float(np.mean(np.abs(plan.l)))
     mean_heading_error = heading_error_sum / max(1, len(plan.times))
 
@@ -1504,8 +1832,10 @@ def evaluate_planned_trajectory(
         cost += config.collision_cost
     cost += config.clearance_weight * clearance_violation * clearance_violation
     cost += config.route_weight * mean_abs_l
-    cost += config.goal_weight * final_goal_distance
-    cost -= config.progress_weight * progress
+    cost += config.goal_weight * min_goal_distance
+    cost -= config.progress_weight * effective_progress
+    if goal_reached_in_plan:
+        cost -= float(config.goal_pass_reward)
     cost += config.heading_weight * mean_heading_error
     cost += config.speed_weight * mean_speed_error
     cost += config.smooth_weight * smooth_cost
@@ -1530,11 +1860,57 @@ def evaluate_planned_trajectory(
     plan.min_clearance = float(min_clearance)
     plan.debug.update(
         {
+            "goal": {
+                "final_goal_distance": final_goal_distance,
+                "min_goal_distance": min_goal_distance,
+                "min_goal_index": min_goal_index,
+                "goal_reached_in_plan": bool(goal_reached_in_plan),
+                "goal_pass_radius": float(config.goal_pass_radius),
+                "goal_pass_reward": float(config.goal_pass_reward),
+                "goal_progress_after_pass_scale": float(
+                    config.goal_progress_after_pass_scale
+                ),
+            },
+            "cost_terms": {
+                "collision_cost": float(config.collision_cost if collision else 0.0),
+                "clearance_cost": float(
+                    config.clearance_weight * clearance_violation * clearance_violation
+                ),
+                "route_cost": float(config.route_weight * mean_abs_l),
+                "goal_cost": float(config.goal_weight * min_goal_distance),
+                "progress_reward": float(-config.progress_weight * effective_progress),
+                "goal_pass_reward": float(
+                    -config.goal_pass_reward if goal_reached_in_plan else 0.0
+                ),
+                "heading_cost": float(config.heading_weight * mean_heading_error),
+                "speed_cost": float(config.speed_weight * mean_speed_error),
+                "smooth_cost": float(config.smooth_weight * smooth_cost),
+                "behavior_bias_cost": float(
+                    config.behavior_bias_weight * float(plan.behavior.bias)
+                ),
+                "stop_without_reason_cost": float(
+                    config.stop_without_reason_cost
+                    if obstacle_pressure is None and float(plan.v[-1]) < 0.5
+                    else 0.0
+                ),
+                "pass_without_pressure_cost": float(
+                    8.0
+                    if obstacle_pressure is None and plan.behavior.mode == "pass"
+                    else 0.0
+                ),
+            },
             "final_goal_distance": final_goal_distance,
+            "min_goal_distance": min_goal_distance,
+            "min_goal_index": min_goal_index,
+            "goal_reached_in_plan": bool(goal_reached_in_plan),
             "progress": progress,
+            "effective_progress": effective_progress,
             "mean_abs_l": mean_abs_l,
             "mean_heading_error": mean_heading_error,
             "smooth_cost": smooth_cost,
+            "min_clearance": float(min_clearance),
+            "collision": bool(collision),
+            "obstacle_pressure": obstacle_pressure,
         }
     )
     return plan

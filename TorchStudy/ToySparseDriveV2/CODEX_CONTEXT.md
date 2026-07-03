@@ -1307,3 +1307,297 @@ optional: restrict |velocity_xy[1]| to avoid unrealistic sideways motion
 ```
 
 Make this change in the shared obstacle sampling path, not only in one visualizer.
+
+## 2026-07-03 Auto Collection, Low-Speed Avoid, and Mixed Training Update
+
+### Auto Collection Route/Obstacle Fix
+
+`human_drive/auto_collect.py` now keeps the original vocab route for record/debug,
+but auto collection uses a separate planner route:
+
+```text
+(0, 0) -> goal_xy -> extended past goal
+```
+
+Important fix: auto-collected obstacles are now resampled against this planner
+route instead of the original vocab route. This removes the previous mismatch:
+
+```text
+obstacles generated around original route
+planner drove on start-to-goal route
+```
+
+The new helper is:
+
+```python
+AutoCollector.sample_obstacles_for_planner_route(...)
+```
+
+It reuses the shared obstacle sampler and validity checks:
+
+```python
+sample_mixed_obstacle()
+obstacle_is_valid_for_scene()
+obstacle_overlaps_ego_initially()
+```
+
+Manual `drive_sim.py` behavior and existing saved episode semantics are not meant
+to be changed by this auto-collector-only obstacle resampling.
+
+### Low-Speed Avoid Scene Config
+
+`dataset/dataset.py` low-speed avoid sampling was made simpler for debugging and
+training:
+
+```text
+scene_mode=low_speed_avoid
+obstacles: 2
+obstacle vx: 0.0-0.5
+obstacle vy: -0.05-0.05
+route_aware_probability: 0.9
+```
+
+Reason: first verify model/planner behavior on clean open-space avoidance before
+adding dense/dynamic complexity.
+
+### Auto Policy Notes
+
+`human_drive/auto_policy.py` currently has a more explicit EPSILON-style planner:
+
+```text
+behavior candidates -> SSC corridor -> Bezier QP -> trajectory scoring
+```
+
+Notable current behavior:
+
+- `enable_behavior_pruning=False` by default in the current working tree, so
+  pass/nudge/follow/stop candidates stay available during auto collection tests.
+- PASS candidates can return toward the original goal when the planner route is
+  extended beyond the goal.
+- Debug information is stored in `PlannedTrajectory.debug`; `debug_policy=True`
+  prints selected behavior details.
+
+The key interpretation from testing:
+
+```text
+simple obstacle cases -> model/planner tends to pass and keep speed
+narrow/multi-obstacle cases -> model/planner can choose conservative slowing
+```
+
+### Low-Speed Avoid V2 Data
+
+A clean low-speed-avoid dataset was collected after the planner-route obstacle
+fix:
+
+```text
+outputs/auto_collect_low_speed_avoid_v2/episodes/goal_reached
+```
+
+Current count used for training:
+
+```text
+goal_reached: 114
+scene_mode: low_speed_avoid = 114
+```
+
+Collection summary at the time:
+
+```text
+saved=50 in latest session
+collision discarded=6
+timeout discarded=3
+stuck discarded=0
+```
+
+Old low-speed-avoid samples that were mixed into the previous preview directory
+before the route/obstacle fix were moved out of the active `episodes/` tree:
+
+```text
+outputs/auto_collect_review_preview/old_low_speed_avoid_before_route_fix
+```
+
+### Low-Speed Avoid V2 Training Result
+
+Training command:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -u train_human.py \
+  --episode-dir outputs/auto_collect_low_speed_avoid_v2/episodes/goal_reached \
+  --checkpoint-dir outputs/checkpoints_auto_low_speed_avoid_v2_114 \
+  --cache-dir outputs/cache_auto_low_speed_avoid_v2_114 \
+  --rebuild-cache \
+  --learning-rate 5e-4 \
+  --path-loss-weight 0.1 \
+  --model-topk-path 20 \
+  --forced-long-path-topk 8 \
+  --val-forced-long-path-topk 0 \
+  --human-temperature 1.0 \
+  --epochs 40
+```
+
+Dataset split:
+
+```text
+episodes: train=91 val=23
+samples: train=1762 val=460
+```
+
+Best checkpoint:
+
+```text
+outputs/checkpoints_auto_low_speed_avoid_v2_114/best_human_model.pt
+```
+
+Best validation was around epoch 30:
+
+```text
+val traj_l2 ~= 0.552
+val endpoint_l2 ~= 0.761
+val collision ~= 0.000
+long_path_topk_recall ~= 0.955
+```
+
+This is strong evidence that, with a fixed-rule teacher/style and clean scene
+distribution, the toy SparseDriveV2 model fits quickly.
+
+### Custom Scene Tester
+
+Added:
+
+```text
+test_custom_scene.py
+```
+
+Purpose: hand-build an open-space scene and run the trained model without
+creating an episode or touching datasets.
+
+The file has a top-level editable config:
+
+```python
+CUSTOM_SCENE = {
+    "checkpoint_path": DEFAULT_CHECKPOINT,
+    "output_path": DEFAULT_OUTPUT,
+    "goal_xy": [35.0, 6.0],
+    "ego_speed": 4.5,
+    "ego_size_xy": [4.8, 2.0],
+    "obstacles": [
+        [16.0, 3.0, 5.0, 3.0, 0.0, 0.0],
+    ],
+    "model_topk_path": 20,
+    "collision_penalty": 4.0,
+    "use_safety_score": True,
+}
+```
+
+Obstacle format:
+
+```text
+[x, y, length, width, vx, vy]
+```
+
+Run:
+
+```bash
+python test_custom_scene.py
+```
+
+Output:
+
+```text
+outputs/test_custom_scene/custom_scene.png
+```
+
+The script prints selected path/velocity, planning score, no-collision logit,
+model collision probability, and an axis-aligned future collision check.
+
+Observed behavior:
+
+- One/two obstacle cases: model predicts an avoidance path rather than only
+  braking.
+- Tight three-obstacle case: model selected a conservative velocity profile that
+  slows toward a near stop over 4 seconds while staying collision-free.
+
+Important interpretation: this proves the model has learned a 4s open-loop
+slow/avoid response. It does not by itself prove full closed-loop stop-wait-go;
+that needs repeated replanning evaluation.
+
+### Mixed Auto Training
+
+`train_human.py` now supports repeated `--episode-dir` arguments. It still works
+with one directory, but can now train directly from multiple episode sources
+without copying files.
+
+Example mixed command:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -u train_human.py \
+  --episode-dir outputs/auto_collect_review_preview/episodes/goal_reached \
+  --episode-dir outputs/auto_collect_low_speed_avoid_v2/episodes/goal_reached \
+  --checkpoint-dir outputs/checkpoints_auto_mix_straight_lowavoid_248 \
+  --cache-dir outputs/cache_auto_mix_straight_lowavoid_248 \
+  --rebuild-cache \
+  --learning-rate 5e-4 \
+  --path-loss-weight 0.1 \
+  --model-topk-path 20 \
+  --forced-long-path-topk 8 \
+  --val-forced-long-path-topk 0 \
+  --human-temperature 1.0 \
+  --epochs 40
+```
+
+Episode mix verified before training:
+
+```text
+total episodes: 248
+straight: 134
+low_speed_avoid: 114
+```
+
+Early mixed-training result by epoch 5:
+
+```text
+val traj_l2: 2.847 -> 1.070
+val endpoint_l2: 4.962 -> 1.972
+path_rec: 0.669 -> 0.820
+val collision: around 0.002-0.012
+```
+
+Interpretation: the model does not collapse under the straight + low-speed-avoid
+mixture. Continue watching whether later epochs reach roughly:
+
+```text
+val traj_l2: 0.7-0.9
+val endpoint_l2: 1.0-1.5
+val collision: near 0
+path_rec: > 0.85
+```
+
+### Current Learning Conclusion
+
+The main conclusion from today's experiments:
+
+```text
+With a fixed-style rule/planner teacher and low-noise labels, the toy
+SparseDriveV2 network fits quickly.
+```
+
+Therefore previous poor human-data results are less likely to be caused by a
+completely broken model/training loop. More likely causes:
+
+```text
+human style inconsistency
+small human dataset
+mixed scenario distribution
+multi-modal driving choices compressed into one label
+path/velocity vocab ambiguity
+```
+
+Recommended next steps before moving to Diffusion Drive:
+
+```text
+1. Finish mixed straight + low_speed_avoid training.
+2. Visualize mixed checkpoint on both validation samples and custom scenes.
+3. Try auto-pretrain -> small human finetune as a controlled experiment.
+4. Then study Diffusion Drive with concrete questions about multimodality,
+   continuous trajectory generation, and human-data fitting.
+```
