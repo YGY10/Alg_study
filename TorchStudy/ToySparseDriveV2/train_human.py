@@ -128,13 +128,14 @@ def find_target_candidate_index(
     target_path_index: torch.Tensor,
     target_velocity_index: torch.Tensor,
 ) -> torch.Tensor:
-    match = (
-        (candidate_path_indices == target_path_index[:, None])
-        & (candidate_velocity_indices == target_velocity_index[:, None])
+    match = (candidate_path_indices == target_path_index[:, None]) & (
+        candidate_velocity_indices == target_velocity_index[:, None]
     )
     if not bool(match.any(dim=1).all()):
         missing = (~match.any(dim=1)).nonzero(as_tuple=False).flatten().tolist()
-        raise RuntimeError(f"Missing target trajectory in candidates: batch rows {missing}")
+        raise RuntimeError(
+            f"Missing target trajectory in candidates: batch rows {missing}"
+        )
     return match.float().argmax(dim=1).long()
 
 
@@ -147,16 +148,24 @@ def trajectory_distance_to_human(
     mask = target_mask.float()
     diff = candidate_trajectories[..., :2] - target_trajectory[:, None, :, :2]
     point_l2 = diff.pow(2).sum(dim=-1).sqrt()
-    traj_l2 = (point_l2 * mask[:, None, :]).sum(dim=-1) / mask.sum(dim=-1)[:, None].clamp(min=1.0)
+    traj_l2 = (point_l2 * mask[:, None, :]).sum(dim=-1) / mask.sum(dim=-1)[
+        :, None
+    ].clamp(min=1.0)
 
     batch_size = candidate_trajectories.shape[0]
     num_candidates = candidate_trajectories.shape[1]
     batch_indices = torch.arange(batch_size, device=candidate_trajectories.device)
     endpoint_index = mask.sum(dim=-1).long().clamp(min=1) - 1
-    gather_index = endpoint_index[:, None, None, None].expand(batch_size, num_candidates, 1, 3)
-    candidate_endpoint = torch.gather(candidate_trajectories, dim=2, index=gather_index).squeeze(2)[..., :2]
+    gather_index = endpoint_index[:, None, None, None].expand(
+        batch_size, num_candidates, 1, 3
+    )
+    candidate_endpoint = torch.gather(
+        candidate_trajectories, dim=2, index=gather_index
+    ).squeeze(2)[..., :2]
     target_endpoint = target_trajectory[batch_indices, endpoint_index, :2]
-    endpoint_l2 = (candidate_endpoint - target_endpoint[:, None]).pow(2).sum(dim=-1).sqrt()
+    endpoint_l2 = (
+        (candidate_endpoint - target_endpoint[:, None]).pow(2).sum(dim=-1).sqrt()
+    )
     combined = traj_l2 + endpoint_l2 * float(endpoint_weight)
     return combined, traj_l2, endpoint_l2
 
@@ -180,6 +189,7 @@ def long_path_human_loss(
     log_probs = F.log_softmax(valid_scores, dim=1)
     return -(target_probs.detach() * log_probs).sum(dim=1).mean()
 
+
 def compute_candidate_collision(
     candidate_trajectories: torch.Tensor,
     obstacle_centers: torch.Tensor,
@@ -196,10 +206,9 @@ def compute_candidate_collision(
     )
     ego_centers = candidate_trajectories[..., :2][:, :, :, None, :]
     ego_size = ego_state[:, 1:3]
-    half_extent = (
-        0.5 * (ego_size[:, None, None, None, :] + obstacle_sizes[:, None, None, :, :])
-        + float(safety_margin)
-    )
+    half_extent = 0.5 * (
+        ego_size[:, None, None, None, :] + obstacle_sizes[:, None, None, :, :]
+    ) + float(safety_margin)
     overlap_xy = (ego_centers - obstacle_centers_t).abs() <= half_extent
     overlap = overlap_xy.all(dim=-1) & obstacle_mask[:, None, None, :].bool()
     return overlap.any(dim=-1).any(dim=-1)
@@ -214,7 +223,9 @@ def soft_human_trajectory_loss(
 ) -> torch.Tensor:
     safe_mask = ~candidate_collision.bool()
     has_safe = safe_mask.any(dim=1)
-    masked_cost = torch.where(safe_mask, candidate_cost, torch.full_like(candidate_cost, float("inf")))
+    masked_cost = torch.where(
+        safe_mask, candidate_cost, torch.full_like(candidate_cost, float("inf"))
+    )
     cost_for_topk = torch.where(has_safe[:, None], masked_cost, candidate_cost)
 
     k = min(int(positive_topk), cost_for_topk.shape[1])
@@ -430,7 +441,9 @@ def run_one_epoch(
         )
         pred_collision = candidate_collision[batch_indices, best_candidate]
         no_collision_prediction = output["no_collision_logits"] >= 0.0
-        no_collision_acc = (no_collision_prediction == (~candidate_collision)).float().mean()
+        no_collision_acc = (
+            (no_collision_prediction == (~candidate_collision)).float().mean()
+        )
 
         metric_sums["loss"] += float(loss.detach())
         metric_sums["path_loss"] += float(path_loss.detach())
@@ -441,7 +454,11 @@ def run_one_epoch(
         long_path_target = batch["long_path_indices"][:, 0]
         long_path_valid = batch["long_path_valid"].bool()
         if bool(long_path_valid.any()):
-            path_acc = (path_pred[long_path_valid] == long_path_target[long_path_valid]).float().mean()
+            path_acc = (
+                (path_pred[long_path_valid] == long_path_target[long_path_valid])
+                .float()
+                .mean()
+            )
         else:
             path_acc = path_pred.float().sum() * 0.0
         metric_sums["path_acc"] += float(path_acc.detach())
@@ -453,8 +470,10 @@ def run_one_epoch(
         recall_long_paths = batch["long_path_indices"][:, :recall_target_topk]
         if bool(long_path_valid.any()):
             long_recall_match = (
-                model_topk_path[:, :, None] == recall_long_paths[:, None, :]
-            ).any(dim=1).any(dim=1)
+                (model_topk_path[:, :, None] == recall_long_paths[:, None, :])
+                .any(dim=1)
+                .any(dim=1)
+            )
             long_path_topk_recall = long_recall_match[long_path_valid].float().mean()
         else:
             long_path_topk_recall = path_pred.float().sum() * 0.0
@@ -473,15 +492,16 @@ def run_one_epoch(
         metric_sums["traj_l2_error"] += float(traj_l2.detach())
         metric_sums["traj_endpoint_error"] += float(endpoint_l2.detach())
         metric_sums["pred_collision_rate"] += float(pred_collision.float().mean())
-        metric_sums["candidate_safe_rate"] += float((~candidate_collision).float().mean())
+        metric_sums["candidate_safe_rate"] += float(
+            (~candidate_collision).float().mean()
+        )
         metric_sums["no_collision_acc"] += float(no_collision_acc.detach())
-        metric_sums["human_candidate_min_l2"] += float(candidate_l2.min(dim=1).values.mean().detach())
+        metric_sums["human_candidate_min_l2"] += float(
+            candidate_l2.min(dim=1).values.mean().detach()
+        )
         num_batches += 1
 
-    return {
-        key: value / max(num_batches, 1)
-        for key, value in metric_sums.items()
-    }
+    return {key: value / max(num_batches, 1) for key, value in metric_sums.items()}
 
 
 def main() -> None:
@@ -583,7 +603,11 @@ def main() -> None:
             )
 
         # Safety first, then human-like geometry. A collision is much worse than a few meters of imitation error.
-        val_score = val_metrics["traj_l2_error"] + 50.0 * val_metrics["pred_collision_rate"]
+        val_score = (
+            val_metrics["traj_l2_error"]
+            + 30.0 * val_metrics["pred_collision_rate"]
+            + 0.5 * val_metrics["traj_endpoint_error"]
+        )
         is_best = val_score < best_score
         if is_best:
             best_score = val_score

@@ -46,7 +46,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-scene-attempts", type=int, default=20)
     parser.add_argument(
         "--scene-mode",
-        choices=("random", "straight", "low_speed_avoid", "follow_stop", "dense_front"),
+        choices=(
+            "random",
+            "straight",
+            "low_speed_avoid",
+            "low_speed_pass_gap",
+            "low_speed_yield_blocked",
+            "follow_stop",
+            "dense_front",
+        ),
         default="random",
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_CACHE_DIR)

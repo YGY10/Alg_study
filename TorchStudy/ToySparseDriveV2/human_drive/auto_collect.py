@@ -26,7 +26,9 @@ from auto_policy import (
     AutoPolicyConfig,
     plan_auto_action,
 )
+from simple_teacher import plan_simple_teacher_action
 from dataset import (
+    Obstacle,
     ToySparseDriveV2Dataset,
     make_scene_sampling_config,
     obstacle_is_valid_for_scene,
@@ -215,9 +217,10 @@ def make_episode_record(
     steps: list[dict[str, Any]],
     ego_history: list[list[float]],
 ) -> dict[str, Any]:
+    policy_name = str(getattr(args, "policy", "auto_policy"))
     return {
-        "source": AUTO_SOURCE,
-        "driver": AUTO_DRIVER_NAME,
+        "source": f"{AUTO_SOURCE}:{policy_name}",
+        "driver": policy_name,
         "scene_mode": str(args.scene_mode),
         "seed_offset": int(args.seed_offset),
         "scene_index": int(scene_index),
@@ -234,6 +237,7 @@ def make_episode_record(
         "ego_history": ego_history,
         "controller": {
             **policy_config.to_metadata(),
+            "policy": policy_name,
             "planning_route": "origin_to_goal_extended_line",
         },
     }
@@ -330,6 +334,103 @@ class AutoCollector:
             "discarded_other": 0,
         }
 
+    def make_route_obstacle(
+        self,
+        route_xy: np.ndarray,
+        distance_m: float,
+        lateral_m: float,
+        size_xy: tuple[float, float],
+        velocity_forward: float,
+        rng: np.random.Generator,
+    ) -> Obstacle:
+        start = route_xy[0]
+        end = route_xy[-1]
+        direction = end - start
+        norm = float(np.linalg.norm(direction))
+        if norm <= 1.0e-6:
+            unit = np.array([1.0, 0.0], dtype=np.float32)
+        else:
+            unit = (direction / norm).astype(np.float32)
+        normal = np.array([-unit[1], unit[0]], dtype=np.float32)
+        center_xy = (
+            start
+            + unit * float(distance_m)
+            + normal * float(lateral_m)
+            + unit * float(rng.uniform(-1.0, 1.0))
+            + normal * float(rng.uniform(-0.35, 0.35))
+        ).astype(np.float32)
+        velocity_xy = (
+            unit * float(velocity_forward) + normal * float(rng.uniform(-0.04, 0.04))
+        ).astype(np.float32)
+        return Obstacle(
+            center_xy=center_xy,
+            size_xy=(float(size_xy[0]), float(size_xy[1])),
+            velocity_xy=velocity_xy,
+        )
+
+    def sample_structured_planner_obstacles(
+        self,
+        rng: np.random.Generator,
+        planning_route_path: np.ndarray,
+        mode: str,
+    ) -> list[Obstacle] | None:
+        route_xy = planning_route_path[:, :2].astype(np.float32)
+        if mode == "low_speed_pass_gap":
+            base_distance = float(rng.uniform(15.0, 20.0))
+            gap_half_width = float(rng.uniform(2.0, 2.6))
+            return [
+                self.make_route_obstacle(
+                    route_xy=route_xy,
+                    distance_m=base_distance,
+                    lateral_m=gap_half_width + float(rng.uniform(1.2, 1.8)),
+                    size_xy=(
+                        float(rng.uniform(4.5, 6.5)),
+                        float(rng.uniform(2.5, 3.5)),
+                    ),
+                    velocity_forward=float(rng.uniform(0.0, 0.6)),
+                    rng=rng,
+                ),
+                self.make_route_obstacle(
+                    route_xy=route_xy,
+                    distance_m=base_distance + float(rng.uniform(1.5, 4.0)),
+                    lateral_m=-(gap_half_width + float(rng.uniform(1.2, 1.8))),
+                    size_xy=(
+                        float(rng.uniform(4.5, 6.5)),
+                        float(rng.uniform(2.5, 3.5)),
+                    ),
+                    velocity_forward=float(rng.uniform(0.0, 0.6)),
+                    rng=rng,
+                ),
+            ]
+        if mode == "low_speed_yield_blocked":
+            base_distance = float(rng.uniform(13.0, 17.0))
+            side_sign = -1.0 if rng.random() < 0.5 else 1.0
+            return [
+                self.make_route_obstacle(
+                    route_xy=route_xy,
+                    distance_m=base_distance,
+                    lateral_m=float(rng.uniform(-0.35, 0.35)),
+                    size_xy=(
+                        float(rng.uniform(4.5, 6.0)),
+                        float(rng.uniform(2.4, 3.0)),
+                    ),
+                    velocity_forward=float(rng.uniform(0.8, 1.6)),
+                    rng=rng,
+                ),
+                self.make_route_obstacle(
+                    route_xy=route_xy,
+                    distance_m=base_distance + float(rng.uniform(3.0, 6.0)),
+                    lateral_m=side_sign * float(rng.uniform(3.8, 5.2)),
+                    size_xy=(
+                        float(rng.uniform(4.5, 6.0)),
+                        float(rng.uniform(2.4, 3.0)),
+                    ),
+                    velocity_forward=float(rng.uniform(0.2, 0.8)),
+                    rng=rng,
+                ),
+            ]
+        return None
+
     def sample_obstacles_for_planner_route(
         self,
         scene_index: int,
@@ -346,6 +447,23 @@ class AutoCollector:
         )
         rng = np.random.default_rng(seed_sequence)
         scene_config = self.dataset.scene_config
+        structured_obstacles = self.sample_structured_planner_obstacles(
+            rng=rng,
+            planning_route_path=planning_route_path,
+            mode=str(scene_config.mode),
+        )
+        if structured_obstacles is not None:
+            if all(
+                obstacle_is_valid_for_scene(obstacle)
+                and not obstacle_overlaps_ego_initially(
+                    obstacle=obstacle,
+                    ego_state=ego_state,
+                    safety_margin=self.teacher_config.safety_margin,
+                )
+                for obstacle in structured_obstacles
+            ):
+                return structured_obstacles
+
         min_obstacles = (
             scene_config.min_obstacles
             if scene_config.min_obstacles is not None
@@ -488,6 +606,8 @@ class AutoCollector:
             time_s=float(time_s),
             history=ego_history,
         )
+        if str(getattr(self.args, "policy", "auto_policy")) == "simple_teacher":
+            return plan_simple_teacher_action(observation, scene, self.policy_config)
         return plan_auto_action(observation, scene, self.policy_config)
 
     def run_scene(self, scene_index: int) -> tuple[str, dict[str, Any] | None]:
@@ -944,8 +1064,22 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Auto driving episode collector.")
     parser.add_argument("--review-gui", action="store_true")
     parser.add_argument(
+        "--policy",
+        choices=("auto_policy", "simple_teacher"),
+        default="auto_policy",
+        help="Teacher policy used to generate driving actions.",
+    )
+    parser.add_argument(
         "--scene-mode",
-        choices=("random", "straight", "low_speed_avoid", "follow_stop", "dense_front"),
+        choices=(
+            "random",
+            "straight",
+            "low_speed_avoid",
+            "low_speed_pass_gap",
+            "low_speed_yield_blocked",
+            "follow_stop",
+            "dense_front",
+        ),
         default="straight",
     )
     parser.add_argument("--num-episodes", type=int, default=1)

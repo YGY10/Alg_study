@@ -55,6 +55,8 @@ LegacySceneKey = Tuple[int, int]
 COLLECTION_TARGETS = {
     "straight": (500, 800),
     "low_speed_avoid": (300, 500),
+    "low_speed_pass_gap": (100, 200),
+    "low_speed_yield_blocked": (100, 200),
     "follow_stop": (300, 500),
     "dense_front": (300, 500),
 }
@@ -951,7 +953,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scene-attempt", type=int, default=0)
     parser.add_argument(
         "--scene-mode",
-        choices=("random", "straight", "low_speed_avoid", "follow_stop", "dense_front"),
+        choices=(
+            "random",
+            "straight",
+            "low_speed_avoid",
+            "low_speed_pass_gap",
+            "low_speed_yield_blocked",
+            "follow_stop",
+            "dense_front",
+        ),
         default="random",
         help="Scene distribution used for newly sampled human driving episodes.",
     )

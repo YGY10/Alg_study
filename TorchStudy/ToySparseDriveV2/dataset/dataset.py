@@ -74,6 +74,34 @@ def make_scene_sampling_config(mode: str) -> SceneSamplingConfig:
             min_obstacles=2,
             max_obstacles=2,
         )
+    if mode == "low_speed_pass_gap":
+        return SceneSamplingConfig(
+            mode=mode,
+            ego_speed_range=(3.0, 5.5),
+            goal_x_range=(25.0, 45.0),
+            goal_y_range=(-12.0, 12.0),
+            obstacle_x_range=(12.0, 24.0),
+            obstacle_y_range=(-7.0, 7.0),
+            obstacle_vx_range=(0.0, 0.8),
+            obstacle_vy_range=(-0.05, 0.05),
+            route_aware_probability=1.0,
+            min_obstacles=3,
+            max_obstacles=3,
+        )
+    if mode == "low_speed_yield_blocked":
+        return SceneSamplingConfig(
+            mode=mode,
+            ego_speed_range=(3.0, 5.5),
+            goal_x_range=(25.0, 45.0),
+            goal_y_range=(-10.0, 10.0),
+            obstacle_x_range=(12.0, 24.0),
+            obstacle_y_range=(-7.0, 7.0),
+            obstacle_vx_range=(0.2, 1.0),
+            obstacle_vy_range=(-0.05, 0.05),
+            route_aware_probability=1.0,
+            min_obstacles=3,
+            max_obstacles=3,
+        )
     if mode == "follow_stop":
         return SceneSamplingConfig(
             mode=mode,

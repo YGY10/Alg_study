@@ -35,7 +35,7 @@ from vocab import SparseDriveVocab
 DEFAULT_CHECKPOINT = (
     PROJECT_ROOT
     / "outputs"
-    / "checkpoints_auto_low_speed_avoid_v2_114"
+    / "checkpoints_auto_mix_straight_lowavoid_248"
     / "best_human_model.pt"
 )
 DEFAULT_OUTPUT = PROJECT_ROOT / "outputs" / "test_custom_scene" / "custom_scene.png"
@@ -53,12 +53,12 @@ CUSTOM_SCENE = {
     "route_extend": 20.0,
     # Each obstacle is [x, y, length, width, vx, vy].
     "obstacles": [
-        [16.0, -3.0, 5.0, 3.0, 0.0, 0.0],
+        [16.0, -1.0, 5.0, 3.0, 0.0, 0.0],
         [21.0, 3.0, 5.0, 3.0, 1.0, 0.0],
         [22.0, -3.0, 5.0, 3.0, 1.0, -0.5],
     ],
-    "model_topk_path": 20,
-    "collision_penalty": 4.0,
+    "model_topk_path": 80,
+    "collision_penalty": 20.0,
     "use_safety_score": True,
     "show_topk_paths": 8,
 }
@@ -119,12 +119,12 @@ def checkpoint_args(checkpoint: dict) -> dict:
     return args if isinstance(args, dict) else {}
 
 
-def choose_arg(cli_value, checkpoint_value, default_value):
+def choose_arg(cli_value, config_value, checkpoint_value=None):
     if cli_value is not None:
         return cli_value
-    if checkpoint_value is not None:
-        return checkpoint_value
-    return default_value
+    if config_value is not None:
+        return config_value
+    return checkpoint_value
 
 
 def build_start_to_goal_route(
@@ -517,15 +517,15 @@ def main() -> None:
     model_topk_path = int(
         choose_arg(
             args.model_topk_path,
-            ckpt_args.get("model_topk_path"),
             config["model_topk_path"],
+            ckpt_args.get("model_topk_path"),
         )
     )
     collision_penalty = float(
         choose_arg(
             args.collision_penalty,
-            ckpt_args.get("collision_penalty"),
             config["collision_penalty"],
+            ckpt_args.get("collision_penalty"),
         )
     )
     use_safety_score = bool(config["use_safety_score"]) and not bool(
