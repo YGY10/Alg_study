@@ -558,6 +558,12 @@ class NuPlanCanonicalDataset(Dataset):
             to_ego_polylines("drivable_area"),
             config=self.grid_config,
         )
+        route_polygons = to_ego_polylines("route_polygons")
+        draw_polygons(
+            input_grid[RASTER_CHANNELS["route"]],
+            route_polygons,
+            config=self.grid_config,
+        )
         draw_polylines(
             input_grid[RASTER_CHANNELS["lane_centerline"]],
             to_ego_polylines("lane_centerlines"),
@@ -667,14 +673,15 @@ class NuPlanCanonicalDataset(Dataset):
 
         input_grid = make_empty_grid(channels=NUM_RASTER_CHANNELS, config=self.grid_config)
         self._rasterize_map(input_grid, data, current_xy, current_yaw)
-        draw_polyline(
-            input_grid[RASTER_CHANNELS["route"]],
-            route_path_ego[:, :2],
-            value=1.0,
-            radius=1,
-            samples_per_segment=4,
-            config=self.grid_config,
-        )
+        if not data.get("map", {}).get("route_polygons"):
+            draw_polyline(
+                input_grid[RASTER_CHANNELS["route"]],
+                route_path_ego[:, :2],
+                value=1.0,
+                radius=1,
+                samples_per_segment=4,
+                config=self.grid_config,
+            )
         draw_points(input_grid[RASTER_CHANNELS["goal"]], goal_xy[None], radius=3, config=self.grid_config)
 
         history_mask = (

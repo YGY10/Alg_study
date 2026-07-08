@@ -319,6 +319,9 @@ def run_one_epoch(
         "candidate_safe_rate": 0.0,
         "no_collision_acc": 0.0,
         "human_candidate_min_l2": 0.0,
+        "target_candidate_hit": 0.0,
+        "oracle_candidate_l2": 0.0,
+        "oracle_gap": 0.0,
     }
     num_batches = 0
 
@@ -433,6 +436,10 @@ def run_one_epoch(
             batch_indices,
             best_candidate,
         ]
+        target_candidate_match = (
+            (output["candidate_path_indices"] == batch["path_index"][:, None])
+            & (output["candidate_velocity_indices"] == batch["velocity_index"][:, None])
+        )
         traj_l2, endpoint_l2 = compute_trajectory_errors(
             candidate_trajectories=output["candidate_trajectories"],
             planning_scores=planning_scores,
@@ -444,6 +451,9 @@ def run_one_epoch(
         no_collision_acc = (
             (no_collision_prediction == (~candidate_collision)).float().mean()
         )
+        oracle_candidate_l2 = candidate_l2.min(dim=1).values
+        selected_candidate_l2 = candidate_l2[batch_indices, best_candidate]
+        oracle_gap = selected_candidate_l2 - oracle_candidate_l2
 
         metric_sums["loss"] += float(loss.detach())
         metric_sums["path_loss"] += float(path_loss.detach())
@@ -497,8 +507,13 @@ def run_one_epoch(
         )
         metric_sums["no_collision_acc"] += float(no_collision_acc.detach())
         metric_sums["human_candidate_min_l2"] += float(
-            candidate_l2.min(dim=1).values.mean().detach()
+            oracle_candidate_l2.mean().detach()
         )
+        metric_sums["target_candidate_hit"] += float(
+            target_candidate_match.any(dim=1).float().mean().detach()
+        )
+        metric_sums["oracle_candidate_l2"] += float(oracle_candidate_l2.mean().detach())
+        metric_sums["oracle_gap"] += float(oracle_gap.mean().detach())
         num_batches += 1
 
     return {key: value / max(num_batches, 1) for key, value in metric_sums.items()}
@@ -632,7 +647,10 @@ def main() -> None:
             f"traj_l2 {train_metrics['traj_l2_error']:.3f} "
             f"col {train_metrics['pred_collision_rate']:.3f} "
             f"path_rec {train_metrics['long_path_topk_recall']:.3f} "
-            f"pair {train_metrics['trajectory_pair_acc']:.3f} | "
+            f"pair {train_metrics['trajectory_pair_acc']:.3f} "
+            f"hit {train_metrics['target_candidate_hit']:.3f} "
+            f"oracle {train_metrics['oracle_candidate_l2']:.3f} "
+            f"gap {train_metrics['oracle_gap']:.3f} | "
             f"val loss {val_metrics['loss']:.4f} "
             f"traj_l2 {val_metrics['traj_l2_error']:.3f} "
             f"end_l2 {val_metrics['traj_endpoint_error']:.3f} "
@@ -640,7 +658,10 @@ def main() -> None:
             f"safe {val_metrics['candidate_safe_rate']:.3f} "
             f"no_col {val_metrics['no_collision_acc']:.3f} "
             f"path_rec {val_metrics['long_path_topk_recall']:.3f} "
-            f"pair {val_metrics['trajectory_pair_acc']:.3f}"
+            f"pair {val_metrics['trajectory_pair_acc']:.3f} "
+            f"hit {val_metrics['target_candidate_hit']:.3f} "
+            f"oracle {val_metrics['oracle_candidate_l2']:.3f} "
+            f"gap {val_metrics['oracle_gap']:.3f}"
             f"{suffix}",
             flush=True,
         )

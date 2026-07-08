@@ -17,6 +17,56 @@ for path in (TOY_ROOT, TOY_ROOT / "vocab"):
 from vocab import SparseDriveVocab
 
 
+class ConvBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int = 1,
+    ) -> None:
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                stride=stride,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(num_groups=min(8, out_channels), num_channels=out_channels),
+            nn.SiLU(),
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(num_groups=min(8, out_channels), num_channels=out_channels),
+        )
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    stride=stride,
+                    bias=False,
+                ),
+                nn.GroupNorm(
+                    num_groups=min(8, out_channels),
+                    num_channels=out_channels,
+                ),
+            )
+        else:
+            self.shortcut = nn.Identity()
+        self.activation = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.activation(self.conv(x) + self.shortcut(x))
+
+
 class ToySparseDriveV2Model(nn.Module):
     def __init__(
         self,
@@ -48,12 +98,12 @@ class ToySparseDriveV2Model(nn.Module):
         self.topk_path = topk_path
 
         self.scene_encoder = nn.Sequential(
-            nn.Conv2d(input_channels, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, hidden_dim, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.ReLU(),
+            ConvBlock(input_channels, 64),
+            ConvBlock(64, 64),
+            ConvBlock(64, hidden_dim, stride=2),
+            ConvBlock(hidden_dim, hidden_dim),
+            ConvBlock(hidden_dim, hidden_dim),
+            ConvBlock(hidden_dim, hidden_dim),
         )
 
         self.scene_pool = nn.AdaptiveAvgPool2d((1, 1))
@@ -123,10 +173,18 @@ class ToySparseDriveV2Model(nn.Module):
         self.trajectory_point_embedding = nn.Parameter(
             torch.randn(1, 1, len_velocity, hidden_dim) * 0.02
         )
-        self.trajectory_token_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+        self.trajectory_point_encoder = nn.Sequential(
+            nn.Linear(hidden_dim + 3, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.trajectory_temporal_encoder = nn.Sequential(
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.ReLU(),
         )
         self.trajectory_score_head = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim),
@@ -274,14 +332,33 @@ class ToySparseDriveV2Model(nn.Module):
                 route_xy,
                 torch.zeros_like(route_xy),
             )
-            route_diff = path_xy[None, :, :, None, :] - route_xy[:, None, None, :, :]
-            route_l2 = torch.linalg.norm(route_diff, dim=-1)
-            route_l2 = route_l2.masked_fill(~route_mask[:, None, None, :], 1.0e6)
-            mean_route_l2 = route_l2.min(dim=-1).values.mean(dim=-1, keepdim=True)
-            endpoint_diff = endpoint_xy[None, :, None, :] - route_xy[:, None, :, :]
-            endpoint_l2 = torch.linalg.norm(endpoint_diff, dim=-1)
-            endpoint_l2 = endpoint_l2.masked_fill(~route_mask[:, None, :], 1.0e6)
-            endpoint_route_l2 = endpoint_l2.min(dim=-1, keepdim=True).values
+
+            mean_route_chunks = []
+            endpoint_route_chunks = []
+            path_chunk_size = 128
+            for start in range(0, self.num_path, path_chunk_size):
+                end = min(start + path_chunk_size, self.num_path)
+                path_xy_chunk = path_xy[start:end]
+                route_diff = (
+                    path_xy_chunk[None, :, :, None, :]
+                    - route_xy[:, None, None, :, :]
+                )
+                route_l2 = torch.linalg.norm(route_diff, dim=-1)
+                route_l2 = route_l2.masked_fill(
+                    ~route_mask[:, None, None, :],
+                    1.0e6,
+                )
+                mean_route_chunks.append(
+                    route_l2.min(dim=-1).values.mean(dim=-1, keepdim=True)
+                )
+
+                endpoint_diff = endpoint_xy[start:end][None, :, None, :] - route_xy[:, None, :, :]
+                endpoint_l2 = torch.linalg.norm(endpoint_diff, dim=-1)
+                endpoint_l2 = endpoint_l2.masked_fill(~route_mask[:, None, :], 1.0e6)
+                endpoint_route_chunks.append(endpoint_l2.min(dim=-1, keepdim=True).values)
+
+            mean_route_l2 = torch.cat(mean_route_chunks, dim=1)
+            endpoint_route_l2 = torch.cat(endpoint_route_chunks, dim=1)
 
         if (
             obstacle_centers is None
@@ -481,7 +558,30 @@ class ToySparseDriveV2Model(nn.Module):
         )
         trajectory_evidence = trajectory_evidence + self.trajectory_point_embedding
         trajectory_evidence = trajectory_evidence + ego_feature[:, None, None, :]
-        trajectory_evidence = self.trajectory_token_mlp(trajectory_evidence).mean(dim=2)
+        candidate_point_geometry = torch.stack(
+            [
+                candidate_trajectories[..., 0] / 60.0,
+                candidate_trajectories[..., 1] / 60.0,
+                candidate_trajectories[..., 2] / torch.pi,
+            ],
+            dim=-1,
+        )
+        trajectory_evidence = self.trajectory_point_encoder(
+            torch.cat([trajectory_evidence, candidate_point_geometry], dim=-1)
+        )
+        trajectory_evidence = trajectory_evidence.reshape(
+            batch_size * topk_path * num_velocity,
+            self.len_velocity,
+            self.hidden_dim,
+        )
+        trajectory_evidence = self.trajectory_temporal_encoder(
+            trajectory_evidence.transpose(1, 2)
+        ).mean(dim=-1)
+        trajectory_evidence = trajectory_evidence.reshape(
+            batch_size,
+            topk_path * num_velocity,
+            self.hidden_dim,
+        )
 
         selected_path_context = selected_path_context[:, :, None, :].expand(
             batch_size,
