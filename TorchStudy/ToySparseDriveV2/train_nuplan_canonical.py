@@ -104,6 +104,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--safety-margin", type=float, default=0.3)
     parser.add_argument("--unsafe-margin", type=float, default=2.0)
     parser.add_argument("--collision-penalty", type=float, default=8.0)
+    parser.add_argument(
+        "--checkpoint-score",
+        choices=("auto", "imitation", "safety"),
+        default="auto",
+        help=(
+            "Metric used to select the best checkpoint. Auto uses imitation when all "
+            "safety weights are zero, otherwise safety-aware scoring."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -138,6 +147,64 @@ def summarize_labels(name: str, dataset: NuPlanCanonicalDataset) -> None:
         f"long_top1_unique={long_top1_unique}",
         flush=True,
     )
+
+
+def balanced_sample_indices(
+    dataset: NuPlanCanonicalDataset,
+    max_samples: int | None,
+    seed: int,
+) -> list[int] | None:
+    if max_samples is None or max_samples >= len(dataset):
+        return None
+
+    episode_groups: dict[Path, list[int]] = {}
+    for sample_index, meta in enumerate(dataset.metas):
+        episode_groups.setdefault(meta.episode_path, []).append(sample_index)
+
+    rng = random.Random(seed)
+    groups = list(episode_groups.values())
+    rng.shuffle(groups)
+    for group in groups:
+        rng.shuffle(group)
+
+    selected: list[int] = []
+    group_offsets = [0] * len(groups)
+    while len(selected) < max_samples:
+        added = False
+        for group_index, group in enumerate(groups):
+            offset = group_offsets[group_index]
+            if offset >= len(group):
+                continue
+            selected.append(group[offset])
+            group_offsets[group_index] += 1
+            added = True
+            if len(selected) >= max_samples:
+                break
+        if not added:
+            break
+
+    return selected
+
+
+def resolve_checkpoint_score(args: argparse.Namespace) -> str:
+    if args.checkpoint_score != "auto":
+        return str(args.checkpoint_score)
+    safety_enabled = (
+        args.no_collision_loss_weight > 0.0
+        or args.unsafe_margin_loss_weight > 0.0
+        or args.collision_penalty > 0.0
+    )
+    return "safety" if safety_enabled else "imitation"
+
+
+def compute_checkpoint_score(
+    metrics: dict[str, float],
+    score_mode: str,
+) -> float:
+    score = metrics["traj_l2_error"] + 0.5 * metrics["traj_endpoint_error"]
+    if score_mode == "safety":
+        score += 30.0 * metrics["pred_collision_rate"]
+    return float(score)
 
 
 def collate_nuplan_batch(
@@ -207,7 +274,9 @@ def main() -> None:
     if args.max_episodes is not None:
         episode_paths = episode_paths[: args.max_episodes]
     if len(episode_paths) < 2:
-        raise RuntimeError(f"Need at least two canonical nuPlan episodes in {args.episode_dir}")
+        raise RuntimeError(
+            f"Need at least two canonical nuPlan episodes in {args.episode_dir}"
+        )
 
     train_paths, val_paths = split_episode_paths(
         episode_paths,
@@ -222,21 +291,46 @@ def main() -> None:
     print(f"samples: train={len(train_dataset)} val={len(val_dataset)}")
     summarize_labels("train", train_dataset)
     summarize_labels("val", val_dataset)
-    train_loader_dataset = train_dataset
-    val_loader_dataset = val_dataset
-    if args.max_train_samples is not None:
-        train_loader_dataset = Subset(
-            train_dataset,
-            range(min(args.max_train_samples, len(train_dataset))),
-        )
-    if args.max_val_samples is not None:
-        val_loader_dataset = Subset(
-            val_dataset,
-            range(min(args.max_val_samples, len(val_dataset))),
-        )
+    train_indices = balanced_sample_indices(
+        train_dataset,
+        max_samples=args.max_train_samples,
+        seed=args.seed,
+    )
+    val_indices = balanced_sample_indices(
+        val_dataset,
+        max_samples=args.max_val_samples,
+        seed=args.seed + 1,
+    )
+    train_loader_dataset = (
+        Subset(train_dataset, train_indices)
+        if train_indices is not None
+        else train_dataset
+    )
+    val_loader_dataset = (
+        Subset(val_dataset, val_indices) if val_indices is not None else val_dataset
+    )
+    train_sampled_episodes = len(
+        {
+            train_dataset.metas[index].episode_path
+            for index in (
+                train_indices
+                if train_indices is not None
+                else range(len(train_dataset))
+            )
+        }
+    )
+    val_sampled_episodes = len(
+        {
+            val_dataset.metas[index].episode_path
+            for index in (
+                val_indices if val_indices is not None else range(len(val_dataset))
+            )
+        }
+    )
     print(
         f"loader samples: train={len(train_loader_dataset)} "
-        f"val={len(val_loader_dataset)}",
+        f"val={len(val_loader_dataset)} sampling=episode_balanced "
+        f"sampled_episodes={train_sampled_episodes}/{val_sampled_episodes}",
         flush=True,
     )
     print(
@@ -286,6 +380,8 @@ def main() -> None:
 
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_checkpoint_path = args.checkpoint_dir / "best_nuplan_canonical_model.pt"
+    checkpoint_score_mode = resolve_checkpoint_score(args)
+    print(f"checkpoint score: {checkpoint_score_mode}", flush=True)
     best_score = float("inf")
     for epoch in range(1, args.epochs + 1):
         train_metrics = run_one_epoch(
@@ -306,11 +402,7 @@ def main() -> None:
                 args=args,
             )
 
-        val_score = (
-            val_metrics["traj_l2_error"]
-            + 30.0 * val_metrics["pred_collision_rate"]
-            + 0.5 * val_metrics["traj_endpoint_error"]
-        )
+        val_score = compute_checkpoint_score(val_metrics, checkpoint_score_mode)
         is_best = val_score < best_score
         if is_best:
             best_score = val_score
@@ -321,6 +413,8 @@ def main() -> None:
                     "optimizer_state_dict": optimizer.state_dict(),
                     "train_metrics": train_metrics,
                     "val_metrics": val_metrics,
+                    "val_score": val_score,
+                    "checkpoint_score_mode": checkpoint_score_mode,
                     "train_episode_paths": [str(path) for path in train_paths],
                     "val_episode_paths": [str(path) for path in val_paths],
                     "args": vars(args),
@@ -349,7 +443,8 @@ def main() -> None:
             f"pair {val_metrics['trajectory_pair_acc']:.3f} "
             f"hit {val_metrics['target_candidate_hit']:.3f} "
             f"oracle {val_metrics['oracle_candidate_l2']:.3f} "
-            f"gap {val_metrics['oracle_gap']:.3f}"
+            f"gap {val_metrics['oracle_gap']:.3f} "
+            f"score {val_score:.3f}"
             f"{suffix}",
             flush=True,
         )

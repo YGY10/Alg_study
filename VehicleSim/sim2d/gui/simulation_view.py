@@ -30,6 +30,7 @@ from sim2d.types import (
     SimulationSnapshot,
     VehicleConfig,
 )
+import math
 
 
 class SimulationView(QGraphicsView):
@@ -58,25 +59,15 @@ class SimulationView(QGraphicsView):
             | QPainter.RenderHint.SmoothPixmapTransform
         )
 
-        self.setTransformationAnchor(
-            QGraphicsView.ViewportAnchor.AnchorUnderMouse
-        )
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
 
-        self.setResizeAnchor(
-            QGraphicsView.ViewportAnchor.AnchorViewCenter
-        )
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
 
-        self.setDragMode(
-            QGraphicsView.DragMode.ScrollHandDrag
-        )
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
 
-        self.setBackgroundBrush(
-            QBrush(QColor("#526746"))
-        )
+        self.setBackgroundBrush(QBrush(QColor("#526746")))
 
-        self.vehicle_item = VehicleGraphicsItem(
-            config=vehicle_config
-        )
+        self.vehicle_item = VehicleGraphicsItem(config=vehicle_config)
 
         self.goal_item = GoalGraphicsItem()
 
@@ -99,21 +90,13 @@ class SimulationView(QGraphicsView):
         )
         self.planned_item.setZValue(25)
 
-        self.graphics_scene.addItem(
-            self.history_item
-        )
+        self.graphics_scene.addItem(self.history_item)
 
-        self.graphics_scene.addItem(
-            self.planned_item
-        )
+        self.graphics_scene.addItem(self.planned_item)
 
-        self.graphics_scene.addItem(
-            self.goal_item
-        )
+        self.graphics_scene.addItem(self.goal_item)
 
-        self.graphics_scene.addItem(
-            self.vehicle_item
-        )
+        self.graphics_scene.addItem(self.vehicle_item)
 
         self.obstacle_items: dict[
             str,
@@ -137,13 +120,9 @@ class SimulationView(QGraphicsView):
         x = road_x_min * PIXELS_PER_METER
         y = -road_y_max * PIXELS_PER_METER
 
-        width = (
-            road_x_max - road_x_min
-        ) * PIXELS_PER_METER
+        width = (road_x_max - road_x_min) * PIXELS_PER_METER
 
-        height = (
-            road_y_max - road_y_min
-        ) * PIXELS_PER_METER
+        height = (road_y_max - road_y_min) * PIXELS_PER_METER
 
         road_item = QGraphicsRectItem(
             x,
@@ -152,9 +131,7 @@ class SimulationView(QGraphicsView):
             height,
         )
 
-        road_item.setBrush(
-            QBrush(QColor("#35393e"))
-        )
+        road_item.setBrush(QBrush(QColor("#35393e")))
 
         road_item.setPen(
             QPen(
@@ -165,9 +142,7 @@ class SimulationView(QGraphicsView):
 
         road_item.setZValue(-100)
 
-        self.graphics_scene.addItem(
-            road_item
-        )
+        self.graphics_scene.addItem(road_item)
 
         boundary_pen = QPen(
             QColor("#f4f0dc"),
@@ -216,38 +191,20 @@ class SimulationView(QGraphicsView):
         snapshot: SimulationSnapshot,
         goal: GoalState,
     ) -> None:
-        self.vehicle_item.set_state(
-            snapshot.ego
-        )
+        self.vehicle_item.set_state(snapshot.ego)
 
-        self.goal_item.set_state(
-            goal.state
-        )
+        self.goal_item.set_state(goal.state)
 
-        self.history_item.setPath(
-            trajectory_to_path(
-                snapshot.history_trajectory
-            )
-        )
+        self.history_item.setPath(trajectory_to_path(snapshot.history_trajectory))
 
-        self.planned_item.setPath(
-            trajectory_to_path(
-                snapshot.planned_trajectory
-            )
-        )
+        self.planned_item.setPath(trajectory_to_path(snapshot.planned_trajectory))
 
-        self._update_obstacles(
-            snapshot
-        )
+        self._update_obstacles(snapshot)
 
         if snapshot.collision:
-            self.vehicle_item.setBrush(
-                QBrush(QColor("#d32f2f"))
-            )
+            self.vehicle_item.setBrush(QBrush(QColor("#d32f2f")))
         else:
-            self.vehicle_item.setBrush(
-                QBrush(QColor("#2386c8"))
-            )
+            self.vehicle_item.setBrush(QBrush(QColor("#2386c8")))
 
     def _update_obstacles(
         self,
@@ -256,13 +213,9 @@ class SimulationView(QGraphicsView):
         active_ids: set[str] = set()
 
         for obstacle in snapshot.obstacles:
-            active_ids.add(
-                obstacle.obstacle_id
-            )
+            active_ids.add(obstacle.obstacle_id)
 
-            existing = self.obstacle_items.get(
-                obstacle.obstacle_id
-            )
+            existing = self.obstacle_items.get(obstacle.obstacle_id)
 
             if isinstance(
                 obstacle,
@@ -273,27 +226,15 @@ class SimulationView(QGraphicsView):
                     CircleObstacleGraphicsItem,
                 ):
                     if existing is not None:
-                        self.graphics_scene.removeItem(
-                            existing
-                        )
+                        self.graphics_scene.removeItem(existing)
 
-                    existing = (
-                        CircleObstacleGraphicsItem(
-                            obstacle
-                        )
-                    )
+                    existing = CircleObstacleGraphicsItem(obstacle)
 
-                    self.graphics_scene.addItem(
-                        existing
-                    )
+                    self.graphics_scene.addItem(existing)
 
-                    self.obstacle_items[
-                        obstacle.obstacle_id
-                    ] = existing
+                    self.obstacle_items[obstacle.obstacle_id] = existing
 
-                existing.update_obstacle(
-                    obstacle
-                )
+                existing.update_obstacle(obstacle)
 
             elif isinstance(
                 obstacle,
@@ -304,69 +245,61 @@ class SimulationView(QGraphicsView):
                     BoxObstacleGraphicsItem,
                 ):
                     if existing is not None:
-                        self.graphics_scene.removeItem(
-                            existing
-                        )
+                        self.graphics_scene.removeItem(existing)
 
-                    existing = (
-                        BoxObstacleGraphicsItem(
-                            obstacle
-                        )
-                    )
+                    existing = BoxObstacleGraphicsItem(obstacle)
 
-                    self.graphics_scene.addItem(
-                        existing
-                    )
+                    self.graphics_scene.addItem(existing)
 
-                    self.obstacle_items[
-                        obstacle.obstacle_id
-                    ] = existing
+                    self.obstacle_items[obstacle.obstacle_id] = existing
 
-                existing.update_obstacle(
-                    obstacle
-                )
+                existing.update_obstacle(obstacle)
 
-        stale_ids = (
-            set(self.obstacle_items)
-            - active_ids
-        )
+        stale_ids = set(self.obstacle_items) - active_ids
 
         for obstacle_id in stale_ids:
-            item = self.obstacle_items.pop(
-                obstacle_id
-            )
+            item = self.obstacle_items.pop(obstacle_id)
 
-            self.graphics_scene.removeItem(
-                item
-            )
+            self.graphics_scene.removeItem(item)
 
     def fit_world(self) -> None:
+        """
+        适配完整场景，并将屏幕视角逆时针旋转 90°。
+
+        仿真内部世界坐标、车辆坐标、航向角和动力学
+        均保持不变，只改变 QGraphicsView 的观察方向。
+        """
+        scene_rect = self.graphics_scene.sceneRect()
+
+        if scene_rect.isEmpty():
+            return
+
+        self.resetTransform()
+
+        # Qt 屏幕 y 轴向下，因此视觉上的逆时针 90°
+        # 对应 QGraphicsView.rotate(-90)。
+        self.rotate(-90.0)
+
         self.fitInView(
-            self.graphics_scene.sceneRect(),
+            scene_rect,
             Qt.AspectRatioMode.KeepAspectRatio,
         )
 
     def wheelEvent(self, event) -> None:
-        factor = (
-            1.15
-            if event.angleDelta().y() > 0
-            else 1.0 / 1.15
+        factor = 1.15 if event.angleDelta().y() > 0 else 1.0 / 1.15
+
+        transform = self.transform()
+
+        # 旋转后的变换矩阵中，m11 不再单独代表缩放。
+        current_scale = math.hypot(
+            transform.m11(),
+            transform.m12(),
         )
 
-        current_scale = (
-            self.transform().m11()
-        )
-
-        if (
-            factor > 1.0
-            and current_scale > 5.0
-        ):
+        if factor > 1.0 and current_scale > 5.0:
             return
 
-        if (
-            factor < 1.0
-            and current_scale < 0.15
-        ):
+        if factor < 1.0 and current_scale < 0.15:
             return
 
         self.scale(
