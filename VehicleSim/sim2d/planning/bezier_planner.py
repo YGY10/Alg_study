@@ -238,12 +238,15 @@ class BezierPlanner(Planner):
             action=action,
             trajectory=predicted_trajectory,
             controls=predicted_controls,
+            # 完整 Bézier 参考路径：
+            # [x, y, yaw, arc_length, curvature]
+            reference_path=reference_path.copy(),
             debug={
                 "planner": "BezierPlanner",
                 "status": status,
                 **control_debug,
-                "prediction_dt": (self.prediction_dt),
-                "prediction_steps": (self.prediction_steps),
+                "prediction_dt": self.prediction_dt,
+                "prediction_steps": self.prediction_steps,
                 "prediction_horizon": (self.prediction_dt * self.prediction_steps),
                 "prediction_mode": ("closed_loop_path_tracking"),
                 "reference_path_points": (reference_path.shape[0]),

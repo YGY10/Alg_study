@@ -84,6 +84,12 @@ def parse_args() -> argparse.Namespace:
         choices=("worst-gap", "best-gap", "random", "first"),
         default="worst-gap",
     )
+    parser.add_argument(
+        "--diagnostic-topk",
+        type=int,
+        default=20,
+        help="Number of selected records to include in the printed diagnostic table.",
+    )
     return parser.parse_args()
 
 
@@ -168,6 +174,12 @@ def evaluate_batch(
     endpoint_weight: float,
     safety_margin: float,
     collision_penalty: float,
+    metric_endpoint_score_weight: float = 5.0,
+    metric_progress_score_weight: float = 5.0,
+    metric_route_score_weight: float = 2.0,
+    metric_imitation_score_weight: float = 0.0,
+    metric_no_collision_score_weight: float = 1.0,
+    use_metric_heads: bool = True,
 ) -> dict[str, torch.Tensor]:
     batch = move_batch_to_device(batch, device)
     forced_paths = make_forced_paths(batch, val_forced_long_path_topk)
@@ -204,6 +216,20 @@ def evaluate_batch(
         trajectory_scores=output["trajectory_scores"],
         no_collision_logits=output["no_collision_logits"],
         collision_penalty=collision_penalty,
+        endpoint_metric_logits=(
+            output.get("endpoint_metric_logits") if use_metric_heads else None
+        ),
+        progress_metric_logits=(
+            output.get("progress_metric_logits") if use_metric_heads else None
+        ),
+        route_metric_logits=(
+            output.get("route_metric_logits") if use_metric_heads else None
+        ),
+        endpoint_weight=metric_endpoint_score_weight,
+        progress_weight=metric_progress_score_weight,
+        route_weight=metric_route_score_weight,
+        imitation_weight=metric_imitation_score_weight,
+        no_collision_weight=metric_no_collision_score_weight,
     )
 
     best_index = planning_scores.argmax(dim=1)
@@ -239,6 +265,137 @@ def finite_route(route_path: np.ndarray) -> np.ndarray:
     return route_path[valid]
 
 
+def summarize_record(record: dict) -> dict[str, float | int | bool]:
+    result = record["result"]
+    batch = record["batch"]
+    row = int(record["row"])
+    output = result["output"]
+    best = int(result["best_index"][row].detach().cpu())
+    oracle = int(result["oracle_index"][row].detach().cpu())
+
+    pred_path = int(output["candidate_path_indices"][row, best].detach().cpu())
+    oracle_path = int(output["candidate_path_indices"][row, oracle].detach().cpu())
+    target_path = int(batch["path_index"][row].detach().cpu())
+    pred_velocity = int(output["candidate_velocity_indices"][row, best].detach().cpu())
+    oracle_velocity = int(
+        output["candidate_velocity_indices"][row, oracle].detach().cpu()
+    )
+    target_velocity = int(batch["velocity_index"][row].detach().cpu())
+
+    candidates = result["output"]["candidate_trajectories"]
+    pred_traj = candidates[row, best].detach().cpu()
+    oracle_traj = candidates[row, oracle].detach().cpu()
+    pred_progress = float(pred_traj[-1, 0])
+    oracle_progress = float(oracle_traj[-1, 0])
+    pred_lateral = float(pred_traj[-1, 1])
+    oracle_lateral = float(oracle_traj[-1, 1])
+    pred_length = float(
+        (pred_traj[1:, :2] - pred_traj[:-1, :2]).pow(2).sum(dim=-1).sqrt().sum()
+    )
+    oracle_length = float(
+        (oracle_traj[1:, :2] - oracle_traj[:-1, :2]).pow(2).sum(dim=-1).sqrt().sum()
+    )
+
+    scores = result["planning_scores"][row].detach().cpu()
+    pred_score = float(scores[best])
+    oracle_score = float(scores[oracle])
+
+    return {
+        "global_index": int(record["global_index"]),
+        "best": best,
+        "oracle": oracle,
+        "pred_path": pred_path,
+        "oracle_path": oracle_path,
+        "target_path": target_path,
+        "pred_velocity": pred_velocity,
+        "oracle_velocity": oracle_velocity,
+        "target_velocity": target_velocity,
+        "path_same": pred_path == oracle_path,
+        "velocity_same": pred_velocity == oracle_velocity,
+        "both_same": pred_path == oracle_path and pred_velocity == oracle_velocity,
+        "target_pair_hit": pred_path == target_path
+        and pred_velocity == target_velocity,
+        "gap": float(record["gap"]),
+        "selected_l2": float(record["selected_l2"]),
+        "oracle_l2": float(result["oracle_l2"][row].detach().cpu()),
+        "selected_endpoint_l2": float(
+            result["selected_endpoint_l2"][row].detach().cpu()
+        ),
+        "oracle_endpoint_l2": float(result["oracle_endpoint_l2"][row].detach().cpu()),
+        "pred_progress": pred_progress,
+        "oracle_progress": oracle_progress,
+        "progress_delta": pred_progress - oracle_progress,
+        "lateral_delta": pred_lateral - oracle_lateral,
+        "length_delta": pred_length - oracle_length,
+        "pred_score": pred_score,
+        "oracle_score": oracle_score,
+        "score_delta": pred_score - oracle_score,
+        "pred_collision": bool(result["candidate_collision"][row, best].detach().cpu()),
+        "oracle_collision": bool(
+            result["candidate_collision"][row, oracle].detach().cpu()
+        ),
+    }
+
+
+def print_diagnostics(records: list[dict], selected: list[dict], topk: int) -> None:
+    def aggregate(name: str, subset: list[dict]) -> None:
+        summaries = [summarize_record(record) for record in subset]
+        if not summaries:
+            print(f"diagnostic {name}: empty", flush=True)
+            return
+        n = len(summaries)
+        path_same = sum(int(item["path_same"]) for item in summaries) / n
+        velocity_same = sum(int(item["velocity_same"]) for item in summaries) / n
+        both_same = sum(int(item["both_same"]) for item in summaries) / n
+        target_pair_hit = sum(int(item["target_pair_hit"]) for item in summaries) / n
+        progress_delta = sum(float(item["progress_delta"]) for item in summaries) / n
+        abs_progress_delta = (
+            sum(abs(float(item["progress_delta"])) for item in summaries) / n
+        )
+        length_delta = sum(float(item["length_delta"]) for item in summaries) / n
+        score_delta = sum(float(item["score_delta"]) for item in summaries) / n
+        pred_faster = (
+            sum(int(float(item["progress_delta"]) > 1.0) for item in summaries) / n
+        )
+        pred_slower = (
+            sum(int(float(item["progress_delta"]) < -1.0) for item in summaries) / n
+        )
+        print(
+            f"diagnostic {name}: n={n} "
+            f"path_same={path_same:.3f} velocity_same={velocity_same:.3f} "
+            f"both_same={both_same:.3f} target_pair_hit={target_pair_hit:.3f} "
+            f"progress_delta={progress_delta:.2f} abs_progress_delta={abs_progress_delta:.2f} "
+            f"length_delta={length_delta:.2f} score_delta={score_delta:.2f} "
+            f"pred_farther={pred_faster:.3f} pred_shorter={pred_slower:.3f}",
+            flush=True,
+        )
+
+    aggregate("scan", records)
+    aggregate("selected", selected)
+
+    table = [summarize_record(record) for record in selected[: max(0, int(topk))]]
+    if not table:
+        return
+    print("diagnostic selected table:", flush=True)
+    print(
+        "sample gap pred_l2 oracle_l2 path[p/o/t] vel[p/o/t] "
+        "same[p/v] progress_delta length_delta score_delta collision[p/o]",
+        flush=True,
+    )
+    for item in table:
+        print(
+            f"{item['global_index']} {item['gap']:.2f} "
+            f"{item['selected_l2']:.2f} {item['oracle_l2']:.2f} "
+            f"{item['pred_path']}/{item['oracle_path']}/{item['target_path']} "
+            f"{item['pred_velocity']}/{item['oracle_velocity']}/{item['target_velocity']} "
+            f"{int(item['path_same'])}/{int(item['velocity_same'])} "
+            f"{item['progress_delta']:.2f} {item['length_delta']:.2f} "
+            f"{item['score_delta']:.2f} "
+            f"{int(item['pred_collision'])}/{int(item['oracle_collision'])}",
+            flush=True,
+        )
+
+
 def plot_prediction(
     sample: dict[str, torch.Tensor],
     result: dict[str, torch.Tensor],
@@ -249,6 +406,14 @@ def plot_prediction(
     output = result["output"]
     best = int(result["best_index"][row].detach().cpu())
     oracle = int(result["oracle_index"][row].detach().cpu())
+    pred_path = int(output["candidate_path_indices"][row, best].detach().cpu())
+    oracle_path = int(output["candidate_path_indices"][row, oracle].detach().cpu())
+    pred_velocity = int(output["candidate_velocity_indices"][row, best].detach().cpu())
+    oracle_velocity = int(
+        output["candidate_velocity_indices"][row, oracle].detach().cpu()
+    )
+    target_path = int(sample["path_index"].detach().cpu())
+    target_velocity = int(sample["velocity_index"].detach().cpu())
 
     input_grid = to_numpy(sample["input_grid"])
     target = to_numpy(sample["target_trajectory"])
@@ -354,7 +519,11 @@ def plot_prediction(
             suffix += " oracle"
         if collisions[index]:
             suffix += " col"
-        labels.append(f"{index}{suffix}")
+        path_idx = int(output["candidate_path_indices"][row, index].detach().cpu())
+        velocity_idx = int(
+            output["candidate_velocity_indices"][row, index].detach().cpu()
+        )
+        labels.append(f"{index}{suffix} p{path_idx} v{velocity_idx}")
     ax_scores.set_yticks(np.arange(top_count), labels)
     ax_scores.set_title("top planning scores")
     ax_scores.grid(True, axis="x", alpha=0.25)
@@ -386,9 +555,14 @@ def plot_prediction(
     oracle_end = float(result["oracle_endpoint_l2"][row].detach().cpu())
     gap = float(result["gap"][row].detach().cpu())
     pred_col = bool(result["candidate_collision"][row, best].detach().cpu())
+    pred_progress = float(candidates[best, -1, 0])
+    oracle_progress = float(candidates[oracle, -1, 0])
     fig.suptitle(
         f"sample={global_index} | pred_l2={selected_l2:.2f} end={selected_end:.2f} "
         f"| oracle_l2={oracle_l2:.2f} end={oracle_end:.2f} | gap={gap:.2f} "
+        f"| p/o/t path={pred_path}/{oracle_path}/{target_path} "
+        f"vel={pred_velocity}/{oracle_velocity}/{target_velocity} "
+        f"| progress_delta={pred_progress - oracle_progress:.2f} "
         f"| pred_collision={pred_col}"
     )
 
@@ -420,6 +594,25 @@ def main() -> None:
     endpoint_weight = float(arg_or_saved(args, saved_args, "endpoint_weight", 0.5))
     safety_margin = float(arg_or_saved(args, saved_args, "safety_margin", 0.3))
     collision_penalty = float(arg_or_saved(args, saved_args, "collision_penalty", 0.0))
+    metric_endpoint_score_weight = float(
+        getattr(saved_args, "metric_endpoint_score_weight", 5.0)
+    )
+    metric_progress_score_weight = float(
+        getattr(saved_args, "metric_progress_score_weight", 5.0)
+    )
+    metric_route_score_weight = float(
+        getattr(saved_args, "metric_route_score_weight", 2.0)
+    )
+    metric_imitation_score_weight = float(
+        getattr(saved_args, "metric_imitation_score_weight", 0.0)
+    )
+    metric_no_collision_score_weight = float(
+        getattr(saved_args, "metric_no_collision_score_weight", -1.0)
+    )
+    if metric_no_collision_score_weight < 0.0:
+        metric_no_collision_score_weight = float(
+            getattr(saved_args, "no_collision_loss_weight", 0.0) > 0.0
+        )
 
     random.seed(seed)
     torch.manual_seed(seed)
@@ -475,7 +668,13 @@ def main() -> None:
         ego_state_dim=7,
         topk_path=model_topk_path,
     ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    load_result = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    use_metric_heads = not any("metric_head" in key for key in load_result.missing_keys)
+    if not use_metric_heads:
+        print(
+            "checkpoint has no trained metric heads; using legacy trajectory scoring",
+            flush=True,
+        )
     model.eval()
 
     records = []
@@ -492,6 +691,12 @@ def main() -> None:
                 endpoint_weight=endpoint_weight,
                 safety_margin=safety_margin,
                 collision_penalty=collision_penalty,
+                metric_endpoint_score_weight=metric_endpoint_score_weight,
+                metric_progress_score_weight=metric_progress_score_weight,
+                metric_route_score_weight=metric_route_score_weight,
+                metric_imitation_score_weight=metric_imitation_score_weight,
+                metric_no_collision_score_weight=metric_no_collision_score_weight,
+                use_metric_heads=use_metric_heads,
             )
             batch_size = batch["input_grid"].shape[0]
             for row in range(batch_size):
@@ -517,6 +722,7 @@ def main() -> None:
         random.shuffle(records)
 
     selected = records[: max(1, int(args.num_plots))]
+    print_diagnostics(records, selected, args.diagnostic_topk)
     saved_paths = []
     print(f"saving {len(selected)} plots to {args.output_dir}", flush=True)
     for rank, record in enumerate(selected):
@@ -547,7 +753,11 @@ def main() -> None:
     )
     print(
         f"settings: topk_path={model_topk_path} val_forced_long_path_topk={val_forced_long_path_topk} "
-        f"max_route_points={max_route_points} collision_penalty={collision_penalty}"
+        f"max_route_points={max_route_points} collision_penalty={collision_penalty} "
+        f"metric_score_w={metric_endpoint_score_weight}/"
+        f"{metric_progress_score_weight}/{metric_route_score_weight}/"
+        f"{metric_imitation_score_weight} "
+        f"no_col_score_w={metric_no_collision_score_weight}"
     )
     print(f"scan mean: pred_l2={mean_l2:.3f} gap={mean_gap:.3f}")
     for path in saved_paths:

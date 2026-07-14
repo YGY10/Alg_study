@@ -10,7 +10,9 @@ from sim2d.core.collision import (
     has_collision,
     minimum_clearance,
 )
-from sim2d.core.dynamics import KinematicBicycleModel
+from sim2d.core.dynamics import (
+    KinematicBicycleModel,
+)
 from sim2d.types import (
     GoalState,
     Observation,
@@ -57,14 +59,10 @@ class EnvironmentConfig:
 
     def validate(self) -> None:
         if self.dt <= 0.0:
-            raise ValueError(
-                f"dt must be positive, got {self.dt}"
-            )
+            raise ValueError(f"dt must be positive, got {self.dt}")
 
         if self.max_time <= 0.0:
-            raise ValueError(
-                f"max_time must be positive, got {self.max_time}"
-            )
+            raise ValueError(f"max_time must be positive, got {self.max_time}")
 
 
 @dataclass
@@ -72,7 +70,7 @@ class DrivingEnv:
     """
     二维自动驾驶仿真环境。
 
-    当前第一版包含：
+    当前包含：
         固定时间步
         运动学自行车模型
         静态障碍物
@@ -81,9 +79,16 @@ class DrivingEnv:
         超时截断
         状态历史
         GUI 快照
+        规划预测轨迹
+        完整参考路径
 
     注意：
         环境核心不依赖 PySide6 或任何 GUI 库。
+
+        planned_trajectory 和 reference_path
+        只用于显示、调试和记录。
+
+        环境不会使用它们推进车辆。
     """
 
     vehicle_config: VehicleConfig
@@ -178,6 +183,12 @@ class DrivingEnv:
         repr=False,
     )
 
+    _reference_path: np.ndarray | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+
     _debug: dict[str, Any] = field(
         default_factory=dict,
         init=False,
@@ -188,9 +199,7 @@ class DrivingEnv:
         self.vehicle_config.validate()
         self.environment_config.validate()
 
-        self._dynamics = KinematicBicycleModel(
-            config=self.vehicle_config
-        )
+        self._dynamics = KinematicBicycleModel(config=self.vehicle_config)
 
     def reset(
         self,
@@ -236,9 +245,7 @@ class DrivingEnv:
             obstacles=self._obstacles,
         )
 
-        self._goal_reached = self._check_goal_reached(
-            initial_state
-        )
+        self._goal_reached = self._check_goal_reached(initial_state)
 
         self._timeout = False
 
@@ -249,7 +256,9 @@ class DrivingEnv:
         )
 
         self._history = [initial_state]
+
         self._planned_trajectory = None
+        self._reference_path = None
         self._debug = {}
 
         if self._collision:
@@ -267,7 +276,8 @@ class DrivingEnv:
         """
         仿真推进一个固定时间步。
 
-        下一状态由车辆动力学模型决定，而不是直接使用规划轨迹。
+        下一状态仅由车辆动力学模型决定，
+        不直接使用规划轨迹或参考路径。
         """
         self._require_initialized()
 
@@ -279,9 +289,7 @@ class DrivingEnv:
 
         assert self._ego_state is not None
 
-        previous_distance = self._distance_to_goal(
-            self._ego_state
-        )
+        previous_distance = self._distance_to_goal(self._ego_state)
 
         next_state = self._dynamics.step(
             state=self._ego_state,
@@ -290,8 +298,11 @@ class DrivingEnv:
         )
 
         self._ego_state = next_state
+
         self._time += self.environment_config.dt
+
         self._frame += 1
+
         self._history.append(next_state)
 
         self._collision = has_collision(
@@ -306,28 +317,15 @@ class DrivingEnv:
             obstacles=self._obstacles,
         )
 
-        self._goal_reached = self._check_goal_reached(
-            next_state
-        )
+        self._goal_reached = self._check_goal_reached(next_state)
 
-        self._timeout = (
-            self._time
-            >= self.environment_config.max_time
-        )
+        self._timeout = self._time >= self.environment_config.max_time
 
-        self._terminated = (
-            self._collision
-            or self._goal_reached
-        )
+        self._terminated = self._collision or self._goal_reached
 
-        self._truncated = (
-            self._timeout
-            and not self._terminated
-        )
+        self._truncated = self._timeout and not self._terminated
 
-        current_distance = self._distance_to_goal(
-            next_state
-        )
+        current_distance = self._distance_to_goal(next_state)
 
         reward = self._compute_reward(
             previous_distance=previous_distance,
@@ -382,10 +380,9 @@ class DrivingEnv:
             time=self._time,
             ego=self._ego_state,
             obstacles=self._obstacles,
-            planned_trajectory=self._copy_optional_array(
-                self._planned_trajectory
-            ),
-            history_trajectory=self._history_as_array(),
+            planned_trajectory=(self._copy_optional_array(self._planned_trajectory)),
+            reference_path=(self._copy_optional_array(self._reference_path)),
+            history_trajectory=(self._history_as_array()),
             collision=self._collision,
             min_clearance=self._min_clearance,
             debug=dict(self._debug),
@@ -394,40 +391,38 @@ class DrivingEnv:
     def set_planner_debug(
         self,
         planned_trajectory: np.ndarray | None,
+        reference_path: np.ndarray | None = None,
         debug: dict[str, Any] | None = None,
     ) -> None:
         """
-        将规划器轨迹及调试信息提供给 GUI。
+        保存规划器输出，供 GUI 显示和日志调试。
 
-        环境不会使用 planned_trajectory 推进车辆。
-        它仅用于显示和记录。
+        planned_trajectory:
+            当前规划周期的闭环预测状态轨迹。
+            至少应包含 x、y 两列。
+
+        reference_path:
+            规划器生成的完整参考路径。
+            至少应包含 x、y 两列。
+
+        debug:
+            规划器调试信息。
+
+        注意：
+            环境不会使用 planned_trajectory 或
+            reference_path 推进车辆。
         """
-        if planned_trajectory is None:
-            self._planned_trajectory = None
-        else:
-            trajectory = np.asarray(
-                planned_trajectory,
-                dtype=np.float64,
-            )
-
-            if trajectory.ndim != 2:
-                raise ValueError(
-                    "planned_trajectory must be a 2D array"
-                )
-
-            if trajectory.shape[1] < 2:
-                raise ValueError(
-                    "planned_trajectory must contain at least "
-                    "x and y columns"
-                )
-
-            self._planned_trajectory = trajectory.copy()
-
-        self._debug = (
-            {}
-            if debug is None
-            else dict(debug)
+        self._planned_trajectory = self._validate_and_copy_path_array(
+            value=planned_trajectory,
+            name="planned_trajectory",
         )
+
+        self._reference_path = self._validate_and_copy_path_array(
+            value=reference_path,
+            name="reference_path",
+        )
+
+        self._debug = {} if debug is None else dict(debug)
 
     @property
     def is_done(self) -> bool:
@@ -452,7 +447,9 @@ class DrivingEnv:
     @property
     def state(self) -> VehicleState:
         self._require_initialized()
+
         assert self._ego_state is not None
+
         return self._ego_state
 
     def _compute_reward(
@@ -471,25 +468,15 @@ class DrivingEnv:
         """
         reward = self.environment_config.step_reward
 
-        progress = (
-            previous_distance
-            - current_distance
-        )
+        progress = previous_distance - current_distance
 
-        reward += (
-            self.environment_config.progress_reward_weight
-            * progress
-        )
+        reward += self.environment_config.progress_reward_weight * progress
 
         if self._collision:
-            reward += (
-                self.environment_config.collision_reward
-            )
+            reward += self.environment_config.collision_reward
 
         if self._goal_reached:
-            reward += (
-                self.environment_config.goal_reward
-            )
+            reward += self.environment_config.goal_reward
 
         return float(reward)
 
@@ -506,23 +493,14 @@ class DrivingEnv:
             state.y - target.y,
         )
 
-        yaw_error = abs(
-            self._normalize_angle(
-                state.yaw - target.yaw
-            )
-        )
+        yaw_error = abs(self._normalize_angle(state.yaw - target.yaw))
 
-        speed_error = abs(
-            state.speed - target.speed
-        )
+        speed_error = abs(state.speed - target.speed)
 
         return (
-            position_error
-            <= self._goal.position_tolerance
-            and yaw_error
-            <= self._goal.yaw_tolerance
-            and speed_error
-            <= self._goal.speed_tolerance
+            position_error <= self._goal.position_tolerance
+            and yaw_error <= self._goal.yaw_tolerance
+            and speed_error <= self._goal.speed_tolerance
         )
 
     def _distance_to_goal(
@@ -538,7 +516,9 @@ class DrivingEnv:
             state.y - target.y,
         )
 
-    def _history_as_array(self) -> np.ndarray:
+    def _history_as_array(
+        self,
+    ) -> np.ndarray:
         return np.array(
             [
                 [
@@ -552,20 +532,50 @@ class DrivingEnv:
             dtype=np.float64,
         )
 
-    def _require_initialized(self) -> None:
+    def _require_initialized(
+        self,
+    ) -> None:
         if self._ego_state is None or self._goal is None:
-            raise RuntimeError(
-                "Environment has not been reset. "
-                "Call reset() first."
-            )
+            raise RuntimeError("Environment has not been reset. " "Call reset() first.")
 
     @staticmethod
-    def _normalize_angle(angle: float) -> float:
-        return (
-            angle + math.pi
-        ) % (
-            2.0 * math.pi
-        ) - math.pi
+    def _validate_and_copy_path_array(
+        *,
+        value: np.ndarray | None,
+        name: str,
+    ) -> np.ndarray | None:
+        """
+        校验并复制轨迹或参考路径数组。
+
+        要求：
+            二维数组
+            至少包含 x、y 两列
+            所有元素必须是有限数值
+        """
+        if value is None:
+            return None
+
+        array = np.asarray(
+            value,
+            dtype=np.float64,
+        )
+
+        if array.ndim != 2:
+            raise ValueError(f"{name} must be a 2D array, " f"got ndim={array.ndim}")
+
+        if array.shape[1] < 2:
+            raise ValueError(f"{name} must contain at least " "x and y columns")
+
+        if not np.all(np.isfinite(array)):
+            raise ValueError(f"{name} must contain only " "finite values")
+
+        return array.copy()
+
+    @staticmethod
+    def _normalize_angle(
+        angle: float,
+    ) -> float:
+        return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
     @staticmethod
     def _copy_optional_array(

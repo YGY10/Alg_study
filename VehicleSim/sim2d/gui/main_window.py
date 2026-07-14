@@ -37,7 +37,9 @@ from sim2d.core import (
 from sim2d.gui.simulation_view import (
     SimulationView,
 )
-from sim2d.planning import BezierPlanner
+from sim2d.planning import (
+    BezierPlanner,
+)
 from sim2d.types import (
     BoxObstacle,
     CircleObstacle,
@@ -77,12 +79,12 @@ class MainWindow(QMainWindow):
         )
 
         self.env = DrivingEnv(
-            vehicle_config=self.vehicle_config,
+            vehicle_config=(self.vehicle_config),
             environment_config=(self.environment_config),
         )
 
         self.planner = BezierPlanner(
-            vehicle_config=self.vehicle_config,
+            vehicle_config=(self.vehicle_config),
             target_speed=4.0,
             speed_gain=1.5,
             braking_deceleration=2.5,
@@ -138,11 +140,15 @@ class MainWindow(QMainWindow):
             self.simulation_view.fit_world,
         )
 
-    def _build_ui(self) -> None:
+    def _build_ui(
+        self,
+    ) -> None:
         root_splitter = QSplitter(Qt.Orientation.Horizontal)
 
         control_panel = QWidget()
+
         control_panel.setMinimumWidth(280)
+
         control_panel.setMaximumWidth(390)
 
         control_layout = QVBoxLayout(control_panel)
@@ -307,12 +313,19 @@ class MainWindow(QMainWindow):
         status_form = QFormLayout(status_group)
 
         self.frame_label = QLabel("0")
+
         self.time_label = QLabel("0.00 s")
+
         self.x_label = QLabel("0.00 m")
+
         self.y_label = QLabel("0.00 m")
+
         self.yaw_label = QLabel("0.00°")
+
         self.speed_label = QLabel("0.00 m/s")
+
         self.clearance_label = QLabel("--")
+
         self.status_label = QLabel("未开始")
 
         status_form.addRow(
@@ -424,7 +437,12 @@ class MainWindow(QMainWindow):
             1,
         )
 
-        right_splitter.setSizes([650, 180])
+        right_splitter.setSizes(
+            [
+                650,
+                180,
+            ]
+        )
 
         root_splitter.addWidget(control_panel)
 
@@ -453,7 +471,9 @@ class MainWindow(QMainWindow):
         self._update_keyboard_input_display()
         self._update_control_mode_ui()
 
-    def _create_actions(self) -> None:
+    def _create_actions(
+        self,
+    ) -> None:
         run_action = QAction(
             "运行/暂停",
             self,
@@ -507,7 +527,7 @@ class MainWindow(QMainWindow):
             "manual",
             "auto",
         }:
-            raise RuntimeError(f"Unknown control mode: {mode!r}")
+            raise RuntimeError("Unknown control mode: " f"{mode!r}")
 
         return mode
 
@@ -529,6 +549,7 @@ class MainWindow(QMainWindow):
         _: int,
     ) -> None:
         self.keyboard_control.reset()
+
         self._update_keyboard_input_display()
         self._update_control_mode_ui()
 
@@ -541,6 +562,7 @@ class MainWindow(QMainWindow):
         _: int,
     ) -> None:
         self.keyboard_control.reset()
+
         self._update_keyboard_input_display()
         self._update_control_mode_ui()
 
@@ -583,8 +605,8 @@ class MainWindow(QMainWindow):
                 "R：复位\n"
                 "F：适配视图\n\n"
                 "当前为自动规划模式。\n"
-                "控制量由 SimplePlanner "
-                "根据当前观测计算。"
+                "控制量由 BezierPlanner "
+                "根据 Bézier 参考路径计算。"
             )
 
         elif manual_input_mode == "keyboard":
@@ -640,6 +662,7 @@ class MainWindow(QMainWindow):
             Qt.Key.Key_Up,
         }:
             self.keyboard_control.throttle_pressed = pressed
+
             return True
 
         if key in {
@@ -647,6 +670,7 @@ class MainWindow(QMainWindow):
             Qt.Key.Key_Down,
         }:
             self.keyboard_control.brake_pressed = pressed
+
             return True
 
         if key in {
@@ -654,6 +678,7 @@ class MainWindow(QMainWindow):
             Qt.Key.Key_Left,
         }:
             self.keyboard_control.left_pressed = pressed
+
             return True
 
         if key in {
@@ -661,6 +686,7 @@ class MainWindow(QMainWindow):
             Qt.Key.Key_Right,
         }:
             self.keyboard_control.right_pressed = pressed
+
             return True
 
         return False
@@ -718,11 +744,14 @@ class MainWindow(QMainWindow):
         # 窗口失去焦点时释放所有驾驶键，
         # 防止油门、刹车或方向盘卡住。
         self.keyboard_control.reset()
+
         self._update_keyboard_input_display()
 
         super().focusOutEvent(event)
 
-    def reset_environment(self) -> None:
+    def reset_environment(
+        self,
+    ) -> None:
         self.pause_simulation()
 
         self.planner.reset()
@@ -776,7 +805,8 @@ class MainWindow(QMainWindow):
         self.append_log(
             "RESET "
             f"mode={self.current_control_mode()} "
-            f"dt={self.environment_config.dt:.3f}s "
+            f"dt="
+            f"{self.environment_config.dt:.3f}s "
             f"max_time="
             f"{self.environment_config.max_time:.1f}s"
         )
@@ -789,7 +819,9 @@ class MainWindow(QMainWindow):
             steering=(self.steering_spin.value()),
         )
 
-    def advance_one_step(self) -> None:
+    def advance_one_step(
+        self,
+    ) -> None:
         if self.env.is_done:
             self.pause_simulation()
 
@@ -810,7 +842,8 @@ class MainWindow(QMainWindow):
 
             self.env.set_planner_debug(
                 planned_trajectory=(plan_result.trajectory),
-                debug=plan_result.debug,
+                reference_path=(plan_result.reference_path),
+                debug=(plan_result.debug),
             )
 
             mode_description = "auto"
@@ -860,8 +893,11 @@ class MainWindow(QMainWindow):
                     "Unsupported manual input mode: " f"{manual_input_mode!r}"
                 )
 
+            # 手动模式不应继续显示上一帧
+            # 自动规划留下的预测轨迹和参考路径。
             self.env.set_planner_debug(
                 planned_trajectory=None,
+                reference_path=None,
                 debug=debug,
             )
 
@@ -903,24 +939,32 @@ class MainWindow(QMainWindow):
 
             # 回合结束后清理驾驶键状态。
             self.keyboard_control.reset()
+
             self._update_keyboard_input_display()
 
             if result.info["collision"]:
                 reason = "collision"
+
             elif result.info["goal_reached"]:
                 reason = "goal_reached"
+
             elif result.info["timeout"]:
                 reason = "timeout"
+
             else:
                 reason = "unknown"
 
             self.append_log("EPISODE_FINISHED " f"reason={reason}")
 
-    def single_step(self) -> None:
+    def single_step(
+        self,
+    ) -> None:
         self.pause_simulation()
         self.advance_one_step()
 
-    def start_simulation(self) -> None:
+    def start_simulation(
+        self,
+    ) -> None:
         if self.env.is_done:
             self.append_log("Episode finished. " "Press Reset first.")
 
@@ -941,7 +985,9 @@ class MainWindow(QMainWindow):
 
         self.append_log(f"RUN mode={mode_description}")
 
-    def pause_simulation(self) -> None:
+    def pause_simulation(
+        self,
+    ) -> None:
         if not self.running:
             return
 
@@ -952,7 +998,9 @@ class MainWindow(QMainWindow):
 
         self.append_log("PAUSE")
 
-    def toggle_simulation(self) -> None:
+    def toggle_simulation(
+        self,
+    ) -> None:
         if self.running:
             self.pause_simulation()
         else:
@@ -983,12 +1031,16 @@ class MainWindow(QMainWindow):
 
         if snapshot.collision:
             self.status_label.setText("碰撞")
+
         elif self.env.terminated:
             self.status_label.setText("任务结束")
+
         elif self.env.truncated:
             self.status_label.setText("超时")
+
         elif self.running:
             self.status_label.setText("运行中")
+
         else:
             self.status_label.setText("已暂停")
 

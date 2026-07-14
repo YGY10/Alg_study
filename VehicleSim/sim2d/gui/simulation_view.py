@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import (
     QBrush,
@@ -30,7 +32,6 @@ from sim2d.types import (
     SimulationSnapshot,
     VehicleConfig,
 )
-import math
 
 
 class SimulationView(QGraphicsView):
@@ -39,6 +40,17 @@ class SimulationView(QGraphicsView):
 
     只负责渲染 SimulationSnapshot，
     不负责调用 Environment.step()。
+
+    当前显示三类轨迹：
+
+        reference_path：
+            规划器生成的完整空间参考路径。
+
+        planned_trajectory：
+            当前规划周期的闭环预测车辆轨迹。
+
+        history_trajectory：
+            车辆经过动力学模型实际执行后的历史轨迹。
     """
 
     def __init__(
@@ -51,6 +63,7 @@ class SimulationView(QGraphicsView):
         self.vehicle_config = vehicle_config
 
         self.graphics_scene = QGraphicsScene(self)
+
         self.setScene(self.graphics_scene)
 
         self.setRenderHints(
@@ -71,24 +84,58 @@ class SimulationView(QGraphicsView):
 
         self.goal_item = GoalGraphicsItem()
 
-        self.history_item = QGraphicsPathItem()
-        self.history_item.setPen(
-            QPen(
-                QColor("#f6d04d"),
-                3.0,
-            )
+        # 完整参考路径。
+        #
+        # BezierPlanner 当前输出通常为：
+        # [x, y, yaw, arc_length, curvature]
+        #
+        # trajectory_to_path() 只读取前两列 x、y。
+        self.reference_item = QGraphicsPathItem()
+
+        reference_pen = QPen(
+            QColor("#6dc7e8"),
+            2.0,
+            Qt.PenStyle.DotLine,
         )
+
+        reference_pen.setCosmetic(True)
+
+        self.reference_item.setPen(reference_pen)
+
+        self.reference_item.setZValue(15)
+
+        # 车辆已经实际执行过的历史轨迹。
+        self.history_item = QGraphicsPathItem()
+
+        history_pen = QPen(
+            QColor("#f6d04d"),
+            3.0,
+            Qt.PenStyle.SolidLine,
+        )
+
+        history_pen.setCosmetic(True)
+
+        self.history_item.setPen(history_pen)
+
         self.history_item.setZValue(20)
 
+        # 从当前车辆状态开始的短期闭环预测轨迹。
         self.planned_item = QGraphicsPathItem()
-        self.planned_item.setPen(
-            QPen(
-                QColor("#43e188"),
-                3.0,
-                Qt.PenStyle.DashLine,
-            )
+
+        planned_pen = QPen(
+            QColor("#43e188"),
+            3.0,
+            Qt.PenStyle.DashLine,
         )
+
+        planned_pen.setCosmetic(True)
+
+        self.planned_item.setPen(planned_pen)
+
         self.planned_item.setZValue(25)
+
+        # 按照从底层到顶层的顺序加入场景。
+        self.graphics_scene.addItem(self.reference_item)
 
         self.graphics_scene.addItem(self.history_item)
 
@@ -105,7 +152,9 @@ class SimulationView(QGraphicsView):
 
         self._draw_default_road()
 
-    def _draw_default_road(self) -> None:
+    def _draw_default_road(
+        self,
+    ) -> None:
         """
         暂时画一条简单直路。
 
@@ -114,10 +163,12 @@ class SimulationView(QGraphicsView):
         """
         road_x_min = -5.0
         road_x_max = 35.0
+
         road_y_min = -4.0
         road_y_max = 4.0
 
         x = road_x_min * PIXELS_PER_METER
+
         y = -road_y_max * PIXELS_PER_METER
 
         width = (road_x_max - road_x_min) * PIXELS_PER_METER
@@ -155,29 +206,35 @@ class SimulationView(QGraphicsView):
             Qt.PenStyle.DashLine,
         )
 
-        self.graphics_scene.addLine(
+        top_boundary_item = self.graphics_scene.addLine(
             x,
             -road_y_min * PIXELS_PER_METER,
             x + width,
             -road_y_min * PIXELS_PER_METER,
             boundary_pen,
-        ).setZValue(-90)
+        )
 
-        self.graphics_scene.addLine(
+        top_boundary_item.setZValue(-90)
+
+        bottom_boundary_item = self.graphics_scene.addLine(
             x,
             -road_y_max * PIXELS_PER_METER,
             x + width,
             -road_y_max * PIXELS_PER_METER,
             boundary_pen,
-        ).setZValue(-90)
+        )
 
-        self.graphics_scene.addLine(
+        bottom_boundary_item.setZValue(-90)
+
+        center_line_item = self.graphics_scene.addLine(
             x,
             0.0,
             x + width,
             0.0,
             center_pen,
-        ).setZValue(-90)
+        )
+
+        center_line_item.setZValue(-90)
 
         self.graphics_scene.setSceneRect(
             x - 2.0 * PIXELS_PER_METER,
@@ -191,12 +248,20 @@ class SimulationView(QGraphicsView):
         snapshot: SimulationSnapshot,
         goal: GoalState,
     ) -> None:
+        """
+        使用最新 SimulationSnapshot 更新所有图元。
+        """
         self.vehicle_item.set_state(snapshot.ego)
 
         self.goal_item.set_state(goal.state)
 
+        # 完整参考路径。
+        self.reference_item.setPath(trajectory_to_path(snapshot.reference_path))
+
+        # 实际历史轨迹。
         self.history_item.setPath(trajectory_to_path(snapshot.history_trajectory))
 
+        # 当前短期预测轨迹。
         self.planned_item.setPath(trajectory_to_path(snapshot.planned_trajectory))
 
         self._update_obstacles(snapshot)
@@ -262,7 +327,9 @@ class SimulationView(QGraphicsView):
 
             self.graphics_scene.removeItem(item)
 
-    def fit_world(self) -> None:
+    def fit_world(
+        self,
+    ) -> None:
         """
         适配完整场景，并将屏幕视角逆时针旋转 90°。
 
@@ -285,7 +352,10 @@ class SimulationView(QGraphicsView):
             Qt.AspectRatioMode.KeepAspectRatio,
         )
 
-    def wheelEvent(self, event) -> None:
+    def wheelEvent(
+        self,
+        event,
+    ) -> None:
         factor = 1.15 if event.angleDelta().y() > 0 else 1.0 / 1.15
 
         transform = self.transform()
@@ -297,12 +367,16 @@ class SimulationView(QGraphicsView):
         )
 
         if factor > 1.0 and current_scale > 5.0:
+            event.accept()
             return
 
         if factor < 1.0 and current_scale < 0.15:
+            event.accept()
             return
 
         self.scale(
             factor,
             factor,
         )
+
+        event.accept()

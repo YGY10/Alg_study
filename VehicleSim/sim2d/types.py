@@ -7,7 +7,6 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-
 FloatArray = NDArray[np.float64]
 
 
@@ -40,19 +39,29 @@ class VehicleState:
     def as_array(self) -> FloatArray:
         """转换为规划器常用的 NumPy 状态向量。"""
         return np.array(
-            [self.x, self.y, self.yaw, self.speed],
+            [
+                self.x,
+                self.y,
+                self.yaw,
+                self.speed,
+            ],
             dtype=np.float64,
         )
 
     @classmethod
-    def from_array(cls, value: FloatArray) -> VehicleState:
+    def from_array(
+        cls,
+        value: FloatArray,
+    ) -> VehicleState:
         """从长度为 4 的数组创建车辆状态。"""
-        array = np.asarray(value, dtype=np.float64)
+        array = np.asarray(
+            value,
+            dtype=np.float64,
+        )
 
         if array.shape != (4,):
             raise ValueError(
-                f"VehicleState array must have shape (4,), "
-                f"got {array.shape}"
+                "VehicleState array must have " f"shape (4,), got {array.shape}"
             )
 
         return cls(
@@ -68,8 +77,11 @@ class VehicleControl:
     """
     车辆控制量。
 
-    acceleration：纵向加速度，单位 m/s²
-    steering：前轮转角，单位 rad
+    acceleration：
+        纵向加速度，单位 m/s²。
+
+    steering：
+        前轮转角，单位 rad。
     """
 
     acceleration: float
@@ -77,18 +89,26 @@ class VehicleControl:
 
     def as_array(self) -> FloatArray:
         return np.array(
-            [self.acceleration, self.steering],
+            [
+                self.acceleration,
+                self.steering,
+            ],
             dtype=np.float64,
         )
 
     @classmethod
-    def from_array(cls, value: FloatArray) -> VehicleControl:
-        array = np.asarray(value, dtype=np.float64)
+    def from_array(
+        cls,
+        value: FloatArray,
+    ) -> VehicleControl:
+        array = np.asarray(
+            value,
+            dtype=np.float64,
+        )
 
         if array.shape != (2,):
             raise ValueError(
-                f"VehicleControl array must have shape (2,), "
-                f"got {array.shape}"
+                "VehicleControl array must have " f"shape (2,), got {array.shape}"
             )
 
         return cls(
@@ -125,19 +145,13 @@ class VehicleConfig:
             raise ValueError("Wheel base must be positive")
 
         if self.acceleration_min >= self.acceleration_max:
-            raise ValueError(
-                "acceleration_min must be less than acceleration_max"
-            )
+            raise ValueError("acceleration_min must be less than " "acceleration_max")
 
         if self.steering_min >= self.steering_max:
-            raise ValueError(
-                "steering_min must be less than steering_max"
-            )
+            raise ValueError("steering_min must be less than " "steering_max")
 
         if self.speed_min >= self.speed_max:
-            raise ValueError(
-                "speed_min must be less than speed_max"
-            )
+            raise ValueError("speed_min must be less than " "speed_max")
 
 
 @dataclass(frozen=True)
@@ -159,7 +173,7 @@ class CircleObstacle:
             raise ValueError("obstacle_id cannot be empty")
 
         if self.radius <= 0.0:
-            raise ValueError("Circle obstacle radius must be positive")
+            raise ValueError("Circle obstacle radius " "must be positive")
 
 
 @dataclass(frozen=True)
@@ -187,10 +201,10 @@ class BoxObstacle:
             raise ValueError("obstacle_id cannot be empty")
 
         if self.length <= 0.0:
-            raise ValueError("Box obstacle length must be positive")
+            raise ValueError("Box obstacle length " "must be positive")
 
         if self.width <= 0.0:
-            raise ValueError("Box obstacle width must be positive")
+            raise ValueError("Box obstacle width " "must be positive")
 
 
 Obstacle = CircleObstacle | BoxObstacle
@@ -208,19 +222,13 @@ class GoalState:
 
     def validate(self) -> None:
         if self.position_tolerance <= 0.0:
-            raise ValueError(
-                "position_tolerance must be positive"
-            )
+            raise ValueError("position_tolerance must be positive")
 
         if self.yaw_tolerance <= 0.0:
-            raise ValueError(
-                "yaw_tolerance must be positive"
-            )
+            raise ValueError("yaw_tolerance must be positive")
 
         if self.speed_tolerance <= 0.0:
-            raise ValueError(
-                "speed_tolerance must be positive"
-            )
+            raise ValueError("speed_tolerance must be positive")
 
 
 @dataclass(frozen=True)
@@ -228,7 +236,7 @@ class Observation:
     """
     提供给规划器或 Torch 模型的观测。
 
-    当前阶段先包含：
+    当前阶段包含：
         仿真时间
         当前帧号
         自车状态
@@ -251,21 +259,42 @@ class PlanResult:
     规划器统一返回结构。
 
     action：
-        本次真正执行的第一帧控制。
+        本周期真正交给环境执行的第一帧控制。
 
     trajectory：
-        可选的预测状态轨迹，形状通常为 [N+1, 4]。
+        可选的闭环预测状态轨迹。
+        常见形状为 [N+1, 4]，各列通常为：
+            x, y, yaw, speed
 
     controls：
-        可选的预测控制序列，形状通常为 [N, 2]。
+        可选的预测控制序列。
+        常见形状为 [N, 2]，各列通常为：
+            acceleration, steering
+
+    reference_path：
+        可选的完整参考路径。
+
+        其列定义由具体规划器决定。例如 BezierPlanner
+        当前可以使用：
+            x, y, yaw, arc_length, curvature
+
+        reference_path 是规划器希望车辆跟踪的空间路径；
+        trajectory 是根据当前闭环控制预测出的车辆运动轨迹。
+        两者语义不同。
 
     debug：
-        规划器需要显示在 GUI 或日志中的调试信息。
+        规划器提供给 GUI 或日志系统的调试信息。
+        大型数组应优先放在明确字段中，不应塞入 debug。
     """
 
     action: VehicleControl
+
     trajectory: FloatArray | None = None
+
     controls: FloatArray | None = None
+
+    reference_path: FloatArray | None = None
+
     debug: dict[str, Any] = field(default_factory=dict)
 
 
@@ -277,6 +306,7 @@ class StepResult:
     reward: float
     terminated: bool
     truncated: bool
+
     info: dict[str, Any] = field(default_factory=dict)
 
 
@@ -285,15 +315,29 @@ class SimulationSnapshot:
     """
     专门提供给 GUI 的只读仿真快照。
 
-    GUI 只读取 Snapshot，不直接访问 Environment 内部状态。
+    GUI 只读取 SimulationSnapshot，
+    不直接访问 DrivingEnv 内部状态。
+
+    planned_trajectory：
+        当前规划周期得到的闭环预测轨迹。
+
+    reference_path：
+        当前规划器生成的完整参考路径。
+
+    history_trajectory：
+        自仿真开始以来，车辆实际执行得到的历史轨迹。
     """
 
     frame: int
     time: float
+
     ego: VehicleState
     obstacles: tuple[Obstacle, ...]
 
     planned_trajectory: FloatArray | None
+
+    reference_path: FloatArray | None
+
     history_trajectory: FloatArray
 
     collision: bool

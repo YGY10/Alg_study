@@ -261,9 +261,125 @@ def compute_planning_scores(
     trajectory_scores: torch.Tensor,
     no_collision_logits: torch.Tensor,
     collision_penalty: float,
+    endpoint_metric_logits: torch.Tensor | None = None,
+    progress_metric_logits: torch.Tensor | None = None,
+    route_metric_logits: torch.Tensor | None = None,
+    endpoint_weight: float = 5.0,
+    progress_weight: float = 5.0,
+    route_weight: float = 2.0,
+    imitation_weight: float = 0.0,
+    no_collision_weight: float = 1.0,
 ) -> torch.Tensor:
-    collision_prob = torch.sigmoid(-no_collision_logits)
-    return trajectory_scores - float(collision_penalty) * collision_prob
+    if (
+        endpoint_metric_logits is None
+        or progress_metric_logits is None
+        or route_metric_logits is None
+    ):
+        collision_prob = torch.sigmoid(-no_collision_logits)
+        return trajectory_scores - float(collision_penalty) * collision_prob
+
+    raw_no_collision_score = torch.sigmoid(no_collision_logits)
+    no_collision_score = (
+        1.0
+        if float(no_collision_weight) <= 0.0
+        else (1.0 - float(no_collision_weight))
+        + float(no_collision_weight) * raw_no_collision_score
+    )
+    endpoint_score = torch.sigmoid(endpoint_metric_logits)
+    progress_score = torch.sigmoid(progress_metric_logits)
+    route_score = torch.sigmoid(route_metric_logits)
+    metric_score = (
+        no_collision_score
+        * route_score
+        * (
+            float(endpoint_weight) * endpoint_score
+            + float(progress_weight) * progress_score
+        )
+    )
+    metric_score = metric_score + float(route_weight) * route_score
+    if imitation_weight != 0.0:
+        metric_score = metric_score + float(imitation_weight) * trajectory_scores
+    return metric_score
+
+
+def candidate_route_distance(
+    candidate_trajectories: torch.Tensor,
+    route_path: torch.Tensor,
+    chunk_size: int = 256,
+) -> torch.Tensor:
+    route_xy = route_path[..., :2]
+    route_mask = torch.isfinite(route_xy).all(dim=-1)
+    if not bool(route_mask.any()):
+        return candidate_trajectories[..., 0].abs().mean(dim=-1) * 0.0
+
+    route_xy = torch.nan_to_num(route_xy, nan=0.0)
+    distances = []
+    for start in range(0, candidate_trajectories.shape[1], chunk_size):
+        end = min(start + chunk_size, candidate_trajectories.shape[1])
+        candidate_xy = candidate_trajectories[:, start:end, :, :2]
+        diff = candidate_xy[:, :, :, None, :] - route_xy[:, None, None, :, :]
+        l2 = diff.pow(2).sum(dim=-1).sqrt()
+        l2 = l2.masked_fill(~route_mask[:, None, None, :], 1.0e6)
+        distances.append(l2.min(dim=-1).values.mean(dim=-1))
+    return torch.cat(distances, dim=1)
+
+
+def build_metric_targets(
+    candidate_trajectories: torch.Tensor,
+    target_trajectory: torch.Tensor,
+    target_mask: torch.Tensor,
+    candidate_collision: torch.Tensor,
+    route_path: torch.Tensor,
+    endpoint_scale: float,
+    progress_scale: float,
+    route_scale: float,
+) -> dict[str, torch.Tensor]:
+    mask = target_mask.float()
+    batch_size = candidate_trajectories.shape[0]
+    batch_indices = torch.arange(batch_size, device=candidate_trajectories.device)
+    endpoint_index = mask.sum(dim=-1).long().clamp(min=1) - 1
+    target_endpoint = target_trajectory[batch_indices, endpoint_index, :2]
+    candidate_endpoint = candidate_trajectories[:, :, -1, :2]
+
+    endpoint_l2 = (
+        (candidate_endpoint - target_endpoint[:, None]).pow(2).sum(dim=-1).sqrt()
+    )
+    progress_l1 = (candidate_endpoint[..., 0] - target_endpoint[:, None, 0]).abs()
+    route_distance = candidate_route_distance(candidate_trajectories, route_path)
+
+    return {
+        "no_collision": (~candidate_collision.bool()).float(),
+        "endpoint": torch.exp(
+            -endpoint_l2 / max(float(endpoint_scale), 1.0e-6)
+        ).detach(),
+        "progress": torch.exp(
+            -progress_l1 / max(float(progress_scale), 1.0e-6)
+        ).detach(),
+        "route": torch.exp(-route_distance / max(float(route_scale), 1.0e-6)).detach(),
+    }
+
+
+def metric_head_loss(
+    output: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    no_collision_loss = F.binary_cross_entropy_with_logits(
+        output["no_collision_logits"],
+        targets["no_collision"],
+    )
+    endpoint_loss = F.binary_cross_entropy_with_logits(
+        output["endpoint_metric_logits"],
+        targets["endpoint"],
+    )
+    progress_loss = F.binary_cross_entropy_with_logits(
+        output["progress_metric_logits"],
+        targets["progress"],
+    )
+    route_loss = F.binary_cross_entropy_with_logits(
+        output["route_metric_logits"],
+        targets["route"],
+    )
+    return no_collision_loss, endpoint_loss, progress_loss, route_loss
 
 
 def compute_trajectory_errors(
@@ -308,6 +424,9 @@ def run_one_epoch(
         "velocity_loss": 0.0,
         "trajectory_loss": 0.0,
         "no_collision_loss": 0.0,
+        "endpoint_metric_loss": 0.0,
+        "progress_metric_loss": 0.0,
+        "route_metric_loss": 0.0,
         "unsafe_margin_loss": 0.0,
         "path_acc": 0.0,
         "long_path_topk_recall": 0.0,
@@ -395,15 +514,38 @@ def run_one_epoch(
                 positive_topk=args.human_positive_topk,
                 temperature=args.human_temperature,
             )
-            no_collision_target = (~candidate_collision).float()
-            no_collision_loss = F.binary_cross_entropy_with_logits(
-                output["no_collision_logits"],
-                no_collision_target,
+            metric_targets = build_metric_targets(
+                candidate_trajectories=output["candidate_trajectories"],
+                target_trajectory=batch["target_trajectory"],
+                target_mask=batch["target_trajectory_mask"],
+                candidate_collision=candidate_collision,
+                route_path=batch["route_path"],
+                endpoint_scale=getattr(args, "endpoint_metric_scale", 2.0),
+                progress_scale=getattr(args, "progress_metric_scale", 2.0),
+                route_scale=getattr(args, "route_metric_scale", 2.0),
             )
+            (
+                no_collision_loss,
+                endpoint_metric_loss,
+                progress_metric_loss,
+                route_metric_loss,
+            ) = metric_head_loss(output, metric_targets)
             planning_scores = compute_planning_scores(
                 trajectory_scores=output["trajectory_scores"],
                 no_collision_logits=output["no_collision_logits"],
                 collision_penalty=args.collision_penalty,
+                endpoint_metric_logits=output.get("endpoint_metric_logits"),
+                progress_metric_logits=output.get("progress_metric_logits"),
+                route_metric_logits=output.get("route_metric_logits"),
+                endpoint_weight=getattr(args, "metric_endpoint_score_weight", 5.0),
+                progress_weight=getattr(args, "metric_progress_score_weight", 5.0),
+                route_weight=getattr(args, "metric_route_score_weight", 2.0),
+                imitation_weight=getattr(args, "metric_imitation_score_weight", 0.0),
+                no_collision_weight=(
+                    getattr(args, "metric_no_collision_score_weight", -1.0)
+                    if getattr(args, "metric_no_collision_score_weight", -1.0) >= 0.0
+                    else float(args.no_collision_loss_weight > 0.0)
+                ),
             )
             margin_loss = unsafe_margin_loss(
                 planning_scores=planning_scores,
@@ -415,6 +557,11 @@ def run_one_epoch(
                 + trajectory_loss * args.trajectory_loss_weight
                 + velocity_loss * args.velocity_loss_weight
                 + no_collision_loss * args.no_collision_loss_weight
+                + endpoint_metric_loss
+                * getattr(args, "endpoint_metric_loss_weight", 0.0)
+                + progress_metric_loss
+                * getattr(args, "progress_metric_loss_weight", 0.0)
+                + route_metric_loss * getattr(args, "route_metric_loss_weight", 0.0)
                 + margin_loss * args.unsafe_margin_loss_weight
             )
 
@@ -437,9 +584,8 @@ def run_one_epoch(
             best_candidate,
         ]
         target_candidate_match = (
-            (output["candidate_path_indices"] == batch["path_index"][:, None])
-            & (output["candidate_velocity_indices"] == batch["velocity_index"][:, None])
-        )
+            output["candidate_path_indices"] == batch["path_index"][:, None]
+        ) & (output["candidate_velocity_indices"] == batch["velocity_index"][:, None])
         traj_l2, endpoint_l2 = compute_trajectory_errors(
             candidate_trajectories=output["candidate_trajectories"],
             planning_scores=planning_scores,
@@ -460,6 +606,9 @@ def run_one_epoch(
         metric_sums["velocity_loss"] += float(velocity_loss.detach())
         metric_sums["trajectory_loss"] += float(trajectory_loss.detach())
         metric_sums["no_collision_loss"] += float(no_collision_loss.detach())
+        metric_sums["endpoint_metric_loss"] += float(endpoint_metric_loss.detach())
+        metric_sums["progress_metric_loss"] += float(progress_metric_loss.detach())
+        metric_sums["route_metric_loss"] += float(route_metric_loss.detach())
         metric_sums["unsafe_margin_loss"] += float(margin_loss.detach())
         long_path_target = batch["long_path_indices"][:, 0]
         long_path_valid = batch["long_path_valid"].bool()

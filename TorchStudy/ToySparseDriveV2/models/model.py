@@ -196,6 +196,21 @@ class ToySparseDriveV2Model(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
+        self.endpoint_metric_head = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.progress_metric_head = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.route_metric_head = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
 
     def xy_to_sample_grid(self, xy: torch.Tensor) -> torch.Tensor:
         """Convert xy coordinates to grid_sample coordinates.
@@ -252,11 +267,15 @@ class ToySparseDriveV2Model(nn.Module):
         path_vocab: torch.Tensor,
     ) -> torch.Tensor:
         batch_size = scene_map.shape[0]
-        sample_grid = self.xy_to_sample_grid(path_vocab).unsqueeze(0).expand(
-            batch_size,
-            -1,
-            -1,
-            -1,
+        sample_grid = (
+            self.xy_to_sample_grid(path_vocab)
+            .unsqueeze(0)
+            .expand(
+                batch_size,
+                -1,
+                -1,
+                -1,
+            )
         )
 
         sampled_features = F.grid_sample(
@@ -340,8 +359,7 @@ class ToySparseDriveV2Model(nn.Module):
                 end = min(start + path_chunk_size, self.num_path)
                 path_xy_chunk = path_xy[start:end]
                 route_diff = (
-                    path_xy_chunk[None, :, :, None, :]
-                    - route_xy[:, None, None, :, :]
+                    path_xy_chunk[None, :, :, None, :] - route_xy[:, None, None, :, :]
                 )
                 route_l2 = torch.linalg.norm(route_diff, dim=-1)
                 route_l2 = route_l2.masked_fill(
@@ -352,19 +370,19 @@ class ToySparseDriveV2Model(nn.Module):
                     route_l2.min(dim=-1).values.mean(dim=-1, keepdim=True)
                 )
 
-                endpoint_diff = endpoint_xy[start:end][None, :, None, :] - route_xy[:, None, :, :]
+                endpoint_diff = (
+                    endpoint_xy[start:end][None, :, None, :] - route_xy[:, None, :, :]
+                )
                 endpoint_l2 = torch.linalg.norm(endpoint_diff, dim=-1)
                 endpoint_l2 = endpoint_l2.masked_fill(~route_mask[:, None, :], 1.0e6)
-                endpoint_route_chunks.append(endpoint_l2.min(dim=-1, keepdim=True).values)
+                endpoint_route_chunks.append(
+                    endpoint_l2.min(dim=-1, keepdim=True).values
+                )
 
             mean_route_l2 = torch.cat(mean_route_chunks, dim=1)
             endpoint_route_l2 = torch.cat(endpoint_route_chunks, dim=1)
 
-        if (
-            obstacle_centers is None
-            or obstacle_sizes is None
-            or obstacle_mask is None
-        ):
+        if obstacle_centers is None or obstacle_sizes is None or obstacle_mask is None:
             min_clearance = torch.full(
                 (batch_size, self.num_path, 1),
                 10.0,
@@ -378,9 +396,7 @@ class ToySparseDriveV2Model(nn.Module):
             centers = obstacle_centers.to(device=device, dtype=dtype)
             sizes = obstacle_sizes.to(device=device, dtype=dtype)
             mask = obstacle_mask.to(device=device).bool()
-            delta = (
-                path_xy[None, :, :, None, :] - centers[:, None, None, :, :]
-            ).abs()
+            delta = (path_xy[None, :, :, None, :] - centers[:, None, None, :, :]).abs()
             half_size = 0.5 * sizes[:, None, None, :, :]
             outside = (delta - half_size).clamp(min=0.0)
             outside_dist = torch.linalg.norm(outside, dim=-1)
@@ -390,7 +406,9 @@ class ToySparseDriveV2Model(nn.Module):
                 -inside_margin,
                 outside_dist,
             )
-            signed_clearance = signed_clearance.masked_fill(~mask[:, None, None, :], 1.0e6)
+            signed_clearance = signed_clearance.masked_fill(
+                ~mask[:, None, None, :], 1.0e6
+            )
             min_clearance = signed_clearance.amin(dim=-1).amin(dim=-1, keepdim=True)
             collision_flag = (min_clearance < 0.0).to(dtype)
             min_clearance = min_clearance.clamp(min=-5.0, max=20.0)
@@ -411,7 +429,6 @@ class ToySparseDriveV2Model(nn.Module):
             ],
             dim=-1,
         )
-
 
     def score_paths(
         self,
@@ -615,6 +632,13 @@ class ToySparseDriveV2Model(nn.Module):
 
         trajectory_scores = self.trajectory_score_head(trajectory_context).squeeze(-1)
         no_collision_logits = self.no_collision_head(trajectory_context).squeeze(-1)
+        endpoint_metric_logits = self.endpoint_metric_head(trajectory_context).squeeze(
+            -1
+        )
+        progress_metric_logits = self.progress_metric_head(trajectory_context).squeeze(
+            -1
+        )
+        route_metric_logits = self.route_metric_head(trajectory_context).squeeze(-1)
 
         velocity_indices = torch.arange(
             num_velocity,
@@ -634,6 +658,9 @@ class ToySparseDriveV2Model(nn.Module):
         return {
             "trajectory_scores": trajectory_scores,
             "no_collision_logits": no_collision_logits,
+            "endpoint_metric_logits": endpoint_metric_logits,
+            "progress_metric_logits": progress_metric_logits,
+            "route_metric_logits": route_metric_logits,
             "candidate_trajectories": candidate_trajectories,
             "candidate_path_indices": candidate_path_indices.reshape(
                 batch_size,

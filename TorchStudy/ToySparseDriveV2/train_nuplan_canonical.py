@@ -97,6 +97,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--velocity-loss-weight", type=float, default=0.0)
     parser.add_argument("--trajectory-loss-weight", type=float, default=1.0)
     parser.add_argument("--no-collision-loss-weight", type=float, default=1.0)
+    parser.add_argument("--endpoint-metric-loss-weight", type=float, default=1.0)
+    parser.add_argument("--progress-metric-loss-weight", type=float, default=1.0)
+    parser.add_argument("--route-metric-loss-weight", type=float, default=1.0)
+    parser.add_argument("--endpoint-metric-scale", type=float, default=2.0)
+    parser.add_argument("--progress-metric-scale", type=float, default=2.0)
+    parser.add_argument("--route-metric-scale", type=float, default=2.0)
+    parser.add_argument("--metric-endpoint-score-weight", type=float, default=5.0)
+    parser.add_argument("--metric-progress-score-weight", type=float, default=5.0)
+    parser.add_argument("--metric-route-score-weight", type=float, default=2.0)
+    parser.add_argument("--metric-imitation-score-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--metric-no-collision-score-weight",
+        type=float,
+        default=-1.0,
+        help="Weight for no-collision in metric planning score. <0 means auto: enabled only when no-collision loss is trained.",
+    )
     parser.add_argument("--unsafe-margin-loss-weight", type=float, default=0.5)
     parser.add_argument("--human-temperature", type=float, default=2.0)
     parser.add_argument("--human-positive-topk", type=int, default=8)
@@ -340,6 +356,20 @@ def main() -> None:
         f"val_long_topk={args.val_forced_long_path_topk} "
         f"path_recall_target_topk={args.path_recall_target_topk} "
         f"max_route_points={args.max_route_points}",
+        flush=True,
+    )
+    print(
+        "metric heads: "
+        f"loss_w(endpoint/progress/route)="
+        f"{args.endpoint_metric_loss_weight}/"
+        f"{args.progress_metric_loss_weight}/"
+        f"{args.route_metric_loss_weight} "
+        f"score_w(endpoint/progress/route/imitation)="
+        f"{args.metric_endpoint_score_weight}/"
+        f"{args.metric_progress_score_weight}/"
+        f"{args.metric_route_score_weight}/"
+        f"{args.metric_imitation_score_weight} "
+        f"no_col_score_w={args.metric_no_collision_score_weight}",
         flush=True,
     )
     collate_fn = partial(
