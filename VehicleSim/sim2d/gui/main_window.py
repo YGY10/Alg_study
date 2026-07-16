@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import math
 import sys
+from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QFocusEvent,
@@ -12,15 +13,20 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -36,6 +42,15 @@ from sim2d.core import (
 )
 from sim2d.gui.simulation_view import (
     SimulationView,
+)
+from sim2d.map import (
+    RoadNetwork,
+    load_opendrive_road_network,
+)
+from sim2d.map.route import (
+    LaneRoute,
+    NoRouteError,
+    build_lane_route,
 )
 from sim2d.planning import (
     BezierPlanner,
@@ -54,11 +69,22 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
 
+        self.settings = QSettings(
+            "VehicleSim",
+            "VehicleSim2D",
+        )
+
         self.setWindowTitle("VehicleSim 2D")
 
         self.resize(
             1400,
             850,
+        )
+
+        # 允许窗口自由缩小；左侧内容不足时由滚动区域承载。
+        self.setMinimumSize(
+            820,
+            560,
         )
 
         self.vehicle_config = VehicleConfig(
@@ -131,13 +157,44 @@ class MainWindow(QMainWindow):
 
         self.running = False
 
+        self.current_map_path: Path | None = None
+        self.road_network: RoadNetwork | None = None
+        self.current_lane_route: LaneRoute | None = None
+        self.map_sample_step = 0.5
+
+        # 场景起点/终点编辑状态。
+        #
+        # selection_mode:
+        #     None    浏览模式
+        #     "start" 选择起点
+        #     "goal"  选择终点
+        self.selection_mode: str | None = None
+
+        self.selected_initial_state = VehicleState(
+            x=0.0,
+            y=0.0,
+            yaw=0.0,
+            speed=2.0,
+        )
+
+        self.selected_goal_state = self.goal.state
+
         self._build_ui()
         self._create_actions()
+
+        self.simulation_view.world_mouse_moved.connect(self._on_world_mouse_moved)
+
+        self.simulation_view.world_pose_selected.connect(self._on_world_pose_selected)
+
+        self.simulation_view.lane_projection_changed.connect(
+            self._on_lane_projection_changed
+        )
+
         self.reset_environment()
 
         QTimer.singleShot(
             0,
-            self.simulation_view.fit_world,
+            self._restore_last_opendrive_map,
         )
 
     def _build_ui(
@@ -147,9 +204,10 @@ class MainWindow(QMainWindow):
 
         control_panel = QWidget()
 
-        control_panel.setMinimumWidth(280)
-
-        control_panel.setMaximumWidth(390)
+        control_panel.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Maximum,
+        )
 
         control_layout = QVBoxLayout(control_panel)
 
@@ -308,6 +366,86 @@ class MainWindow(QMainWindow):
 
         control_layout.addWidget(simulation_group)
 
+        scenario_group = QGroupBox("场景起点 / 终点")
+
+        scenario_layout = QVBoxLayout(scenario_group)
+
+        selection_buttons = QHBoxLayout()
+
+        self.select_start_button = QPushButton("选择起点")
+        self.select_goal_button = QPushButton("选择终点")
+        self.cancel_selection_button = QPushButton("取消选择")
+
+        selection_buttons.addWidget(self.select_start_button)
+        selection_buttons.addWidget(self.select_goal_button)
+        selection_buttons.addWidget(self.cancel_selection_button)
+
+        scenario_layout.addLayout(selection_buttons)
+
+        self.select_start_button.clicked.connect(self.begin_start_selection)
+
+        self.select_goal_button.clicked.connect(self.begin_goal_selection)
+
+        self.cancel_selection_button.clicked.connect(self.cancel_point_selection)
+
+        self.snap_to_lane_check = QCheckBox("吸附到可行驶车道")
+        self.snap_to_lane_check.setChecked(True)
+        self.snap_to_lane_check.toggled.connect(self._on_lane_snap_changed)
+
+        self.snap_distance_spin = QDoubleSpinBox()
+        self.snap_distance_spin.setRange(0.0, 100.0)
+        self.snap_distance_spin.setDecimals(2)
+        self.snap_distance_spin.setSingleStep(0.25)
+        self.snap_distance_spin.setValue(3.0)
+        self.snap_distance_spin.setSuffix(" m")
+        self.snap_distance_spin.valueChanged.connect(
+            self._on_lane_snap_distance_changed
+        )
+
+        scenario_form = QFormLayout()
+
+        scenario_form.addRow(self.snap_to_lane_check)
+
+        scenario_form.addRow(
+            "吸附半径",
+            self.snap_distance_spin,
+        )
+
+        self.start_x_spin = self._create_coordinate_spin()
+        self.start_y_spin = self._create_coordinate_spin()
+        self.start_yaw_spin = self._create_yaw_spin()
+        self.start_speed_spin = self._create_speed_spin(2.0)
+
+        self.goal_x_spin = self._create_coordinate_spin()
+        self.goal_y_spin = self._create_coordinate_spin()
+        self.goal_yaw_spin = self._create_yaw_spin()
+        self.goal_speed_spin = self._create_speed_spin(1.0)
+
+        scenario_form.addRow("起点 x", self.start_x_spin)
+        scenario_form.addRow("起点 y", self.start_y_spin)
+        scenario_form.addRow("起点 yaw", self.start_yaw_spin)
+        scenario_form.addRow("起点 speed", self.start_speed_spin)
+
+        scenario_form.addRow("终点 x", self.goal_x_spin)
+        scenario_form.addRow("终点 y", self.goal_y_spin)
+        scenario_form.addRow("终点 yaw", self.goal_yaw_spin)
+        scenario_form.addRow("终点 speed", self.goal_speed_spin)
+
+        scenario_layout.addLayout(scenario_form)
+
+        self.apply_scenario_button = QPushButton("应用起点和终点")
+
+        self.apply_scenario_button.clicked.connect(self.apply_scenario_from_inputs)
+
+        scenario_layout.addWidget(self.apply_scenario_button)
+
+        self.selection_status_label = QLabel("当前：浏览模式")
+        self.selection_status_label.setWordWrap(True)
+
+        scenario_layout.addWidget(self.selection_status_label)
+
+        control_layout.addWidget(scenario_group)
+
         status_group = QGroupBox("车辆状态")
 
         status_form = QFormLayout(status_group)
@@ -373,6 +511,33 @@ class MainWindow(QMainWindow):
         view_group = QGroupBox("视图")
 
         view_layout = QVBoxLayout(view_group)
+
+        self.load_map_button = QPushButton("加载 OpenDRIVE 地图")
+
+        self.load_map_button.clicked.connect(self.select_opendrive_map)
+
+        view_layout.addWidget(self.load_map_button)
+
+        self.map_name_label = QLabel("当前地图：默认道路")
+
+        self.map_name_label.setWordWrap(True)
+
+        view_layout.addWidget(self.map_name_label)
+
+        self.show_lane_boundaries_check = QCheckBox("显示全部车道边界（调试）")
+        self.show_lane_boundaries_check.setChecked(False)
+        self.show_lane_boundaries_check.toggled.connect(
+            self._on_show_lane_boundaries_changed
+        )
+
+        self.show_lane_centerlines_check = QCheckBox("显示车道中心线（调试）")
+        self.show_lane_centerlines_check.setChecked(False)
+        self.show_lane_centerlines_check.toggled.connect(
+            self._on_show_lane_centerlines_changed
+        )
+
+        view_layout.addWidget(self.show_lane_boundaries_check)
+        view_layout.addWidget(self.show_lane_centerlines_check)
 
         fit_button = QPushButton("适配整个场景")
 
@@ -444,13 +609,35 @@ class MainWindow(QMainWindow):
             ]
         )
 
-        root_splitter.addWidget(control_panel)
+        control_scroll = QScrollArea()
 
+        control_scroll.setWidgetResizable(True)
+        control_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        control_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        control_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        control_scroll.setMinimumWidth(270)
+        control_scroll.setWidget(control_panel)
+
+        root_splitter.addWidget(control_scroll)
         root_splitter.addWidget(right_splitter)
+
+        root_splitter.setStretchFactor(
+            0,
+            0,
+        )
 
         root_splitter.setStretchFactor(
             1,
             1,
+        )
+
+        root_splitter.setSizes(
+            [
+                360,
+                1040,
+            ]
         )
 
         central = QWidget()
@@ -468,8 +655,285 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
 
+        self._sync_scenario_inputs_from_states()
         self._update_keyboard_input_display()
         self._update_control_mode_ui()
+
+    def _create_coordinate_spin(
+        self,
+    ) -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+
+        spin.setRange(
+            -1_000_000.0,
+            1_000_000.0,
+        )
+
+        spin.setDecimals(3)
+        spin.setSingleStep(0.25)
+        spin.setSuffix(" m")
+
+        return spin
+
+    def _create_yaw_spin(
+        self,
+    ) -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+
+        spin.setRange(
+            -360.0,
+            360.0,
+        )
+
+        spin.setDecimals(2)
+        spin.setSingleStep(5.0)
+        spin.setSuffix("°")
+
+        return spin
+
+    def _create_speed_spin(
+        self,
+        value: float,
+    ) -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+
+        spin.setRange(
+            self.vehicle_config.speed_min,
+            self.vehicle_config.speed_max,
+        )
+
+        spin.setDecimals(2)
+        spin.setSingleStep(0.25)
+        spin.setSuffix(" m/s")
+        spin.setValue(value)
+
+        return spin
+
+    def _sync_scenario_inputs_from_states(
+        self,
+    ) -> None:
+        start = self.selected_initial_state
+        goal = self.selected_goal_state
+
+        self.start_x_spin.setValue(start.x)
+        self.start_y_spin.setValue(start.y)
+        self.start_yaw_spin.setValue(math.degrees(start.yaw))
+        self.start_speed_spin.setValue(start.speed)
+
+        self.goal_x_spin.setValue(goal.x)
+        self.goal_y_spin.setValue(goal.y)
+        self.goal_yaw_spin.setValue(math.degrees(goal.yaw))
+        self.goal_speed_spin.setValue(goal.speed)
+
+    def begin_start_selection(
+        self,
+    ) -> None:
+        self._begin_point_selection("start")
+
+    def begin_goal_selection(
+        self,
+    ) -> None:
+        self._begin_point_selection("goal")
+
+    def _begin_point_selection(
+        self,
+        mode: str,
+    ) -> None:
+        if mode not in {
+            "start",
+            "goal",
+        }:
+            raise ValueError(f"Unsupported selection mode: {mode!r}")
+
+        self.pause_simulation()
+
+        self.selection_mode = mode
+
+        self.simulation_view.set_lane_snapping(
+            enabled=self.snap_to_lane_check.isChecked(),
+            max_distance=self.snap_distance_spin.value(),
+        )
+
+        if mode == "start":
+            default_yaw = math.radians(self.start_yaw_spin.value())
+        else:
+            default_yaw = math.radians(self.goal_yaw_spin.value())
+
+        self.simulation_view.set_selection_default_yaw(default_yaw)
+
+        self.simulation_view.set_selection_enabled(True)
+
+        if mode == "start":
+            description = "选择起点"
+        else:
+            description = "选择终点"
+
+        self.selection_status_label.setText(
+            f"当前：{description}。左键按下确定位置，拖动确定方向，松开确认；速度使用数值框"
+        )
+
+        self.append_log(
+            f"POINT_SELECTION_BEGIN mode={mode} "
+            f"snap={self.snap_to_lane_check.isChecked()} "
+            f"radius={self.snap_distance_spin.value():.2f}"
+        )
+
+    def cancel_point_selection(
+        self,
+    ) -> None:
+        previous_mode = self.selection_mode
+
+        self.selection_mode = None
+
+        self.simulation_view.set_selection_enabled(False)
+
+        self.selection_status_label.setText("当前：浏览模式")
+
+        if previous_mode is not None:
+            self.append_log(f"POINT_SELECTION_CANCEL mode={previous_mode}")
+
+    def _on_lane_snap_changed(
+        self,
+        enabled: bool,
+    ) -> None:
+        self.snap_distance_spin.setEnabled(enabled)
+
+        self.simulation_view.set_lane_snapping(
+            enabled=enabled,
+            max_distance=self.snap_distance_spin.value(),
+        )
+
+    def _on_lane_snap_distance_changed(
+        self,
+        value: float,
+    ) -> None:
+        self.simulation_view.set_lane_snapping(
+            enabled=self.snap_to_lane_check.isChecked(),
+            max_distance=value,
+        )
+
+    def _on_world_mouse_moved(
+        self,
+        x: float,
+        y: float,
+    ) -> None:
+        if self.selection_mode is None:
+            self.statusBar().showMessage(f"mouse=({x:.3f}, {y:.3f})")
+
+    def _on_lane_projection_changed(
+        self,
+        projection,
+    ) -> None:
+        if self.selection_mode is None:
+            return
+
+        if not self.snap_to_lane_check.isChecked():
+            return
+
+        if projection is None:
+            self.statusBar().showMessage("附近没有满足吸附半径的可行驶车道")
+
+            return
+
+        self.statusBar().showMessage(
+            f"lane={projection.lane_id} "
+            f"point=({projection.point[0]:.3f}, "
+            f"{projection.point[1]:.3f}) "
+            f"yaw={math.degrees(projection.yaw):.2f}° "
+            f"distance={projection.distance:.3f} m"
+        )
+
+    def _on_world_pose_selected(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+    ) -> None:
+        if self.selection_mode is None:
+            return
+
+        selected_x = float(x)
+        selected_y = float(y)
+        selected_yaw = float(yaw)
+
+        if self.selection_mode == "start":
+            self.selected_initial_state = VehicleState(
+                x=selected_x,
+                y=selected_y,
+                yaw=selected_yaw,
+                speed=self.start_speed_spin.value(),
+            )
+
+            description = "START_SELECTED"
+            selected_speed = self.start_speed_spin.value()
+
+        elif self.selection_mode == "goal":
+            self.selected_goal_state = VehicleState(
+                x=selected_x,
+                y=selected_y,
+                yaw=selected_yaw,
+                speed=self.goal_speed_spin.value(),
+            )
+
+            description = "GOAL_SELECTED"
+            selected_speed = self.goal_speed_spin.value()
+
+        else:
+            raise RuntimeError("Invalid point selection mode")
+
+        lane_id = None
+
+        if self.simulation_view.last_lane_projection is not None:
+            lane_id = self.simulation_view.last_lane_projection.lane_id
+
+        self._sync_scenario_inputs_from_states()
+
+        self.append_log(
+            f"{description} "
+            f"x={selected_x:.3f} "
+            f"y={selected_y:.3f} "
+            f"yaw={selected_yaw:.3f} "
+            f"speed={selected_speed:.3f} "
+            f"lane={lane_id}"
+        )
+
+        self.cancel_point_selection()
+
+    def apply_scenario_from_inputs(
+        self,
+    ) -> None:
+        self.selected_initial_state = VehicleState(
+            x=self.start_x_spin.value(),
+            y=self.start_y_spin.value(),
+            yaw=math.radians(self.start_yaw_spin.value()),
+            speed=self.start_speed_spin.value(),
+        )
+
+        self.selected_goal_state = VehicleState(
+            x=self.goal_x_spin.value(),
+            y=self.goal_y_spin.value(),
+            yaw=math.radians(self.goal_yaw_spin.value()),
+            speed=self.goal_speed_spin.value(),
+        )
+
+        self.goal = GoalState(
+            state=self.selected_goal_state,
+            position_tolerance=(self.goal.position_tolerance),
+            yaw_tolerance=(self.goal.yaw_tolerance),
+            speed_tolerance=(self.goal.speed_tolerance),
+        )
+
+        self.reset_environment()
+
+        self.append_log(
+            "SCENARIO_APPLIED "
+            f"start=({self.selected_initial_state.x:.3f}, "
+            f"{self.selected_initial_state.y:.3f}, "
+            f"{self.selected_initial_state.yaw:.3f}) "
+            f"goal=({self.selected_goal_state.x:.3f}, "
+            f"{self.selected_goal_state.y:.3f}, "
+            f"{self.selected_goal_state.yaw:.3f})"
+        )
 
     def _create_actions(
         self,
@@ -517,6 +981,284 @@ class MainWindow(QMainWindow):
         fit_action.triggered.connect(self.simulation_view.fit_world)
 
         self.addAction(fit_action)
+
+        load_map_action = QAction(
+            "加载 OpenDRIVE 地图",
+            self,
+        )
+
+        load_map_action.setShortcut("Ctrl+O")
+
+        load_map_action.triggered.connect(self.select_opendrive_map)
+
+        self.addAction(load_map_action)
+
+        toggle_lane_boundaries_action = QAction(
+            "切换全部车道边界",
+            self,
+        )
+
+        toggle_lane_boundaries_action.setShortcut("Ctrl+B")
+
+        toggle_lane_boundaries_action.triggered.connect(
+            self.show_lane_boundaries_check.toggle
+        )
+
+        self.addAction(toggle_lane_boundaries_action)
+
+        toggle_lane_centerlines_action = QAction(
+            "切换车道中心线",
+            self,
+        )
+
+        toggle_lane_centerlines_action.setShortcut("Ctrl+L")
+
+        toggle_lane_centerlines_action.triggered.connect(
+            self.show_lane_centerlines_check.toggle
+        )
+
+        self.addAction(toggle_lane_centerlines_action)
+
+        select_start_action = QAction(
+            "选择起点",
+            self,
+        )
+
+        select_start_action.setShortcut("Ctrl+1")
+
+        select_start_action.triggered.connect(self.begin_start_selection)
+
+        self.addAction(select_start_action)
+
+        select_goal_action = QAction(
+            "选择终点",
+            self,
+        )
+
+        select_goal_action.setShortcut("Ctrl+2")
+
+        select_goal_action.triggered.connect(self.begin_goal_selection)
+
+        self.addAction(select_goal_action)
+
+    def _on_show_lane_boundaries_changed(
+        self,
+        enabled: bool,
+    ) -> None:
+        """
+        切换全部 lane 左右边界调试层。
+        """
+        self.simulation_view.set_show_lane_boundaries(enabled)
+
+        self.append_log("MAP_DEBUG_BOUNDARIES " f"enabled={bool(enabled)}")
+
+    def _on_show_lane_centerlines_changed(
+        self,
+        enabled: bool,
+    ) -> None:
+        """
+        切换 lane centerline 调试层。
+        """
+        self.simulation_view.set_show_lane_centerlines(enabled)
+
+        self.append_log("MAP_DEBUG_CENTERLINES " f"enabled={bool(enabled)}")
+
+    def _restore_last_opendrive_map(
+        self,
+    ) -> None:
+        """
+        启动后恢复上一次成功加载的 OpenDRIVE 地图。
+
+        恢复失败采用软失败策略：
+            只写日志；
+            不弹出错误对话框；
+            不阻止 GUI 启动；
+            保留默认道路。
+        """
+        saved_path = self.settings.value(
+            "map/last_successful_opendrive_path",
+            "",
+            type=str,
+        )
+
+        if not saved_path:
+            self.append_log("MAP_RESTORE_SKIPPED " "reason=no_saved_path")
+            self.simulation_view.fit_world()
+            return
+
+        map_path = Path(saved_path).expanduser()
+
+        if not map_path.is_file():
+            self.append_log(
+                "MAP_RESTORE_SKIPPED " f"path={map_path} " "reason=file_not_found"
+            )
+            self.simulation_view.fit_world()
+            return
+
+        restored = self.load_opendrive_map(
+            map_path,
+            show_error_dialog=False,
+            remember_on_success=False,
+            load_reason="restore",
+        )
+
+        if not restored:
+            self.simulation_view.fit_world()
+
+    def select_opendrive_map(
+        self,
+    ) -> None:
+        """弹出文件选择框并加载 OpenDRIVE 地图。"""
+        self.pause_simulation()
+        self.cancel_point_selection()
+
+        saved_directory = self.settings.value(
+            "map/last_directory",
+            "",
+            type=str,
+        )
+
+        if saved_directory and Path(saved_directory).expanduser().is_dir():
+            initial_directory = str(Path(saved_directory).expanduser().resolve())
+        elif self.current_map_path is not None:
+            initial_directory = str(self.current_map_path.parent)
+        else:
+            initial_directory = str(Path.cwd())
+
+        file_name, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 OpenDRIVE 地图",
+            initial_directory,
+            ("OpenDRIVE 地图 (*.xodr);;" "XML 文件 (*.xml);;" "所有文件 (*)"),
+        )
+
+        if not file_name:
+            return
+
+        self.load_opendrive_map(
+            Path(file_name),
+            show_error_dialog=True,
+            remember_on_success=True,
+            load_reason="manual",
+        )
+
+    def load_opendrive_map(
+        self,
+        path: Path,
+        *,
+        show_error_dialog: bool = True,
+        remember_on_success: bool = True,
+        load_reason: str = "manual",
+    ) -> bool:
+        """
+        读取、转换并显示一个 OpenDRIVE 地图。
+
+        返回：
+            True：
+                地图成功加载并完成显示。
+
+            False：
+                文件不存在、解析失败或渲染失败。
+
+        remember_on_success：
+            仅成功加载后记录为“最后成功地图”。
+
+        show_error_dialog：
+            手动加载时通常为 True；
+            启动自动恢复时应为 False。
+        """
+        map_path = Path(path).expanduser().resolve()
+
+        if not map_path.is_file():
+            error_message = "OpenDRIVE map file does not exist"
+
+            self.append_log(
+                "MAP_LOAD_FAILED "
+                f"reason={load_reason} "
+                f"path={map_path} "
+                f"error=FileNotFoundError: "
+                f"{error_message}"
+            )
+
+            if show_error_dialog:
+                QMessageBox.critical(
+                    self,
+                    "地图加载失败",
+                    ("OpenDRIVE 地图文件不存在：\n" f"{map_path}"),
+                )
+
+            return False
+
+        try:
+            road_network = load_opendrive_road_network(
+                map_path,
+                sample_step=self.map_sample_step,
+            )
+
+            self.simulation_view.render_road_network(road_network)
+
+        except Exception as error:
+            self.append_log(
+                "MAP_LOAD_FAILED "
+                f"reason={load_reason} "
+                f"path={map_path} "
+                f"error={type(error).__name__}: "
+                f"{error}"
+            )
+
+            if show_error_dialog:
+                QMessageBox.critical(
+                    self,
+                    "地图加载失败",
+                    (
+                        "无法加载 OpenDRIVE 地图：\n"
+                        f"{map_path}\n\n"
+                        f"{type(error).__name__}: "
+                        f"{error}"
+                    ),
+                )
+
+            return False
+
+        self.current_map_path = map_path
+        self.road_network = road_network
+
+        self.map_name_label.setText(f"当前地图：{map_path.name}")
+
+        self.cancel_point_selection()
+
+        # 新地图加载后，立即用当前起终点重新配置地图参考路径。
+        self.reset_environment()
+        self.simulation_view.fit_world()
+
+        if remember_on_success:
+            self.settings.setValue(
+                "map/last_successful_opendrive_path",
+                str(map_path),
+            )
+            self.settings.setValue(
+                "map/last_directory",
+                str(map_path.parent),
+            )
+            self.settings.sync()
+
+        topology_edge_count = int(
+            road_network.metadata.get(
+                "intra_road_topology_edge_count",
+                0,
+            )
+        )
+
+        self.append_log(
+            "MAP_LOADED "
+            f"reason={load_reason} "
+            f"path={map_path} "
+            f"lanes={road_network.lane_count} "
+            f"topology_edges={topology_edge_count} "
+            f"sample_step={self.map_sample_step:.3f}"
+        )
+
+        return True
 
     def current_control_mode(
         self,
@@ -603,10 +1345,16 @@ class MainWindow(QMainWindow):
                 "Space：运行/暂停\n"
                 "N：单步执行\n"
                 "R：复位\n"
-                "F：适配视图\n\n"
+                "F：适配视图\n"
+                "Ctrl+O：加载地图\n"
+                "Ctrl+B：切换全部车道边界\n"
+                "Ctrl+L：切换车道中心线\n"
+                "Ctrl+1：选择起点\n"
+                "Ctrl+2：选择终点\n\n"
                 "当前为自动规划模式。\n"
-                "控制量由 BezierPlanner "
-                "根据 Bézier 参考路径计算。"
+                "lane graph 路线可用时，"
+                "优先跟踪地图 reference path；\n"
+                "否则回退到 Bézier 参考路径。"
             )
 
         elif manual_input_mode == "keyboard":
@@ -615,7 +1363,12 @@ class MainWindow(QMainWindow):
                 "Space：运行/暂停\n"
                 "N：单步执行\n"
                 "R：复位\n"
-                "F：适配视图\n\n"
+                "F：适配视图\n"
+                "Ctrl+O：加载地图\n"
+                "Ctrl+B：切换全部车道边界\n"
+                "Ctrl+L：切换车道中心线\n"
+                "Ctrl+1：选择起点\n"
+                "Ctrl+2：选择终点\n\n"
                 "当前为键盘驾驶模式：\n"
                 "W / ↑：油门\n"
                 "S / ↓：制动\n"
@@ -633,7 +1386,12 @@ class MainWindow(QMainWindow):
                 "Space：运行/暂停\n"
                 "N：单步执行\n"
                 "R：复位\n"
-                "F：适配视图\n\n"
+                "F：适配视图\n"
+                "Ctrl+O：加载地图\n"
+                "Ctrl+B：切换全部车道边界\n"
+                "Ctrl+L：切换车道中心线\n"
+                "Ctrl+1：选择起点\n"
+                "Ctrl+2：选择终点\n\n"
                 "当前为精确输入模式。\n"
                 "直接填写加速度和"
                 "前轮转角。"
@@ -749,6 +1507,92 @@ class MainWindow(QMainWindow):
 
         super().focusOutEvent(event)
 
+    def _configure_planner_reference_path(
+        self,
+    ) -> None:
+        """
+        根据当前地图和场景起终点配置规划器参考路径。
+
+        成功：
+            在 RoadNetwork lane graph 上生成有向路线；
+            起点和终点 yaw 自动采用各自车道投影航向。
+
+        失败：
+            清除外部路径并回退到原 Bézier 路径。
+
+        当前可达范围取决于 RoadNetwork 中已有的 successor_ids。
+        现阶段已经支持同一 road 内跨 laneSection；
+        后续补齐跨 road 和 junction 拓扑后，本函数无需改动。
+        """
+        self.current_lane_route = None
+
+        if self.road_network is None:
+            self.planner.clear_external_reference_path()
+
+            self.append_log("MAP_ROUTE_FALLBACK " "reason=no_road_network")
+            return
+
+        try:
+            route = build_lane_route(
+                self.road_network,
+                start_x=self.selected_initial_state.x,
+                start_y=self.selected_initial_state.y,
+                goal_x=self.selected_goal_state.x,
+                goal_y=self.selected_goal_state.y,
+                snap_distance=self.snap_distance_spin.value(),
+            )
+
+        except NoRouteError as error:
+            self.planner.clear_external_reference_path()
+
+            self.append_log(
+                "MAP_ROUTE_FALLBACK " f"reason={error.reason} " f"error={error}"
+            )
+            return
+
+        except Exception as error:
+            self.planner.clear_external_reference_path()
+
+            self.append_log(
+                "MAP_ROUTE_FALLBACK "
+                "reason=unexpected_error "
+                f"error={type(error).__name__}: {error}"
+            )
+            return
+
+        self.current_lane_route = route
+
+        # 地图路线成功时，采用车道投影航向。
+        # 位置仍保留用户输入值；参考路径本身从精确投影点开始。
+        self.selected_initial_state = VehicleState(
+            x=self.selected_initial_state.x,
+            y=self.selected_initial_state.y,
+            yaw=route.start_projection.yaw,
+            speed=self.selected_initial_state.speed,
+        )
+
+        self.selected_goal_state = VehicleState(
+            x=self.selected_goal_state.x,
+            y=self.selected_goal_state.y,
+            yaw=route.goal_projection.yaw,
+            speed=self.selected_goal_state.speed,
+        )
+
+        self._sync_scenario_inputs_from_states()
+
+        self.planner.set_reference_path(route.reference_path)
+
+        self.append_log(
+            "MAP_ROUTE_READY "
+            f"lanes={route.lane_ids} "
+            f"points={route.reference_path.shape[0]} "
+            f"length={route.reference_path[-1, 3]:.3f} "
+            f"start_s={route.start_projection.arc_length:.3f} "
+            f"goal_s={route.goal_projection.arc_length:.3f} "
+            f"start_yaw={route.start_projection.yaw:.3f} "
+            f"goal_yaw={route.goal_projection.yaw:.3f}"
+        )
+
     def reset_environment(
         self,
     ) -> None:
@@ -758,16 +1602,24 @@ class MainWindow(QMainWindow):
         self.keyboard_control.reset()
 
         self.acceleration_spin.setValue(0.0)
-
         self.steering_spin.setValue(0.0)
 
         self._update_keyboard_input_display()
+        self.cancel_point_selection()
 
-        initial_state = VehicleState(
-            x=0.0,
-            y=0.0,
-            yaw=0.0,
-            speed=2.0,
+        # planner.reset() 会清除外部路径，因此每次环境复位时
+        # 都要重新构造地图参考路径。
+        #
+        # 路线成功时，该函数还会把起终点 yaw 同步为车道航向。
+        self._configure_planner_reference_path()
+
+        initial_state = self.selected_initial_state
+
+        self.goal = GoalState(
+            state=self.selected_goal_state,
+            position_tolerance=self.goal.position_tolerance,
+            yaw_tolerance=self.goal.yaw_tolerance,
+            speed_tolerance=self.goal.speed_tolerance,
         )
 
         obstacles = (
@@ -793,6 +1645,22 @@ class MainWindow(QMainWindow):
             obstacles=obstacles,
         )
 
+        # 地图路线无需等待第一帧 plan()，场景应用或复位后立即显示。
+        if self.current_lane_route is not None:
+            self.env.set_planner_debug(
+                planned_trajectory=None,
+                reference_path=(self.current_lane_route.reference_path),
+                debug={
+                    "planner": "BezierPlanner",
+                    "status": "map_route_ready",
+                    "reference_path_source": "external",
+                    "route_lane_ids": (self.current_lane_route.lane_ids),
+                    "reference_path_points": (
+                        self.current_lane_route.reference_path.shape[0]
+                    ),
+                },
+            )
+
         snapshot = self.env.get_snapshot()
 
         self.simulation_view.render_snapshot(
@@ -802,13 +1670,14 @@ class MainWindow(QMainWindow):
 
         self._update_status(snapshot)
 
+        route_source = "external" if self.current_lane_route is not None else "bezier"
+
         self.append_log(
             "RESET "
             f"mode={self.current_control_mode()} "
-            f"dt="
-            f"{self.environment_config.dt:.3f}s "
-            f"max_time="
-            f"{self.environment_config.max_time:.1f}s"
+            f"reference={route_source} "
+            f"dt={self.environment_config.dt:.3f}s "
+            f"max_time={self.environment_config.max_time:.1f}s"
         )
 
     def current_control(
@@ -915,8 +1784,46 @@ class MainWindow(QMainWindow):
 
         self._update_status(snapshot)
 
+        reference_source = "none"
+        cross_track_error = math.nan
+        nearest_index = -1
+        target_index = -1
+
+        if control_mode == "auto":
+            reference_source = str(
+                plan_result.debug.get(
+                    "reference_path_source",
+                    "unknown",
+                )
+            )
+
+            cross_track_error = float(
+                plan_result.debug.get(
+                    "cross_track_error",
+                    math.nan,
+                )
+            )
+
+            nearest_index = int(
+                plan_result.debug.get(
+                    "nearest_index",
+                    -1,
+                )
+            )
+
+            target_index = int(
+                plan_result.debug.get(
+                    "target_index",
+                    -1,
+                )
+            )
+
         self.append_log(
             f"step mode={mode_description} "
+            f"reference={reference_source} "
+            f"cte={cross_track_error:.3f} "
+            f"nearest={nearest_index} "
+            f"target={target_index} "
             f"control=("
             f"a={control.acceleration:.2f}, "
             f"delta={control.steering:.3f}) "

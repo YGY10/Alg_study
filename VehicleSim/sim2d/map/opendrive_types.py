@@ -21,6 +21,20 @@ class OpenDriveLaneSide(str, Enum):
     RIGHT = "right"
 
 
+class OpenDriveElementType(str, Enum):
+    """road link 指向的 OpenDRIVE 元素类型。"""
+
+    ROAD = "road"
+    JUNCTION = "junction"
+
+
+class OpenDriveContactPoint(str, Enum):
+    """道路连接发生在目标 road 的哪一端。"""
+
+    START = "start"
+    END = "end"
+
+
 @dataclass(frozen=True)
 class OpenDriveLineGeometry:
     """
@@ -414,6 +428,134 @@ class OpenDriveLaneSection:
 
 
 @dataclass(frozen=True)
+class OpenDriveRoadLink:
+    """
+    road/link 下的 predecessor 或 successor。
+
+    element_type:
+        目标元素是 road 还是 junction。
+
+    element_id:
+        目标 road 或 junction ID。
+
+    contact_point:
+        当 element_type == ROAD 时，表示连接到目标 road
+        的 start 或 end。
+
+        junction link 通常没有 contactPoint，因此可为 None。
+    """
+
+    element_type: OpenDriveElementType
+    element_id: str
+    contact_point: OpenDriveContactPoint | None = None
+
+    def __post_init__(self) -> None:
+        if not self.element_id.strip():
+            raise ValueError("OpenDriveRoadLink.element_id cannot be empty")
+
+        if (
+            self.element_type is OpenDriveElementType.ROAD
+            and self.contact_point is None
+        ):
+            raise ValueError("Road link targeting a road requires contact_point")
+
+
+@dataclass(frozen=True)
+class OpenDriveJunctionLaneLink:
+    """
+    junction/connection/laneLink。
+
+    from_lane_id:
+        incomingRoad 边界处的 lane ID。
+
+    to_lane_id:
+        connectingRoad 接触端的 lane ID。
+    """
+
+    from_lane_id: int
+    to_lane_id: int
+
+    def __post_init__(self) -> None:
+        if self.from_lane_id == 0:
+            raise ValueError("Junction laneLink from_lane_id cannot be zero")
+
+        if self.to_lane_id == 0:
+            raise ValueError("Junction laneLink to_lane_id cannot be zero")
+
+
+@dataclass(frozen=True)
+class OpenDriveJunctionConnection:
+    """
+    junction 中的一条 connection。
+    """
+
+    connection_id: str
+    incoming_road_id: str
+    connecting_road_id: str
+    contact_point: OpenDriveContactPoint
+
+    lane_links: tuple[OpenDriveJunctionLaneLink, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.connection_id.strip():
+            raise ValueError(
+                "OpenDriveJunctionConnection.connection_id cannot be empty"
+            )
+
+        if not self.incoming_road_id.strip():
+            raise ValueError("incoming_road_id cannot be empty")
+
+        if not self.connecting_road_id.strip():
+            raise ValueError("connecting_road_id cannot be empty")
+
+        if not isinstance(self.lane_links, tuple):
+            object.__setattr__(
+                self,
+                "lane_links",
+                tuple(self.lane_links),
+            )
+
+        pairs = [
+            (
+                lane_link.from_lane_id,
+                lane_link.to_lane_id,
+            )
+            for lane_link in self.lane_links
+        ]
+
+        if len(pairs) != len(set(pairs)):
+            raise ValueError("OpenDriveJunctionConnection contains duplicate laneLinks")
+
+
+@dataclass(frozen=True)
+class OpenDriveJunction:
+    """
+    OpenDRIVE junction。
+    """
+
+    junction_id: str
+    connections: tuple[OpenDriveJunctionConnection, ...]
+
+    name: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.junction_id.strip():
+            raise ValueError("OpenDriveJunction.junction_id cannot be empty")
+
+        if not isinstance(self.connections, tuple):
+            object.__setattr__(
+                self,
+                "connections",
+                tuple(self.connections),
+            )
+
+        connection_ids = [connection.connection_id for connection in self.connections]
+
+        if len(connection_ids) != len(set(connection_ids)):
+            raise ValueError("OpenDriveJunction contains duplicate connection IDs")
+
+
+@dataclass(frozen=True)
 class OpenDriveRoad:
     """
     一条 OpenDRIVE road 的最小内部表示。
@@ -427,6 +569,9 @@ class OpenDriveRoad:
 
     name: str | None = None
     junction_id: str | None = None
+
+    predecessor: OpenDriveRoadLink | None = None
+    successor: OpenDriveRoadLink | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(
@@ -490,3 +635,61 @@ class OpenDriveRoad:
         for section in self.lane_sections:
             if section.s > self.length:
                 raise ValueError("OpenDriveLaneSection starts beyond " "road length")
+
+
+@dataclass(frozen=True)
+class OpenDriveMap:
+    """
+    一个完整 OpenDRIVE 文档。
+
+    保留 roads 与 junctions，供 converter 建立完整 lane graph。
+    """
+
+    roads: tuple[OpenDriveRoad, ...]
+    junctions: tuple[OpenDriveJunction, ...] = ()
+
+    source_name: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.roads, tuple):
+            object.__setattr__(
+                self,
+                "roads",
+                tuple(self.roads),
+            )
+
+        if not isinstance(self.junctions, tuple):
+            object.__setattr__(
+                self,
+                "junctions",
+                tuple(self.junctions),
+            )
+
+        if not self.roads:
+            raise ValueError("OpenDriveMap must contain at least one road")
+
+        road_ids = [road.road_id for road in self.roads]
+
+        if len(road_ids) != len(set(road_ids)):
+            raise ValueError("OpenDriveMap contains duplicate road IDs")
+
+        junction_ids = [junction.junction_id for junction in self.junctions]
+
+        if len(junction_ids) != len(set(junction_ids)):
+            raise ValueError("OpenDriveMap contains duplicate junction IDs")
+
+        road_id_set = set(road_ids)
+
+        for junction in self.junctions:
+            for connection in junction.connections:
+                if connection.incoming_road_id not in road_id_set:
+                    raise ValueError(
+                        "Junction connection references unknown "
+                        f"incoming road {connection.incoming_road_id!r}"
+                    )
+
+                if connection.connecting_road_id not in road_id_set:
+                    raise ValueError(
+                        "Junction connection references unknown "
+                        f"connecting road {connection.connecting_road_id!r}"
+                    )

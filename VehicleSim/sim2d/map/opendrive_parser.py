@@ -10,8 +10,15 @@ from sim2d.map.opendrive_types import (
     OpenDriveLaneSection,
     OpenDriveLaneSide,
     OpenDriveLaneWidth,
+    OpenDriveContactPoint,
+    OpenDriveElementType,
+    OpenDriveJunction,
+    OpenDriveJunctionConnection,
+    OpenDriveJunctionLaneLink,
     OpenDriveLineGeometry,
+    OpenDriveMap,
     OpenDriveRoad,
+    OpenDriveRoadLink,
 )
 
 
@@ -373,6 +380,139 @@ def parse_lane_section_element(
     )
 
 
+def _parse_contact_point(
+    value: str,
+) -> OpenDriveContactPoint:
+    normalized = value.strip().lower()
+
+    try:
+        return OpenDriveContactPoint(normalized)
+    except ValueError as error:
+        raise ValueError(f"Invalid OpenDRIVE contactPoint: {value!r}") from error
+
+
+def parse_road_link_element(
+    link_element: ElementTree.Element,
+) -> OpenDriveRoadLink:
+    """
+    解析 road/link 下的 predecessor 或 successor。
+    """
+    element_type_text = (
+        _required_attribute(
+            link_element,
+            "elementType",
+        )
+        .strip()
+        .lower()
+    )
+
+    try:
+        element_type = OpenDriveElementType(element_type_text)
+    except ValueError as error:
+        raise ValueError(
+            "Unsupported road link elementType: " f"{element_type_text!r}"
+        ) from error
+
+    element_id = _required_attribute(
+        link_element,
+        "elementId",
+    )
+
+    contact_point_text = link_element.get("contactPoint")
+
+    contact_point: OpenDriveContactPoint | None
+
+    if contact_point_text is None:
+        contact_point = None
+    else:
+        contact_point = _parse_contact_point(contact_point_text)
+
+    return OpenDriveRoadLink(
+        element_type=element_type,
+        element_id=element_id,
+        contact_point=contact_point,
+    )
+
+
+def _parse_optional_road_link(
+    road_element: ElementTree.Element,
+    relation: str,
+) -> OpenDriveRoadLink | None:
+    road_link_element = road_element.find("link")
+
+    if road_link_element is None:
+        return None
+
+    relation_element = road_link_element.find(relation)
+
+    if relation_element is None:
+        return None
+
+    return parse_road_link_element(relation_element)
+
+
+def parse_junction_lane_link_element(
+    lane_link_element: ElementTree.Element,
+) -> OpenDriveJunctionLaneLink:
+    return OpenDriveJunctionLaneLink(
+        from_lane_id=_required_int(
+            lane_link_element,
+            "from",
+        ),
+        to_lane_id=_required_int(
+            lane_link_element,
+            "to",
+        ),
+    )
+
+
+def parse_junction_connection_element(
+    connection_element: ElementTree.Element,
+) -> OpenDriveJunctionConnection:
+    lane_links = tuple(
+        parse_junction_lane_link_element(lane_link_element)
+        for lane_link_element in connection_element.findall("laneLink")
+    )
+
+    return OpenDriveJunctionConnection(
+        connection_id=_required_attribute(
+            connection_element,
+            "id",
+        ),
+        incoming_road_id=_required_attribute(
+            connection_element,
+            "incomingRoad",
+        ),
+        connecting_road_id=_required_attribute(
+            connection_element,
+            "connectingRoad",
+        ),
+        contact_point=_parse_contact_point(
+            _required_attribute(
+                connection_element,
+                "contactPoint",
+            )
+        ),
+        lane_links=lane_links,
+    )
+
+
+def parse_junction_element(
+    junction_element: ElementTree.Element,
+) -> OpenDriveJunction:
+    return OpenDriveJunction(
+        junction_id=_required_attribute(
+            junction_element,
+            "id",
+        ),
+        name=junction_element.get("name"),
+        connections=tuple(
+            parse_junction_connection_element(connection_element)
+            for connection_element in junction_element.findall("connection")
+        ),
+    )
+
+
 def parse_road_element(
     road_element: ElementTree.Element,
 ) -> OpenDriveRoad:
@@ -431,14 +571,22 @@ def parse_road_element(
         geometries=geometries,
         lane_sections=lane_sections,
         junction_id=junction_id,
+        predecessor=_parse_optional_road_link(
+            road_element,
+            "predecessor",
+        ),
+        successor=_parse_optional_road_link(
+            road_element,
+            "successor",
+        ),
     )
 
 
-def parse_opendrive_root(
+def parse_opendrive_map_root(
     root: ElementTree.Element,
-) -> tuple[OpenDriveRoad, ...]:
+) -> OpenDriveMap:
     """
-    从 OpenDRIVE XML 根元素解析所有 road。
+    从 OpenDRIVE XML 根元素解析完整文档。
     """
     if root.tag != "OpenDRIVE":
         raise ValueError(
@@ -452,21 +600,31 @@ def parse_opendrive_root(
     if not roads:
         raise ValueError("OpenDRIVE document does not contain " "any <road> elements")
 
-    road_ids = [road.road_id for road in roads]
+    junctions = tuple(
+        parse_junction_element(junction_element)
+        for junction_element in root.findall("junction")
+    )
 
-    if len(road_ids) != len(set(road_ids)):
-        raise ValueError("OpenDRIVE document contains duplicate " "road IDs")
+    return OpenDriveMap(
+        roads=roads,
+        junctions=junctions,
+    )
 
-    return roads
 
-
-def parse_opendrive_string(
-    xml_text: str,
+def parse_opendrive_root(
+    root: ElementTree.Element,
 ) -> tuple[OpenDriveRoad, ...]:
     """
-    从 XML 字符串解析 OpenDRIVE。
+    兼容旧接口：仅返回 roads。
+    """
+    return parse_opendrive_map_root(root).roads
 
-    主要用于单元测试。
+
+def parse_opendrive_map_string(
+    xml_text: str,
+) -> OpenDriveMap:
+    """
+    从 XML 字符串解析完整 OpenDRIVE 文档。
     """
     if not xml_text.strip():
         raise ValueError("xml_text cannot be empty")
@@ -476,26 +634,50 @@ def parse_opendrive_string(
     except ElementTree.ParseError as error:
         raise ValueError("Invalid OpenDRIVE XML") from error
 
-    return parse_opendrive_root(root)
+    return parse_opendrive_map_root(root)
+
+
+def parse_opendrive_string(
+    xml_text: str,
+) -> tuple[OpenDriveRoad, ...]:
+    """
+    兼容旧接口：从 XML 字符串仅返回 roads。
+    """
+    return parse_opendrive_map_string(xml_text).roads
+
+
+def parse_opendrive_map_file(
+    path: str | Path,
+) -> OpenDriveMap:
+    """
+    从 .xodr 文件解析完整 OpenDRIVE 文档。
+    """
+    file_path = Path(path).expanduser()
+
+    if not file_path.exists():
+        raise FileNotFoundError("OpenDRIVE file does not exist: " f"{file_path}")
+
+    if not file_path.is_file():
+        raise ValueError("OpenDRIVE path is not a file: " f"{file_path}")
+
+    try:
+        tree = ElementTree.parse(file_path)
+    except ElementTree.ParseError as error:
+        raise ValueError("Invalid OpenDRIVE XML file: " f"{file_path}") from error
+
+    parsed_map = parse_opendrive_map_root(tree.getroot())
+
+    return OpenDriveMap(
+        roads=parsed_map.roads,
+        junctions=parsed_map.junctions,
+        source_name=file_path.name,
+    )
 
 
 def parse_opendrive_file(
     path: str | Path,
 ) -> tuple[OpenDriveRoad, ...]:
     """
-    从 .xodr 文件解析 OpenDRIVE roads。
+    兼容旧接口：从 .xodr 文件仅返回 roads。
     """
-    file_path = Path(path).expanduser()
-
-    if not file_path.exists():
-        raise FileNotFoundError(f"OpenDRIVE file does not exist: " f"{file_path}")
-
-    if not file_path.is_file():
-        raise ValueError(f"OpenDRIVE path is not a file: " f"{file_path}")
-
-    try:
-        tree = ElementTree.parse(file_path)
-    except ElementTree.ParseError as error:
-        raise ValueError(f"Invalid OpenDRIVE XML file: " f"{file_path}") from error
-
-    return parse_opendrive_root(tree.getroot())
+    return parse_opendrive_map_file(path).roads

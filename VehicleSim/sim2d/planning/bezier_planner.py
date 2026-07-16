@@ -174,20 +174,92 @@ class BezierPlanner(Planner):
 
         self._reference_path: np.ndarray | None = None
 
+        # 外部地图参考路径。设置后优先于 Bézier 路径。
+        self._external_reference_path: np.ndarray | None = None
+
         self._path_goal_signature: tuple[float, ...] | None = None
 
         self._nearest_index = 0
 
     def reset(self) -> None:
         """
-        清除当前参考路径。
+        清除当前 episode 的参考路径状态。
 
-        下一次调用 plan() 时，会根据新的初始状态和
-        目标状态重新生成 Bézier 路径。
+        外部参考路径也会被清除，避免新场景误用上一场景路线。
+        调用方应在 reset() 之后重新调用 set_reference_path()。
         """
+        self._reference_path = None
+        self._external_reference_path = None
+        self._path_goal_signature = None
+        self._nearest_index = 0
+
+    def set_reference_path(
+        self,
+        reference_path: np.ndarray,
+    ) -> None:
+        """
+        设置外部地图参考路径。
+
+        输入列必须为：
+
+            [x, y, yaw, arc_length, curvature]
+
+        arc_length 必须从 0 开始并严格递增。
+        保存时创建独立副本。
+        """
+        path = np.asarray(
+            reference_path,
+            dtype=np.float64,
+        )
+
+        self._validate_reference_path(path)
+
+        self._external_reference_path = path.copy()
+
+        # 清除 Bézier 缓存，避免后续状态混淆。
         self._reference_path = None
         self._path_goal_signature = None
         self._nearest_index = 0
+
+    def clear_external_reference_path(
+        self,
+    ) -> None:
+        """
+        清除外部地图路径。
+
+        下一次 plan() 会恢复为自动生成 Bézier 路径。
+        """
+        self._external_reference_path = None
+        self._reference_path = None
+        self._path_goal_signature = None
+        self._nearest_index = 0
+
+    @property
+    def has_external_reference_path(
+        self,
+    ) -> bool:
+        return self._external_reference_path is not None
+
+    @staticmethod
+    def _validate_reference_path(
+        reference_path: np.ndarray,
+    ) -> None:
+        if reference_path.ndim != 2 or reference_path.shape[1] != 5:
+            raise ValueError(
+                "reference_path must have shape " f"[N, 5], got {reference_path.shape}"
+            )
+
+        if reference_path.shape[0] < 2:
+            raise ValueError("reference_path must contain at least " "two points")
+
+        if not np.all(np.isfinite(reference_path)):
+            raise ValueError("reference_path contains non-finite values")
+
+        if abs(float(reference_path[0, 3])) > 1e-9:
+            raise ValueError("reference_path arc length must start " "at zero")
+
+        if not np.all(np.diff(reference_path[:, 3]) > 0.0):
+            raise ValueError("reference_path arc length must be " "strictly increasing")
 
     def plan(
         self,
@@ -231,6 +303,8 @@ class BezierPlanner(Planner):
             status = "goal_hold"
         elif bool(control_debug["braking_active"]):
             status = "braking_for_goal"
+        elif self.has_external_reference_path:
+            status = "tracking_external_path"
         else:
             status = "tracking_bezier_path"
 
@@ -250,6 +324,9 @@ class BezierPlanner(Planner):
                 "prediction_horizon": (self.prediction_dt * self.prediction_steps),
                 "prediction_mode": ("closed_loop_path_tracking"),
                 "reference_path_points": (reference_path.shape[0]),
+                "reference_path_source": (
+                    "external" if self.has_external_reference_path else "bezier"
+                ),
             },
         )
 
@@ -260,13 +337,18 @@ class BezierPlanner(Planner):
         goal: GoalState,
     ) -> np.ndarray:
         """
-        确保当前 episode 已经生成参考路径。
+        确保当前 episode 存在参考路径。
 
-        路径只在以下情况重新生成：
+        已设置外部地图路径时直接返回外部路径。
+
+        否则，Bézier 路径只在以下情况重新生成：
 
         - reset() 后第一次规划；
         - 目标状态发生变化。
         """
+        if self._external_reference_path is not None:
+            return self._external_reference_path
+
         goal_signature = (
             goal.state.x,
             goal.state.y,

@@ -62,6 +62,9 @@ class OpenDriveLaneSample:
 
     width: FloatArray
 
+    predecessor_lane_id: int | None = None
+    successor_lane_id: int | None = None
+
     def __post_init__(self) -> None:
         object.__setattr__(
             self,
@@ -117,6 +120,18 @@ class OpenDriveLaneSample:
         if self.section_index < 0:
             raise ValueError(
                 "OpenDriveLaneSample.section_index must " "be non-negative"
+            )
+
+        if self.predecessor_lane_id is not None and self.predecessor_lane_id == 0:
+            raise ValueError(
+                "OpenDriveLaneSample.predecessor_lane_id "
+                "cannot reference center lane 0"
+            )
+
+        if self.successor_lane_id is not None and self.successor_lane_id == 0:
+            raise ValueError(
+                "OpenDriveLaneSample.successor_lane_id "
+                "cannot reference center lane 0"
             )
 
         if not np.isfinite(self.section_s_start):
@@ -529,6 +544,8 @@ def _sample_side_lanes(
                 lane_id=lane.lane_id,
                 side=lane.side,
                 lane_type=lane.lane_type,
+                predecessor_lane_id=lane.predecessor_id,
+                successor_lane_id=lane.successor_id,
                 road_s=road_s,
                 centerline=centerline,
                 inner_boundary=inner_boundary,

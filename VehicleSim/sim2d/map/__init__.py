@@ -21,6 +21,7 @@ from sim2d.map.types import (
     LaneType,
     Polyline2D,
     RoadNetwork,
+    LaneProjection,
 )
 
 from sim2d.map.opendrive_geometry import (
@@ -106,4 +107,5 @@ __all__ = [
     "load_opendrive_road_network",
     "make_lane_uid",
     "map_lane_type",
+    "LaneProjection",
 ]

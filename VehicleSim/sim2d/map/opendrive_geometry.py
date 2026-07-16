@@ -228,12 +228,19 @@ def sample_geometry(
 def sample_road_reference_line(
     road: OpenDriveRoad,
     step: float = 0.5,
+    *,
+    s_tolerance: float = 1e-5,
+    position_tolerance: float = 1e-2,
+    heading_tolerance: float = 1e-3,
 ) -> FloatArray:
     """
     采样整条 OpenDRIVE road 的 reference line。
 
     相邻 geometry 的连接点会重复出现，因此拼接时会删除
     后一段 geometry 的第一个采样点。
+
+    第三方 OpenDRIVE 地图中可能存在毫米级浮点导出误差，
+    因此连续性检查使用可配置容差。
 
     输出形状：
 
@@ -248,6 +255,17 @@ def sample_road_reference_line(
 
     if step <= 0.0:
         raise ValueError("step must be positive")
+
+    for name, value in (
+        ("s_tolerance", s_tolerance),
+        ("position_tolerance", position_tolerance),
+        ("heading_tolerance", heading_tolerance),
+    ):
+        if not np.isfinite(value):
+            raise ValueError(f"{name} must be finite")
+
+        if value < 0.0:
+            raise ValueError(f"{name} must be non-negative")
 
     sampled_parts: list[FloatArray] = []
 
@@ -266,31 +284,34 @@ def sample_road_reference_line(
 
             heading_error = abs(float(normalize_angle(sampled[0, 3] - previous_end[3])))
 
-            if s_error > 1e-6:
+            if s_error > s_tolerance:
                 raise ValueError(
                     "OpenDRIVE geometry s values are "
                     "not continuous between geometry "
                     f"{geometry_index - 1} and "
                     f"{geometry_index}: "
-                    f"s_error={s_error}"
+                    f"s_error={s_error}, "
+                    f"tolerance={s_tolerance}"
                 )
 
-            if position_error > 1e-4:
+            if position_error > position_tolerance:
                 raise ValueError(
                     "OpenDRIVE geometry positions are "
                     "not continuous between geometry "
                     f"{geometry_index - 1} and "
                     f"{geometry_index}: "
-                    f"position_error={position_error}"
+                    f"position_error={position_error}, "
+                    f"tolerance={position_tolerance}"
                 )
 
-            if heading_error > 1e-4:
+            if heading_error > heading_tolerance:
                 raise ValueError(
                     "OpenDRIVE geometry headings are "
                     "not continuous between geometry "
                     f"{geometry_index - 1} and "
                     f"{geometry_index}: "
-                    f"heading_error={heading_error}"
+                    f"heading_error={heading_error}, "
+                    f"tolerance={heading_tolerance}"
                 )
 
             sampled = sampled[1:]
@@ -306,7 +327,7 @@ def sample_road_reference_line(
         previous_end = complete_geometry[-1]
 
     if not sampled_parts:
-        raise ValueError("OpenDriveRoad produced no reference-line samples")
+        raise ValueError("OpenDriveRoad produced no " "reference-line samples")
 
     result = np.vstack(sampled_parts)
 
