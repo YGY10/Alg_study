@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from pathlib import Path
 
 from sim2d.map.opendrive_geometry import (
+    normalize_angle,
     sample_road_reference_line,
 )
 from sim2d.map.opendrive_lanes import (
@@ -19,15 +21,226 @@ from sim2d.map.opendrive_types import (
     OpenDriveJunction,
     OpenDriveLaneSide,
     OpenDriveMap,
+    OpenDriveArcGeometry,
+    OpenDriveLineGeometry,
     OpenDriveRoad,
     OpenDriveRoadLink,
+    OpenDriveSignal,
 )
 from sim2d.map.types import (
     Lane,
     LaneType,
     Polyline2D,
     RoadNetwork,
+    TrafficSignal,
 )
+
+
+def _road_reference_pose_at_s(
+    road: OpenDriveRoad,
+    s: float,
+    *,
+    tolerance: float = 1e-6,
+) -> tuple[float, float, float]:
+    """
+    精确计算 road reference line 在绝对弧长 s 处的二维位姿。
+
+    返回：
+
+        x, y, heading
+
+    这里直接使用 line/arc 的解析表达式，不依赖地图采样步长。
+    """
+    if not math.isfinite(s):
+        raise ValueError("Reference-line query s must be finite")
+
+    if s < -tolerance or s > road.length + tolerance:
+        raise ValueError(
+            f"Reference-line query s={s} is outside road "
+            f"{road.road_id!r} range [0, {road.length}]"
+        )
+
+    clamped_s = min(
+        max(s, 0.0),
+        road.length,
+    )
+
+    selected_geometry = None
+
+    for geometry in road.geometries:
+        geometry_end = geometry.s + geometry.length
+
+        if (
+            clamped_s >= geometry.s - tolerance
+            and clamped_s <= geometry_end + tolerance
+        ):
+            selected_geometry = geometry
+
+    if selected_geometry is None:
+        raise ValueError(f"Road {road.road_id!r} has no geometry covering s={s}")
+
+    local_s = min(
+        max(clamped_s - selected_geometry.s, 0.0),
+        selected_geometry.length,
+    )
+
+    if isinstance(selected_geometry, OpenDriveLineGeometry):
+        x = selected_geometry.x + local_s * math.cos(selected_geometry.heading)
+        y = selected_geometry.y + local_s * math.sin(selected_geometry.heading)
+        heading = selected_geometry.heading
+
+    elif isinstance(selected_geometry, OpenDriveArcGeometry):
+        raw_heading = selected_geometry.heading + selected_geometry.curvature * local_s
+
+        x = (
+            selected_geometry.x
+            + (math.sin(raw_heading) - math.sin(selected_geometry.heading))
+            / selected_geometry.curvature
+        )
+
+        y = (
+            selected_geometry.y
+            - (math.cos(raw_heading) - math.cos(selected_geometry.heading))
+            / selected_geometry.curvature
+        )
+
+        heading = raw_heading
+
+    else:
+        raise TypeError(
+            "Unsupported OpenDRIVE geometry type: "
+            f"{type(selected_geometry).__name__}"
+        )
+
+    return (
+        float(x),
+        float(y),
+        float(normalize_angle(heading)),
+    )
+
+
+def _build_signal_controller_index(
+    opendrive_map: OpenDriveMap,
+) -> dict[str, tuple[str, ...]]:
+    """
+    建立 signal ID → controller ID 列表。
+    """
+    controller_ids_by_signal: dict[str, set[str]] = {}
+
+    for controller in opendrive_map.controllers:
+        for control in controller.controls:
+            controller_ids_by_signal.setdefault(
+                control.signal_id,
+                set(),
+            ).add(controller.controller_id)
+
+    return {
+        signal_id: tuple(sorted(controller_ids))
+        for signal_id, controller_ids in controller_ids_by_signal.items()
+    }
+
+
+def convert_traffic_signal(
+    signal: OpenDriveSignal,
+    *,
+    road: OpenDriveRoad,
+    controller_ids: tuple[str, ...] = (),
+) -> TrafficSignal:
+    """
+    将 OpenDRIVE signal 的 road s/t 坐标转换为世界坐标。
+
+    OpenDRIVE 横向坐标 t 的正方向位于 reference line 左侧：
+
+        x = x_ref - t * sin(heading_ref)
+        y = y_ref + t * cos(heading_ref)
+
+    signal 的实体朝向为：
+
+        yaw = heading_ref + hOffset
+    """
+    x_ref, y_ref, heading_ref = _road_reference_pose_at_s(
+        road,
+        signal.s,
+    )
+
+    x = x_ref - signal.t * math.sin(heading_ref)
+    y = y_ref + signal.t * math.cos(heading_ref)
+
+    yaw = float(normalize_angle(heading_ref + signal.h_offset))
+
+    valid_lane_ranges = tuple(
+        (
+            validity.from_lane,
+            validity.to_lane,
+        )
+        for validity in signal.validities
+    )
+
+    return TrafficSignal(
+        signal_id=signal.signal_id,
+        road_id=road.road_id,
+        x=x,
+        y=y,
+        yaw=yaw,
+        s=signal.s,
+        t=signal.t,
+        z_offset=signal.z_offset,
+        dynamic=signal.dynamic,
+        name=signal.name,
+        signal_type=signal.signal_type,
+        subtype=signal.subtype,
+        orientation=signal.orientation.value,
+        controller_ids=controller_ids,
+        valid_lane_ranges=valid_lane_ranges,
+        metadata={
+            "source": "opendrive",
+            "country": signal.country,
+            "value": signal.value,
+            "text": signal.text,
+            "height": signal.height,
+            "width": signal.width,
+            "roll": signal.roll,
+            "pitch": signal.pitch,
+            "h_offset": signal.h_offset,
+        },
+    )
+
+
+def convert_traffic_signals(
+    opendrive_map: OpenDriveMap,
+) -> tuple[TrafficSignal, ...]:
+    """
+    转换完整地图中的物理 signal。
+
+    signalReference 不会生成重复的 TrafficSignal；它在后续建立
+    “道路/车道受哪个信号控制”的语义关联时使用。
+    """
+    controller_index = _build_signal_controller_index(opendrive_map)
+
+    converted: list[TrafficSignal] = []
+
+    for road in opendrive_map.roads:
+        for signal in road.signals:
+            converted.append(
+                convert_traffic_signal(
+                    signal,
+                    road=road,
+                    controller_ids=controller_index.get(
+                        signal.signal_id,
+                        (),
+                    ),
+                )
+            )
+
+    converted.sort(
+        key=lambda signal: (
+            signal.road_id,
+            signal.s,
+            signal.signal_id,
+        )
+    )
+
+    return tuple(converted)
 
 
 def map_lane_type(
@@ -742,6 +955,8 @@ def convert_opendrive_map(
         len(controller.controls) for controller in opendrive_map.controllers
     )
 
+    traffic_signals = convert_traffic_signals(opendrive_map)
+
     initial_lanes = tuple(lanes)
 
     lane_by_uid = {lane.lane_id: lane for lane in initial_lanes}
@@ -788,6 +1003,7 @@ def convert_opendrive_map(
         source_name=(
             source_name if source_name is not None else opendrive_map.source_name
         ),
+        traffic_signals=traffic_signals,
         metadata={
             "road_count": len(opendrive_map.roads),
             "junction_count": len(opendrive_map.junctions),

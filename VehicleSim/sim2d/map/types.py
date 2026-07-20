@@ -220,6 +220,130 @@ class Lane:
 
 
 @dataclass(frozen=True)
+class TrafficSignal:
+    """
+    VehicleSim 统一静态交通信号灯表示。
+
+    x、y:
+        信号灯在地图世界坐标系中的位置，单位 m。
+
+    yaw:
+        信号灯实体朝向，单位 rad，范围 [-pi, pi)。
+
+    road_id、s、t:
+        保留信号灯在 OpenDRIVE 道路坐标系中的原始定位。
+
+    controller_ids:
+        控制该 signal 的 OpenDRIVE controller ID。
+
+    valid_lane_ranges:
+        OpenDRIVE validity 的闭区间列表：
+
+            ((from_lane, to_lane), ...)
+    """
+
+    signal_id: str
+    road_id: str
+
+    x: float
+    y: float
+    yaw: float
+
+    s: float
+    t: float
+    z_offset: float = 0.0
+
+    dynamic: bool = False
+
+    name: str | None = None
+    signal_type: str | None = None
+    subtype: str | None = None
+    orientation: str | None = None
+
+    controller_ids: tuple[str, ...] = ()
+    valid_lane_ranges: tuple[tuple[int, int], ...] = ()
+
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.controller_ids, tuple):
+            object.__setattr__(
+                self,
+                "controller_ids",
+                tuple(self.controller_ids),
+            )
+
+        if not isinstance(self.valid_lane_ranges, tuple):
+            object.__setattr__(
+                self,
+                "valid_lane_ranges",
+                tuple(self.valid_lane_ranges),
+            )
+
+        normalized_ranges = tuple(
+            (int(from_lane), int(to_lane))
+            for from_lane, to_lane in self.valid_lane_ranges
+        )
+
+        object.__setattr__(
+            self,
+            "valid_lane_ranges",
+            normalized_ranges,
+        )
+
+        object.__setattr__(
+            self,
+            "metadata",
+            MappingProxyType(dict(self.metadata)),
+        )
+
+        self.validate()
+
+    def validate(self) -> None:
+        if not self.signal_id.strip():
+            raise ValueError("TrafficSignal.signal_id cannot be empty")
+
+        if not self.road_id.strip():
+            raise ValueError("TrafficSignal.road_id cannot be empty")
+
+        scalar_values = np.array(
+            [
+                self.x,
+                self.y,
+                self.yaw,
+                self.s,
+                self.t,
+                self.z_offset,
+            ],
+            dtype=np.float64,
+        )
+
+        if not np.all(np.isfinite(scalar_values)):
+            raise ValueError("TrafficSignal contains non-finite values")
+
+        if self.s < 0.0:
+            raise ValueError("TrafficSignal.s must be non-negative")
+
+        if not (-math.pi <= self.yaw < math.pi):
+            raise ValueError("TrafficSignal.yaw must be within [-pi, pi)")
+
+        if len(self.controller_ids) != len(set(self.controller_ids)):
+            raise ValueError("TrafficSignal.controller_ids contains duplicates")
+
+        for controller_id in self.controller_ids:
+            if not controller_id.strip():
+                raise ValueError(
+                    "TrafficSignal.controller_ids cannot contain empty IDs"
+                )
+
+        for from_lane, to_lane in self.valid_lane_ranges:
+            if from_lane > to_lane:
+                raise ValueError(
+                    "TrafficSignal validity range start must not " "be greater than end"
+                )
+
+
+@dataclass(frozen=True)
 class LaneProjection:
     """
     世界坐标点在车道中心线上的最近投影结果。
@@ -342,9 +466,17 @@ class RoadNetwork:
     source_type: str
     source_name: str | None = None
 
+    traffic_signals: tuple[TrafficSignal, ...] = ()
+
     metadata: Mapping[str, object] = field(default_factory=dict)
 
     _lane_by_id: Mapping[str, Lane] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    _traffic_signal_by_id: Mapping[str, TrafficSignal] = field(
         init=False,
         repr=False,
         compare=False,
@@ -361,6 +493,16 @@ class RoadNetwork:
                 tuple(self.lanes),
             )
 
+        if not isinstance(
+            self.traffic_signals,
+            tuple,
+        ):
+            object.__setattr__(
+                self,
+                "traffic_signals",
+                tuple(self.traffic_signals),
+            )
+
         object.__setattr__(
             self,
             "metadata",
@@ -373,6 +515,16 @@ class RoadNetwork:
             self,
             "_lane_by_id",
             MappingProxyType(lane_by_id),
+        )
+
+        traffic_signal_by_id = {
+            signal.signal_id: signal for signal in self.traffic_signals
+        }
+
+        object.__setattr__(
+            self,
+            "_traffic_signal_by_id",
+            MappingProxyType(traffic_signal_by_id),
         )
 
         self.validate()
@@ -411,9 +563,37 @@ class RoadNetwork:
                         f"{successor_id!r}"
                     )
 
+        signal_ids: list[str] = []
+
+        for signal in self.traffic_signals:
+            signal.validate()
+            signal_ids.append(signal.signal_id)
+
+        if len(signal_ids) != len(set(signal_ids)):
+            raise ValueError("RoadNetwork contains duplicate traffic signal IDs")
+
     @property
     def lane_count(self) -> int:
         return len(self.lanes)
+
+    @property
+    def traffic_signal_count(self) -> int:
+        return len(self.traffic_signals)
+
+    def get_traffic_signal(
+        self,
+        signal_id: str,
+    ) -> TrafficSignal:
+        try:
+            return self._traffic_signal_by_id[signal_id]
+        except KeyError as error:
+            raise KeyError(f"Unknown traffic signal ID: {signal_id!r}") from error
+
+    def find_traffic_signal(
+        self,
+        signal_id: str,
+    ) -> TrafficSignal | None:
+        return self._traffic_signal_by_id.get(signal_id)
 
     def get_lane(
         self,

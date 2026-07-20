@@ -5,8 +5,11 @@ from typing import Any
 
 import numpy as np
 
-from sim2d.core.dynamics import (
-    KinematicBicycleModel,
+from sim2d.models.kinematic_bicycle import (
+    KinematicBicyclePredictionModel,
+)
+from sim2d.models.motion_model import (
+    MotionModel,
 )
 from sim2d.planning.base import Planner
 from sim2d.types import (
@@ -155,7 +158,9 @@ class SimplePlanner(Planner):
         self.prediction_dt = prediction_dt
         self.prediction_steps = prediction_steps
 
-        self._dynamics = KinematicBicycleModel(config=vehicle_config)
+        self._motion_model: MotionModel = KinematicBicyclePredictionModel(
+            vehicle_config=vehicle_config,
+        )
 
         # 一旦车辆进入终点减速区域，该状态会一直保持，
         # 直到 reset()。
@@ -565,7 +570,7 @@ class SimplePlanner(Planner):
                 predicted_states.append(predicted_state.as_array())
                 continue
 
-            predicted_state = self._dynamics.step(
+            predicted_state = self._motion_model.predict_step(
                 state=predicted_state,
                 control=predicted_action,
                 dt=self.prediction_dt,

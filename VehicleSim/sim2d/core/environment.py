@@ -10,8 +10,11 @@ from sim2d.core.collision import (
     has_collision,
     minimum_clearance,
 )
-from sim2d.core.dynamics import (
-    KinematicBicycleModel,
+from sim2d.dynamics.base import (
+    DynamicsBackend,
+)
+from sim2d.dynamics.kinematic_bicycle import (
+    KinematicBicycleBackend,
 )
 from sim2d.types import (
     GoalState,
@@ -94,7 +97,12 @@ class DrivingEnv:
     vehicle_config: VehicleConfig
     environment_config: EnvironmentConfig
 
-    _dynamics: KinematicBicycleModel = field(
+    dynamics_backend: DynamicsBackend | None = field(
+        default=None,
+        repr=False,
+    )
+
+    _dynamics: DynamicsBackend = field(
         init=False,
         repr=False,
     )
@@ -199,7 +207,12 @@ class DrivingEnv:
         self.vehicle_config.validate()
         self.environment_config.validate()
 
-        self._dynamics = KinematicBicycleModel(config=self.vehicle_config)
+        if self.dynamics_backend is None:
+            self._dynamics = KinematicBicycleBackend(
+                vehicle_config=self.vehicle_config,
+            )
+        else:
+            self._dynamics = self.dynamics_backend
 
     def reset(
         self,
@@ -228,8 +241,10 @@ class DrivingEnv:
         for obstacle in obstacles:
             obstacle.validate()
 
-        self._initial_state = initial_state
-        self._ego_state = initial_state
+        reset_state = self._dynamics.reset(initial_state)
+
+        self._initial_state = reset_state
+        self._ego_state = reset_state
         self._goal = goal
         self._obstacles = tuple(obstacles)
 
@@ -240,22 +255,22 @@ class DrivingEnv:
         self._truncated = False
 
         self._collision = has_collision(
-            state=initial_state,
+            state=reset_state,
             config=self.vehicle_config,
             obstacles=self._obstacles,
         )
 
-        self._goal_reached = self._check_goal_reached(initial_state)
+        self._goal_reached = self._check_goal_reached(reset_state)
 
         self._timeout = False
 
         self._min_clearance = minimum_clearance(
-            state=initial_state,
+            state=reset_state,
             config=self.vehicle_config,
             obstacles=self._obstacles,
         )
 
-        self._history = [initial_state]
+        self._history = [reset_state]
 
         self._planned_trajectory = None
         self._reference_path = None
@@ -292,7 +307,6 @@ class DrivingEnv:
         previous_distance = self._distance_to_goal(self._ego_state)
 
         next_state = self._dynamics.step(
-            state=self._ego_state,
             control=control,
             dt=self.environment_config.dt,
         )
