@@ -732,6 +732,16 @@ def convert_opendrive_map(
             )
         )
 
+    signal_count = sum(len(road.signals) for road in opendrive_map.roads)
+    signal_reference_count = sum(
+        len(road.signal_references) for road in opendrive_map.roads
+    )
+    object_count = sum(len(road.objects) for road in opendrive_map.roads)
+    controller_count = len(opendrive_map.controllers)
+    controller_control_count = sum(
+        len(controller.controls) for controller in opendrive_map.controllers
+    )
+
     initial_lanes = tuple(lanes)
 
     lane_by_uid = {lane.lane_id: lane for lane in initial_lanes}
@@ -782,6 +792,11 @@ def convert_opendrive_map(
             "road_count": len(opendrive_map.roads),
             "junction_count": len(opendrive_map.junctions),
             "junction_road_count": (junction_road_count),
+            "signal_count": signal_count,
+            "signal_reference_count": (signal_reference_count),
+            "object_count": object_count,
+            "controller_count": controller_count,
+            "controller_control_count": (controller_control_count),
             "sample_step": sample_step,
             "traffic_rule": "RHT",
             "intra_road_topology_edge_count": (intra_road_edge_count),

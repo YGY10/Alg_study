@@ -17,8 +17,15 @@ from sim2d.map.opendrive_types import (
     OpenDriveJunctionLaneLink,
     OpenDriveLineGeometry,
     OpenDriveMap,
+    OpenDriveObject,
+    OpenDriveOrientation,
     OpenDriveRoad,
     OpenDriveRoadLink,
+    OpenDriveSignal,
+    OpenDriveSignalReference,
+    OpenDriveValidity,
+    OpenDriveController,
+    OpenDriveControllerControl,
 )
 
 
@@ -97,6 +104,264 @@ def _optional_int(
         raise ValueError(
             f"<{element.tag}> attribute {name!r} " f"must be an integer, got {text!r}"
         ) from error
+
+
+def _optional_float(
+    element: ElementTree.Element,
+    name: str,
+    *,
+    default: float | None = None,
+) -> float | None:
+    """读取可选浮点属性。"""
+    text = element.get(name)
+
+    if text is None:
+        return default
+
+    try:
+        return float(text)
+    except ValueError as error:
+        raise ValueError(
+            f"<{element.tag}> attribute {name!r} " f"must be a float, got {text!r}"
+        ) from error
+
+
+def _parse_yes_no_bool(
+    value: str,
+) -> bool:
+    """解析 OpenDRIVE signal dynamic=yes/no。"""
+    normalized = value.strip().lower()
+
+    if normalized == "yes":
+        return True
+
+    if normalized == "no":
+        return False
+
+    raise ValueError(f"Invalid OpenDRIVE yes/no boolean: {value!r}")
+
+
+def _parse_orientation(
+    value: str | None,
+) -> OpenDriveOrientation:
+    """解析 signal/object orientation。"""
+    normalized = "none" if value is None else value.strip().lower()
+
+    try:
+        return OpenDriveOrientation(normalized)
+    except ValueError as error:
+        raise ValueError(f"Invalid OpenDRIVE orientation: {value!r}") from error
+
+
+def parse_validity_element(
+    validity_element: ElementTree.Element,
+) -> OpenDriveValidity:
+    return OpenDriveValidity(
+        from_lane=_required_int(
+            validity_element,
+            "fromLane",
+        ),
+        to_lane=_required_int(
+            validity_element,
+            "toLane",
+        ),
+    )
+
+
+def _parse_validities(
+    parent: ElementTree.Element,
+) -> tuple[OpenDriveValidity, ...]:
+    return tuple(
+        parse_validity_element(element) for element in parent.findall("validity")
+    )
+
+
+def parse_signal_element(
+    signal_element: ElementTree.Element,
+) -> OpenDriveSignal:
+    return OpenDriveSignal(
+        signal_id=_required_attribute(
+            signal_element,
+            "id",
+        ),
+        name=signal_element.get("name"),
+        s=_required_float(
+            signal_element,
+            "s",
+        ),
+        t=_required_float(
+            signal_element,
+            "t",
+        ),
+        z_offset=float(
+            _optional_float(
+                signal_element,
+                "zOffset",
+                default=0.0,
+            )
+        ),
+        h_offset=float(
+            _optional_float(
+                signal_element,
+                "hOffset",
+                default=0.0,
+            )
+        ),
+        roll=float(
+            _optional_float(
+                signal_element,
+                "roll",
+                default=0.0,
+            )
+        ),
+        pitch=float(
+            _optional_float(
+                signal_element,
+                "pitch",
+                default=0.0,
+            )
+        ),
+        orientation=_parse_orientation(signal_element.get("orientation")),
+        dynamic=_parse_yes_no_bool(
+            _required_attribute(
+                signal_element,
+                "dynamic",
+            )
+        ),
+        country=signal_element.get("country"),
+        signal_type=signal_element.get("type"),
+        subtype=signal_element.get("subtype"),
+        value=_optional_float(
+            signal_element,
+            "value",
+        ),
+        text=signal_element.get("text"),
+        height=_optional_float(
+            signal_element,
+            "height",
+        ),
+        width=_optional_float(
+            signal_element,
+            "width",
+        ),
+        validities=_parse_validities(signal_element),
+    )
+
+
+def parse_signal_reference_element(
+    reference_element: ElementTree.Element,
+) -> OpenDriveSignalReference:
+    return OpenDriveSignalReference(
+        signal_id=_required_attribute(
+            reference_element,
+            "id",
+        ),
+        s=_required_float(
+            reference_element,
+            "s",
+        ),
+        t=_required_float(
+            reference_element,
+            "t",
+        ),
+        orientation=_parse_orientation(reference_element.get("orientation")),
+        validities=_parse_validities(reference_element),
+    )
+
+
+def parse_object_element(
+    object_element: ElementTree.Element,
+) -> OpenDriveObject:
+    return OpenDriveObject(
+        object_id=_required_attribute(
+            object_element,
+            "id",
+        ),
+        name=object_element.get("name"),
+        object_type=object_element.get("type"),
+        s=_required_float(
+            object_element,
+            "s",
+        ),
+        t=_required_float(
+            object_element,
+            "t",
+        ),
+        z_offset=float(
+            _optional_float(
+                object_element,
+                "zOffset",
+                default=0.0,
+            )
+        ),
+        heading=float(
+            _optional_float(
+                object_element,
+                "hdg",
+                default=0.0,
+            )
+        ),
+        roll=float(
+            _optional_float(
+                object_element,
+                "roll",
+                default=0.0,
+            )
+        ),
+        pitch=float(
+            _optional_float(
+                object_element,
+                "pitch",
+                default=0.0,
+            )
+        ),
+        orientation=_parse_orientation(object_element.get("orientation")),
+        height=_optional_float(
+            object_element,
+            "height",
+        ),
+        width=_optional_float(
+            object_element,
+            "width",
+        ),
+        length=_optional_float(
+            object_element,
+            "length",
+        ),
+        validities=_parse_validities(object_element),
+    )
+
+
+def parse_controller_control_element(
+    control_element: ElementTree.Element,
+) -> OpenDriveControllerControl:
+    return OpenDriveControllerControl(
+        signal_id=_required_attribute(
+            control_element,
+            "signalId",
+        ),
+        control_type=control_element.get("type"),
+    )
+
+
+def parse_controller_element(
+    controller_element: ElementTree.Element,
+) -> OpenDriveController:
+    return OpenDriveController(
+        controller_id=_required_attribute(
+            controller_element,
+            "id",
+        ),
+        name=controller_element.get("name"),
+        sequence=_optional_int(
+            controller_element,
+            "sequence",
+        ),
+        controls=tuple(
+            parse_controller_control_element(control_element)
+            for control_element in controller_element.findall("control")
+        ),
+    )
 
 
 def _parse_bool(
@@ -564,6 +829,31 @@ def parse_road_element(
         for lane_section_element in lanes_element.findall("laneSection")
     )
 
+    signals_element = road_element.find("signals")
+
+    if signals_element is None:
+        signals = ()
+        signal_references = ()
+    else:
+        signals = tuple(
+            parse_signal_element(signal_element)
+            for signal_element in signals_element.findall("signal")
+        )
+        signal_references = tuple(
+            parse_signal_reference_element(reference_element)
+            for reference_element in signals_element.findall("signalReference")
+        )
+
+    objects_element = road_element.find("objects")
+
+    if objects_element is None:
+        objects = ()
+    else:
+        objects = tuple(
+            parse_object_element(object_element)
+            for object_element in objects_element.findall("object")
+        )
+
     return OpenDriveRoad(
         road_id=road_id,
         name=road_name,
@@ -579,6 +869,9 @@ def parse_road_element(
             road_element,
             "successor",
         ),
+        signals=signals,
+        signal_references=signal_references,
+        objects=objects,
     )
 
 
@@ -605,9 +898,15 @@ def parse_opendrive_map_root(
         for junction_element in root.findall("junction")
     )
 
+    controllers = tuple(
+        parse_controller_element(controller_element)
+        for controller_element in root.findall("controller")
+    )
+
     return OpenDriveMap(
         roads=roads,
         junctions=junctions,
+        controllers=controllers,
     )
 
 
@@ -670,6 +969,7 @@ def parse_opendrive_map_file(
     return OpenDriveMap(
         roads=parsed_map.roads,
         junctions=parsed_map.junctions,
+        controllers=parsed_map.controllers,
         source_name=file_path.name,
     )
 

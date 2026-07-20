@@ -35,6 +35,14 @@ class OpenDriveContactPoint(str, Enum):
     END = "end"
 
 
+class OpenDriveOrientation(str, Enum):
+    """signal/object 对道路行驶方向的适用关系。"""
+
+    POSITIVE = "+"
+    NEGATIVE = "-"
+    NONE = "none"
+
+
 @dataclass(frozen=True)
 class OpenDriveLineGeometry:
     """
@@ -556,6 +564,198 @@ class OpenDriveJunction:
 
 
 @dataclass(frozen=True)
+class OpenDriveValidity:
+    """signal、signalReference 或 object 的车道适用范围。"""
+
+    from_lane: int
+    to_lane: int
+
+    def __post_init__(self) -> None:
+        if self.from_lane > self.to_lane:
+            raise ValueError(
+                "OpenDriveValidity.from_lane must not be greater " "than to_lane"
+            )
+
+
+@dataclass(frozen=True)
+class OpenDriveSignal:
+    """OpenDRIVE <signal> 的原始静态描述。"""
+
+    signal_id: str
+    s: float
+    t: float
+    orientation: OpenDriveOrientation
+    dynamic: bool
+
+    name: str | None = None
+    z_offset: float = 0.0
+    h_offset: float = 0.0
+    roll: float = 0.0
+    pitch: float = 0.0
+    country: str | None = None
+    signal_type: str | None = None
+    subtype: str | None = None
+    value: float | None = None
+    text: str | None = None
+    height: float | None = None
+    width: float | None = None
+    validities: tuple[OpenDriveValidity, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.signal_id.strip():
+            raise ValueError("OpenDriveSignal.signal_id cannot be empty")
+
+        if not isinstance(self.validities, tuple):
+            object.__setattr__(
+                self,
+                "validities",
+                tuple(self.validities),
+            )
+
+        values = [
+            self.s,
+            self.t,
+            self.z_offset,
+            self.h_offset,
+            self.roll,
+            self.pitch,
+        ]
+        values.extend(
+            value
+            for value in (
+                self.value,
+                self.height,
+                self.width,
+            )
+            if value is not None
+        )
+
+        if not np.all(np.isfinite(np.asarray(values, dtype=np.float64))):
+            raise ValueError("OpenDriveSignal contains non-finite values")
+
+        if self.s < 0.0:
+            raise ValueError("OpenDriveSignal.s must be non-negative")
+
+
+@dataclass(frozen=True)
+class OpenDriveSignalReference:
+    """OpenDRIVE <signalReference> 的原始描述。"""
+
+    signal_id: str
+    s: float
+    t: float
+    orientation: OpenDriveOrientation
+    validities: tuple[OpenDriveValidity, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.signal_id.strip():
+            raise ValueError("OpenDriveSignalReference.signal_id cannot be empty")
+
+        if not isinstance(self.validities, tuple):
+            object.__setattr__(
+                self,
+                "validities",
+                tuple(self.validities),
+            )
+
+        if not np.all(np.isfinite([self.s, self.t])):
+            raise ValueError("OpenDriveSignalReference contains non-finite values")
+
+        if self.s < 0.0:
+            raise ValueError("OpenDriveSignalReference.s must be non-negative")
+
+
+@dataclass(frozen=True)
+class OpenDriveObject:
+    """OpenDRIVE <object> 的第一版原始描述。"""
+
+    object_id: str
+    s: float
+    t: float
+
+    name: str | None = None
+    object_type: str | None = None
+    orientation: OpenDriveOrientation = OpenDriveOrientation.NONE
+    z_offset: float = 0.0
+    heading: float = 0.0
+    roll: float = 0.0
+    pitch: float = 0.0
+    height: float | None = None
+    width: float | None = None
+    length: float | None = None
+    validities: tuple[OpenDriveValidity, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.object_id.strip():
+            raise ValueError("OpenDriveObject.object_id cannot be empty")
+
+        if not isinstance(self.validities, tuple):
+            object.__setattr__(
+                self,
+                "validities",
+                tuple(self.validities),
+            )
+
+        values = [
+            self.s,
+            self.t,
+            self.z_offset,
+            self.heading,
+            self.roll,
+            self.pitch,
+        ]
+        values.extend(
+            value
+            for value in (
+                self.height,
+                self.width,
+                self.length,
+            )
+            if value is not None
+        )
+
+        if not np.all(np.isfinite(np.asarray(values, dtype=np.float64))):
+            raise ValueError("OpenDriveObject contains non-finite values")
+
+        if self.s < 0.0:
+            raise ValueError("OpenDriveObject.s must be non-negative")
+
+
+@dataclass(frozen=True)
+class OpenDriveControllerControl:
+    """controller 下的一条 <control> 记录。"""
+
+    signal_id: str
+    control_type: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.signal_id.strip():
+            raise ValueError("OpenDriveControllerControl.signal_id cannot be empty")
+
+
+@dataclass(frozen=True)
+class OpenDriveController:
+    """OpenDRIVE 根节点下的交通信号 controller。"""
+
+    controller_id: str
+    controls: tuple[OpenDriveControllerControl, ...]
+
+    name: str | None = None
+    sequence: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.controller_id.strip():
+            raise ValueError("OpenDriveController.controller_id cannot be empty")
+
+        if not isinstance(self.controls, tuple):
+            object.__setattr__(
+                self,
+                "controls",
+                tuple(self.controls),
+            )
+
+
+@dataclass(frozen=True)
 class OpenDriveRoad:
     """
     一条 OpenDRIVE road 的最小内部表示。
@@ -572,6 +772,10 @@ class OpenDriveRoad:
 
     predecessor: OpenDriveRoadLink | None = None
     successor: OpenDriveRoadLink | None = None
+
+    signals: tuple[OpenDriveSignal, ...] = ()
+    signal_references: tuple[OpenDriveSignalReference, ...] = ()
+    objects: tuple[OpenDriveObject, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(
@@ -593,6 +797,20 @@ class OpenDriveRoad:
                 "lane_sections",
                 tuple(self.lane_sections),
             )
+
+        for field_name in (
+            "signals",
+            "signal_references",
+            "objects",
+        ):
+            value = getattr(self, field_name)
+
+            if not isinstance(value, tuple):
+                object.__setattr__(
+                    self,
+                    field_name,
+                    tuple(value),
+                )
 
         self.validate()
 
@@ -636,6 +854,16 @@ class OpenDriveRoad:
             if section.s > self.length:
                 raise ValueError("OpenDriveLaneSection starts beyond " "road length")
 
+        signal_ids = [signal.signal_id for signal in self.signals]
+
+        if len(signal_ids) != len(set(signal_ids)):
+            raise ValueError("OpenDriveRoad contains duplicate signal IDs")
+
+        object_ids = [obj.object_id for obj in self.objects]
+
+        if len(object_ids) != len(set(object_ids)):
+            raise ValueError("OpenDriveRoad contains duplicate object IDs")
+
 
 @dataclass(frozen=True)
 class OpenDriveMap:
@@ -647,6 +875,7 @@ class OpenDriveMap:
 
     roads: tuple[OpenDriveRoad, ...]
     junctions: tuple[OpenDriveJunction, ...] = ()
+    controllers: tuple[OpenDriveController, ...] = ()
 
     source_name: str | None = None
 
@@ -665,6 +894,13 @@ class OpenDriveMap:
                 tuple(self.junctions),
             )
 
+        if not isinstance(self.controllers, tuple):
+            object.__setattr__(
+                self,
+                "controllers",
+                tuple(self.controllers),
+            )
+
         if not self.roads:
             raise ValueError("OpenDriveMap must contain at least one road")
 
@@ -677,6 +913,11 @@ class OpenDriveMap:
 
         if len(junction_ids) != len(set(junction_ids)):
             raise ValueError("OpenDriveMap contains duplicate junction IDs")
+
+        controller_ids = [controller.controller_id for controller in self.controllers]
+
+        if len(controller_ids) != len(set(controller_ids)):
+            raise ValueError("OpenDriveMap contains duplicate controller IDs")
 
         road_id_set = set(road_ids)
 
