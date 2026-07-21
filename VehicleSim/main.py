@@ -11,9 +11,6 @@ from sim2d.gui.perception_extension import install as install_perception
 from sim2d.gui.perception_object_debug_extension import (
     install as install_perception_object_debug,
 )
-from sim2d.gui.perception_view_rotation import (
-    install as install_perception_view_rotation,
-)
 from sim2d.gui.perception_viewer import install as install_perception_viewer
 from sim2d.gui.perception_viewer_bootstrap import (
     install as install_perception_viewer_bootstrap,
@@ -40,13 +37,14 @@ install_demo_obstacles()
 install_perception_viewer_bootstrap()
 install_perception_viewer()
 
-# 感知窗口显示方向：+x 向上，+y 向左。
-install_perception_view_rotation()
+# perception_viewer.py 已直接使用车辆坐标系，并按 +x 向上、+y 向左绘制。
+# 不再安装旧的 perception_view_rotation 扩展；旧扩展会把车辆坐标误当成
+# 世界坐标，再减一次 ego 位姿，导致障碍物图元与数值标签位置不一致。
 
 # 必须在感知图元类加载后安装，显示每个目标的实时车辆坐标。
 install_perception_object_debug()
 
-# 必须最后安装，覆盖逐帧 fitInView 行为并保留旋转后的绘制逻辑。
+# 必须最后安装，覆盖逐帧 fitInView 行为并保留当前车辆坐标绘制逻辑。
 install_perception_viewer_interaction()
 
 from sim2d.gui.main_window import MainWindow  # noqa: E402
