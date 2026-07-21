@@ -3,8 +3,13 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from sim2d.map.types import TrafficSignal
+from sim2d.map.types import RoadNetwork, TrafficSignal
 from sim2d.types import VehicleState
+from sim2d.world.road_deformation import (
+    RoadDeformationConfig,
+    deform_pose,
+    deform_road_network,
+)
 from sim2d.world.state import WorldState
 from sim2d.world.traffic_signal import (
     TrafficLightState,
@@ -14,19 +19,7 @@ from sim2d.world.traffic_signal import (
 
 @dataclass
 class World:
-    """
-    仿真真实世界容器。
-
-    World 负责提交同一个仿真时间步中的 ground-truth 状态更新：
-
-        - 推进世界时间；
-        - 更新自车真实状态；
-        - 初始化和维护真实世界交通灯；
-        - 后续更新交通灯周期、NPC、行人等世界实体。
-
-    车辆动力学计算暂时仍由 DrivingEnv 中的 DynamicsBackend 完成。
-    World.step() 只接收已经计算出的下一时刻自车状态。
-    """
+    """仿真真实世界容器。"""
 
     state: WorldState
 
@@ -36,22 +29,23 @@ class World:
         *,
         ego_state: VehicleState | None = None,
     ) -> WorldState:
-        """
-        将真实世界推进一个仿真时间步。
-        """
-        if not isinstance(
-            dt,
-            (int, float),
-        ):
-            raise TypeError("dt must be a real number, " f"got {type(dt).__name__}")
+        if not isinstance(dt, (int, float)):
+            raise TypeError(
+                "dt must be a real number, "
+                f"got {type(dt).__name__}"
+            )
 
         dt = float(dt)
 
         if not math.isfinite(dt):
-            raise ValueError(f"dt must be finite, got {dt}")
+            raise ValueError(
+                f"dt must be finite, got {dt}"
+            )
 
         if dt <= 0.0:
-            raise ValueError(f"dt must be positive, got {dt}")
+            raise ValueError(
+                f"dt must be positive, got {dt}"
+            )
 
         if ego_state is not None:
             self.state.ego_state = ego_state
@@ -59,6 +53,58 @@ class World:
         self.state.time += dt
 
         return self.state
+
+    def initialize_map_geometry(
+        self,
+        road_network: RoadNetwork,
+        deformation: RoadDeformationConfig,
+        *,
+        initial_signal_state: TrafficLightState = TrafficLightState.UNKNOWN,
+    ) -> None:
+        """
+        使用同一连续形变场初始化世界道路与世界交通灯。
+
+        lane 的 predecessor/successor 关系直接继承地图层；几何使用
+        连续空间场变换，因此共享地图连接点不会因逐 lane 偏移而断裂。
+        """
+        self.state.road_lanes = deform_road_network(
+            road_network,
+            deformation,
+        )
+
+        self.state.traffic_signals = tuple(
+            self._deform_traffic_signal(
+                signal,
+                deformation,
+                initial_signal_state,
+            )
+            for signal in road_network.traffic_signals
+        )
+
+    @staticmethod
+    def _deform_traffic_signal(
+        signal: TrafficSignal,
+        deformation: RoadDeformationConfig,
+        state: TrafficLightState,
+    ) -> WorldTrafficSignal:
+        x, y, yaw = deform_pose(
+            x=signal.x,
+            y=signal.y,
+            yaw=signal.yaw,
+            config=deformation,
+        )
+
+        signal_id = str(signal.signal_id)
+
+        return WorldTrafficSignal(
+            entity_id=f"world_signal_{signal_id}",
+            map_signal_id=signal_id,
+            x=x,
+            y=y,
+            yaw=yaw,
+            state=state,
+            remaining_time=None,
+        )
 
     def initialize_traffic_signals(
         self,
@@ -69,14 +115,7 @@ class World:
         yaw_offset: float = 0.0,
         initial_state: TrafficLightState = TrafficLightState.UNKNOWN,
     ) -> tuple[WorldTrafficSignal, ...]:
-        """
-        从地图层交通灯创建真实世界交通灯实体。
-
-        当前对所有地图灯应用相同的位姿偏差，先建立最小可用链路。
-        后续可以扩展为按 signal_id 配置不同误差、缺失灯和额外灯。
-
-        再次调用该方法会整体替换当前 WorldState.traffic_signals。
-        """
+        """保留旧接口，用统一刚体偏差初始化交通灯。"""
         world_signals = tuple(
             WorldTrafficSignal.from_map_signal(
                 signal,
