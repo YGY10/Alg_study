@@ -5,6 +5,7 @@ import math
 import numpy as np
 
 from sim2d.core import DrivingEnv, EnvironmentConfig
+from sim2d.map.types import LaneType
 from sim2d.perception import PerceptionConfig, PlanningInput
 from sim2d.types import (
     CircleObstacle,
@@ -13,16 +14,20 @@ from sim2d.types import (
     VehicleState,
 )
 from sim2d.world.road_geometry import WorldLaneGeometry
-from sim2d.map.types import LaneType
 
 
-def _make_env() -> DrivingEnv:
+def _make_env(
+    initial_state: VehicleState | None = None,
+) -> DrivingEnv:
     env = DrivingEnv(
         vehicle_config=VehicleConfig(),
         environment_config=EnvironmentConfig(),
     )
     env.reset(
-        initial_state=VehicleState(0.0, 0.0, 0.0, 0.0),
+        initial_state=(
+            initial_state
+            or VehicleState(0.0, 0.0, 0.0, 0.0)
+        ),
         goal=GoalState(VehicleState(20.0, 0.0, 0.0, 0.0)),
         obstacles=(
             CircleObstacle("near", 10.0, 0.0, 1.0),
@@ -41,8 +46,15 @@ def test_planner_input_is_backward_compatible_and_local():
     assert planning_input.time == 0.0
     assert planning_input.frame == 0
     assert planning_input.goal.state.x == 20.0
-    assert [item.obstacle_id for item in planning_input.obstacles] == ["near"]
-    assert [item.object_id for item in planning_input.perception.objects] == ["near"]
+    assert planning_input.perception.coordinate_frame == "vehicle"
+    assert [item.obstacle_id for item in planning_input.obstacles] == [
+        "near"
+    ]
+    assert [
+        item.object_id for item in planning_input.perception.objects
+    ] == ["near"]
+    assert planning_input.perception.objects[0].x == 10.0
+    assert planning_input.perception.objects[0].y == 0.0
 
 
 def test_perception_range_is_configurable():
@@ -123,3 +135,85 @@ def test_field_of_view_can_hide_rear_objects():
     )
     snapshot = env.get_perception_snapshot()
     assert {item.object_id for item in snapshot.objects} == {"near"}
+
+
+def test_objects_are_published_in_rotated_vehicle_frame():
+    env = DrivingEnv(
+        vehicle_config=VehicleConfig(),
+        environment_config=EnvironmentConfig(),
+    )
+    env.reset(
+        initial_state=VehicleState(
+            x=5.0,
+            y=7.0,
+            yaw=0.5 * math.pi,
+            speed=0.0,
+        ),
+        goal=GoalState(VehicleState(5.0, 30.0, 0.0, 0.0)),
+        obstacles=(
+            CircleObstacle("ahead", 5.0, 17.0, 1.0),
+            CircleObstacle("left", -3.0, 7.0, 1.0),
+        ),
+    )
+
+    planning_input = env.get_planning_input()
+    by_id = {
+        item.object_id: item
+        for item in planning_input.perception.objects
+    }
+
+    assert np.isclose(by_id["ahead"].x, 10.0)
+    assert np.isclose(by_id["ahead"].y, 0.0)
+    assert np.isclose(by_id["left"].x, 0.0)
+    assert np.isclose(by_id["left"].y, 8.0)
+
+    # 顶层 obstacles 是旧规划器兼容视图，仍恢复为全局坐标。
+    legacy_by_id = {
+        item.obstacle_id: item
+        for item in planning_input.obstacles
+    }
+    assert np.isclose(legacy_by_id["ahead"].x, 5.0)
+    assert np.isclose(legacy_by_id["ahead"].y, 17.0)
+
+
+def test_lane_points_are_published_in_vehicle_frame():
+    env = DrivingEnv(
+        vehicle_config=VehicleConfig(),
+        environment_config=EnvironmentConfig(),
+    )
+    env.reset(
+        initial_state=VehicleState(
+            x=10.0,
+            y=20.0,
+            yaw=0.5 * math.pi,
+            speed=0.0,
+        ),
+        goal=GoalState(VehicleState(10.0, 40.0, 0.0, 0.0)),
+    )
+    world_points = np.array(
+        [
+            [10.0, 20.0],
+            [10.0, 30.0],
+            [10.0, 40.0],
+        ],
+        dtype=np.float64,
+    )
+    env.world.state.road_lanes = (
+        WorldLaneGeometry(
+            entity_id="world_lane_rotated",
+            map_lane_id="lane_rotated",
+            lane_type=LaneType.DRIVING,
+            centerline=world_points,
+            left_boundary=world_points + np.array([-1.75, 0.0]),
+            right_boundary=world_points + np.array([1.75, 0.0]),
+            predecessor_ids=(),
+            successor_ids=(),
+        ),
+    )
+
+    segment = env.get_perception_snapshot().road_segments[0]
+    assert np.allclose(
+        segment.centerline,
+        np.array([[0.0, 0.0], [10.0, 0.0], [20.0, 0.0]]),
+        atol=1e-9,
+    )
