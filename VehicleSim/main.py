@@ -8,6 +8,9 @@ from PySide6.QtWidgets import QApplication
 from sim2d.gui.app_icon import apply_application_icon
 from sim2d.gui.demo_obstacle_extension import install as install_demo_obstacles
 from sim2d.gui.perception_extension import install as install_perception
+from sim2d.gui.perception_object_debug_extension import (
+    install as install_perception_object_debug,
+)
 from sim2d.gui.perception_view_rotation import (
     install as install_perception_view_rotation,
 )
@@ -39,6 +42,9 @@ install_perception_viewer()
 
 # 感知窗口显示方向：+x 向上，+y 向左。
 install_perception_view_rotation()
+
+# 必须在感知图元类加载后安装，显示每个目标的实时车辆坐标。
+install_perception_object_debug()
 
 # 必须最后安装，覆盖逐帧 fitInView 行为并保留旋转后的绘制逻辑。
 install_perception_viewer_interaction()
