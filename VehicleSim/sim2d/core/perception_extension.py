@@ -36,9 +36,11 @@ def install() -> None:
         original_post_init(self)
         self._perception_model = GroundTruthLocalPerception()
         self._perception_map_network = None
+        self._perception_scene_signature = None
 
     def reset(self: DrivingEnv, *args, **kwargs):
         self._perception_model.reset()
+        self._perception_scene_signature = None
         return original_reset(self, *args, **kwargs)
 
     DrivingEnv.__post_init__ = post_init
@@ -58,6 +60,7 @@ def _set_perception_config(
 ) -> None:
     config.validate()
     self._perception_model = GroundTruthLocalPerception(config)
+    self._perception_scene_signature = None
 
 
 def _set_perception_map_network(
@@ -68,8 +71,39 @@ def _set_perception_map_network(
     self._perception_map_network = road_network
 
 
+def _scene_signature(self: DrivingEnv) -> tuple[object, ...]:
+    """返回会改变同一时刻感知内容的场景结构签名。
+
+    DrivingEnv.reset() 会在 world road/traffic signal 初始化之前先生成一帧观测。
+    随后若同一仿真时刻再写入 road_lanes 或 traffic_signals，单纯依赖
+    update_period 会错误复用旧缓存。这里检测场景容器及实体集合变化，及时
+    失效缓存；自车连续运动仍由正常感知周期控制，不会每帧重置历史。
+    """
+    state = self.world.state
+    return (
+        id(state.obstacles),
+        tuple(id(item) for item in state.obstacles),
+        id(state.traffic_signals),
+        tuple(id(item) for item in state.traffic_signals),
+        id(state.road_lanes),
+        tuple(id(item) for item in state.road_lanes),
+    )
+
+
 def _get_perception_snapshot(self: DrivingEnv):
     self._require_initialized()
+
+    signature = _scene_signature(self)
+    previous_signature = getattr(
+        self,
+        "_perception_scene_signature",
+        None,
+    )
+
+    if previous_signature != signature:
+        self._perception_model.reset()
+        self._perception_scene_signature = signature
+
     return self._perception_model.observe(
         self.world.state,
         frame=self.frame,
