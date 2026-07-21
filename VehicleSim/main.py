@@ -7,6 +7,9 @@ from PySide6.QtWidgets import QApplication
 
 from sim2d.gui.app_icon import apply_application_icon
 from sim2d.gui.perception_extension import install as install_perception
+from sim2d.gui.perception_view_rotation import (
+    install as install_perception_view_rotation,
+)
 from sim2d.gui.perception_viewer import install as install_perception_viewer
 from sim2d.gui.perception_viewer_bootstrap import (
     install as install_perception_viewer_bootstrap,
@@ -26,6 +29,9 @@ install_perception()
 # 占位 controller，再安装感知窗口扩展，避免构造阶段访问尚未创建的属性。
 install_perception_viewer_bootstrap()
 install_perception_viewer()
+
+# 仅改变感知调试窗口的显示方向：+x 向上，+y 向左。
+install_perception_view_rotation()
 
 from sim2d.gui.main_window import MainWindow  # noqa: E402
 
