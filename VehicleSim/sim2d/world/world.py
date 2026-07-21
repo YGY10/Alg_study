@@ -3,6 +3,9 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from sim2d.map.topology_repair import (
+    repair_road_network_topology,
+)
 from sim2d.map.types import RoadNetwork, TrafficSignal
 from sim2d.types import VehicleState
 from sim2d.world.road_deformation import (
@@ -64,11 +67,17 @@ class World:
         """
         使用同一连续形变场初始化世界道路与世界交通灯。
 
-        lane 的 predecessor/successor 关系直接继承地图层；几何使用
-        连续空间场变换，因此共享地图连接点不会因逐 lane 偏移而断裂。
+        首先保留 OpenDRIVE 显式拓扑，并根据 lane 端点位置与航向补全
+        缺失连接；随后世界道路继承修复后的 predecessor/successor。
+        几何仍使用同一个连续空间场，因此共享地图连接点在世界层映射
+        到同一个点，不会产生逐 lane 独立偏移导致的断裂。
         """
+        repaired_network = repair_road_network_topology(
+            road_network
+        )
+
         self.state.road_lanes = deform_road_network(
-            road_network,
+            repaired_network,
             deformation,
         )
 
@@ -78,7 +87,7 @@ class World:
                 deformation,
                 initial_signal_state,
             )
-            for signal in road_network.traffic_signals
+            for signal in repaired_network.traffic_signals
         )
 
     @staticmethod
