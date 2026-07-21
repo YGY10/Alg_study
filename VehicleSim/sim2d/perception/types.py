@@ -19,7 +19,10 @@ class PerceptionConfig:
     rear_range: float = 20.0
     lateral_range: float = 35.0
     field_of_view: float = 2.0 * np.pi
-    update_period: float = 0.10
+
+    # 与 EnvironmentConfig.dt=0.05 s 对齐。这样默认每个仿真帧都会生成
+    # 一帧新的感知结果，不会因为 10 Hz 缓存让调试视图看起来停住。
+    update_period: float = 0.05
     latency: float = 0.0
 
     position_noise_std: float = 0.0
