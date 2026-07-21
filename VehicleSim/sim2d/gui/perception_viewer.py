@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDockWidget,
     QGraphicsEllipseItem,
@@ -57,7 +58,10 @@ class PerceptionGraphicsView(QGraphicsView):
         self._draw_signals(snapshot)
         self._draw_ego()
         self._draw_status(snapshot)
-        self.fitInView(self.graphics_scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.fitInView(
+            self.graphics_scene.sceneRect(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+        )
 
     @staticmethod
     def _vehicle_point(snapshot, x: float, y: float) -> QPointF:
@@ -74,7 +78,11 @@ class PerceptionGraphicsView(QGraphicsView):
         )
 
     def _draw_grid(self, front: float, rear: float, lateral: float) -> None:
-        grid_pen = QPen(QColor(86, 105, 120, 80), 1.0, Qt.PenStyle.DotLine)
+        grid_pen = QPen(
+            QColor(86, 105, 120, 80),
+            1.0,
+            Qt.PenStyle.DotLine,
+        )
         grid_pen.setCosmetic(True)
         for x in range(-int(rear), int(front) + 1, 10):
             self.graphics_scene.addLine(
@@ -98,12 +106,18 @@ class PerceptionGraphicsView(QGraphicsView):
         x_pen.setCosmetic(True)
         y_pen.setCosmetic(True)
         self.graphics_scene.addLine(
-            -rear * _PIXELS_PER_METER, 0.0,
-            front * _PIXELS_PER_METER, 0.0, x_pen,
+            -rear * _PIXELS_PER_METER,
+            0.0,
+            front * _PIXELS_PER_METER,
+            0.0,
+            x_pen,
         )
         self.graphics_scene.addLine(
-            0.0, lateral * _PIXELS_PER_METER,
-            0.0, -lateral * _PIXELS_PER_METER, y_pen,
+            0.0,
+            lateral * _PIXELS_PER_METER,
+            0.0,
+            -lateral * _PIXELS_PER_METER,
+            y_pen,
         )
 
         x_text = self.graphics_scene.addSimpleText("+x 前进")
@@ -114,7 +128,11 @@ class PerceptionGraphicsView(QGraphicsView):
         y_text.setPos(6.0, -(lateral - 3.0) * _PIXELS_PER_METER)
 
     def _draw_lanes(self, snapshot) -> None:
-        center_pen = QPen(QColor("#62bfff"), 1.6, Qt.PenStyle.DashLine)
+        center_pen = QPen(
+            QColor("#62bfff"),
+            1.6,
+            Qt.PenStyle.DashLine,
+        )
         boundary_pen = QPen(QColor("#dce9f3"), 1.4)
         center_pen.setCosmetic(True)
         boundary_pen.setCosmetic(True)
@@ -127,9 +145,21 @@ class PerceptionGraphicsView(QGraphicsView):
             ):
                 if len(points) < 2:
                     continue
-                path = QPainterPath(self._vehicle_point(snapshot, points[0][0], points[0][1]))
+                path = QPainterPath(
+                    self._vehicle_point(
+                        snapshot,
+                        points[0][0],
+                        points[0][1],
+                    )
+                )
                 for point in points[1:]:
-                    path.lineTo(self._vehicle_point(snapshot, point[0], point[1]))
+                    path.lineTo(
+                        self._vehicle_point(
+                            snapshot,
+                            point[0],
+                            point[1],
+                        )
+                    )
                 item = QGraphicsPathItem(path)
                 item.setPen(pen)
                 self.graphics_scene.addItem(item)
@@ -139,7 +169,11 @@ class PerceptionGraphicsView(QGraphicsView):
             center = self._vehicle_point(snapshot, obj.x, obj.y)
             yaw = obj.yaw - snapshot.ego.yaw
             if obj.object_type == "circle":
-                radius = 0.5 * max(obj.length, obj.width) * _PIXELS_PER_METER
+                radius = (
+                    0.5
+                    * max(obj.length, obj.width)
+                    * _PIXELS_PER_METER
+                )
                 item = QGraphicsEllipseItem(
                     center.x() - radius,
                     center.y() - radius,
@@ -159,7 +193,9 @@ class PerceptionGraphicsView(QGraphicsView):
                     (-half_l, half_w),
                 ):
                     scene_x = center.x() + c * local_x - s * local_y
-                    scene_y = center.y() - (s * local_x + c * local_y)
+                    scene_y = center.y() - (
+                        s * local_x + c * local_y
+                    )
                     polygon.append(QPointF(scene_x, scene_y))
                 item = QGraphicsPolygonItem(polygon)
 
@@ -190,18 +226,33 @@ class PerceptionGraphicsView(QGraphicsView):
                 2.0 * radius,
             )
             item.setPen(QPen(QColor("#101010"), 1.2))
-            item.setBrush(QBrush(colors.get(signal.state, colors["unknown"])))
+            item.setBrush(
+                QBrush(
+                    colors.get(
+                        signal.state,
+                        colors["unknown"],
+                    )
+                )
+            )
             self.graphics_scene.addItem(item)
 
     def _draw_ego(self) -> None:
         length = 4.6 * _PIXELS_PER_METER
         width = 1.85 * _PIXELS_PER_METER
-        item = QGraphicsRectItem(-0.5 * length, -0.5 * width, length, width)
+        item = QGraphicsRectItem(
+            -0.5 * length,
+            -0.5 * width,
+            length,
+            width,
+        )
         item.setPen(QPen(QColor("#35f2ff"), 2.0))
         item.setBrush(QBrush(QColor(37, 205, 230, 150)))
         self.graphics_scene.addItem(item)
         self.graphics_scene.addLine(
-            0.0, 0.0, 0.65 * length, 0.0,
+            0.0,
+            0.0,
+            0.65 * length,
+            0.0,
             QPen(QColor("#ffffff"), 2.0),
         )
 
@@ -224,7 +275,9 @@ class PerceptionWindow(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent, Qt.WindowType.Window)
-        self.setWindowTitle("VehicleSim 2D - 感知视图（车辆坐标系）")
+        self.setWindowTitle(
+            "VehicleSim 2D - 感知视图（车辆坐标系）"
+        )
         self.resize(980, 680)
         self.view = PerceptionGraphicsView(self)
         layout = QVBoxLayout(self)
@@ -245,7 +298,9 @@ class PerceptionViewerController:
         if enabled:
             if self.viewer is None:
                 self.viewer = PerceptionWindow(self.main_window)
-                apply_application_icon(self.main_window.windowHandle().screen().virtualSiblings()[0] if False else None, self.viewer)
+                app = QApplication.instance()
+                if isinstance(app, QApplication):
+                    apply_application_icon(app, self.viewer)
                 self.viewer.closed.connect(self._viewer_closed)
             self.viewer.show()
             self.viewer.raise_()
@@ -256,14 +311,21 @@ class PerceptionViewerController:
 
     def _viewer_closed(self) -> None:
         self.viewer = None
-        checkbox = getattr(self.main_window, "show_perception_view_check", None)
+        checkbox = getattr(
+            self.main_window,
+            "show_perception_view_check",
+            None,
+        )
         if checkbox is not None:
             checkbox.blockSignals(True)
             checkbox.setChecked(False)
             checkbox.blockSignals(False)
 
     def update(self) -> None:
-        if self.viewer is None or not self.main_window.env.is_initialized:
+        if (
+            self.viewer is None
+            or not self.main_window.env.is_initialized
+        ):
             return
         snapshot = self.main_window.env.get_perception_snapshot()
         self.viewer.view.render_perception(snapshot)
@@ -280,18 +342,25 @@ def install() -> None:
 
     def init(self: MainWindow, *args, **kwargs) -> None:
         original_init(self, *args, **kwargs)
-        self.perception_viewer_controller = PerceptionViewerController(self)
+        self.perception_viewer_controller = PerceptionViewerController(
+            self
+        )
 
         dock = QDockWidget("感知调试", self)
         dock.setObjectName("perception_viewer_dock")
         panel = QWidget(dock)
         layout = QVBoxLayout(panel)
-        self.show_perception_view_check = QCheckBox("打开独立感知视图")
+        self.show_perception_view_check = QCheckBox(
+            "打开独立感知视图"
+        )
         self.show_perception_view_check.setChecked(False)
         layout.addWidget(self.show_perception_view_check)
         layout.addStretch(1)
         dock.setWidget(panel)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self.addDockWidget(
+            Qt.DockWidgetArea.RightDockWidgetArea,
+            dock,
+        )
         self.show_perception_view_check.toggled.connect(
             self.perception_viewer_controller.set_enabled
         )
