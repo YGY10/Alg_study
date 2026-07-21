@@ -75,6 +75,11 @@ class PerceptionConfig:
 
 @dataclass(frozen=True)
 class PerceivedObject:
+    """车辆坐标系中的感知目标。
+
+    x 为前向距离，y 为左向距离，yaw 为相对自车航向。
+    """
+
     object_id: str
     object_type: str
     x: float
@@ -88,6 +93,8 @@ class PerceivedObject:
 
 @dataclass(frozen=True)
 class PerceivedTrafficSignal:
+    """车辆坐标系中的感知交通灯。"""
+
     entity_id: str
     map_signal_id: str | None
     x: float
@@ -100,6 +107,8 @@ class PerceivedTrafficSignal:
 
 @dataclass(frozen=True)
 class PerceivedLaneSegment:
+    """车辆坐标系中的局部车道几何，所有点均为 [x_forward, y_left]。"""
+
     map_lane_id: str
     centerline: FloatArray
     left_boundary: FloatArray
@@ -118,6 +127,13 @@ class PerceivedLaneSegment:
 
 @dataclass(frozen=True)
 class PerceptionSnapshot:
+    """规划器可见的局部感知快照。
+
+    ego 是带感知误差的全局自车定位，用于地图匹配和兼容现有规划器。
+    objects、traffic_signals、road_segments 全部使用车辆坐标系：
+    +x 向前，+y 向左，自车原点为 (0, 0)，相对航向为 0。
+    """
+
     measurement_time: float
     publish_time: float
     frame: int
@@ -126,6 +142,7 @@ class PerceptionSnapshot:
     traffic_signals: tuple[PerceivedTrafficSignal, ...]
     road_segments: tuple[PerceivedLaneSegment, ...]
     source: str = "ground_truth_local"
+    coordinate_frame: str = "vehicle"
     debug: dict[str, Any] = field(default_factory=dict)
 
 
