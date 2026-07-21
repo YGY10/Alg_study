@@ -11,7 +11,6 @@ from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
     QGraphicsPathItem,
     QGraphicsPolygonItem,
-    QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsSimpleTextItem,
     QGraphicsView,
@@ -27,7 +26,7 @@ _PIXELS_PER_METER = 8.0
 
 
 class PerceptionGraphicsView(QGraphicsView):
-    """车辆坐标系下的局部感知结果：前方 +x，左侧 +y。"""
+    """直接显示车辆坐标系感知结果：+x 向上，+y 向左。"""
 
     def __init__(self, parent=None) -> None:
         self.graphics_scene = QGraphicsScene(parent)
@@ -37,19 +36,33 @@ class PerceptionGraphicsView(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setMinimumSize(760, 520)
 
+    @staticmethod
+    def _scene_point(x_forward: float, y_left: float) -> QPointF:
+        """车辆坐标映射到 Qt scene：前方朝上、左侧朝左。"""
+        return QPointF(
+            -float(y_left) * _PIXELS_PER_METER,
+            -float(x_forward) * _PIXELS_PER_METER,
+        )
+
     def render_perception(self, snapshot) -> None:
+        if snapshot.coordinate_frame != "vehicle":
+            raise ValueError(
+                "Perception viewer requires vehicle-frame data, got "
+                f"{snapshot.coordinate_frame!r}"
+            )
+
         self.graphics_scene.clear()
         debug = snapshot.debug
         front = float(debug.get("forward_range", 60.0))
         rear = float(debug.get("rear_range", 20.0))
         lateral = float(debug.get("lateral_range", 35.0))
-
         margin = 3.0
+
         self.graphics_scene.setSceneRect(
-            -(rear + margin) * _PIXELS_PER_METER,
             -(lateral + margin) * _PIXELS_PER_METER,
-            (front + rear + 2.0 * margin) * _PIXELS_PER_METER,
+            -(front + margin) * _PIXELS_PER_METER,
             2.0 * (lateral + margin) * _PIXELS_PER_METER,
+            (front + rear + 2.0 * margin) * _PIXELS_PER_METER,
         )
 
         self._draw_grid(front, rear, lateral)
@@ -63,20 +76,6 @@ class PerceptionGraphicsView(QGraphicsView):
             Qt.AspectRatioMode.KeepAspectRatio,
         )
 
-    @staticmethod
-    def _vehicle_point(snapshot, x: float, y: float) -> QPointF:
-        ego = snapshot.ego
-        dx = float(x) - ego.x
-        dy = float(y) - ego.y
-        c = math.cos(ego.yaw)
-        s = math.sin(ego.yaw)
-        longitudinal = c * dx + s * dy
-        lateral = -s * dx + c * dy
-        return QPointF(
-            longitudinal * _PIXELS_PER_METER,
-            -lateral * _PIXELS_PER_METER,
-        )
-
     def _draw_grid(self, front: float, rear: float, lateral: float) -> None:
         grid_pen = QPen(
             QColor(86, 105, 120, 80),
@@ -84,48 +83,59 @@ class PerceptionGraphicsView(QGraphicsView):
             Qt.PenStyle.DotLine,
         )
         grid_pen.setCosmetic(True)
-        for x in range(-int(rear), int(front) + 1, 10):
+
+        for x_forward in range(-int(rear), int(front) + 1, 10):
+            left = self._scene_point(x_forward, lateral)
+            right = self._scene_point(x_forward, -lateral)
             self.graphics_scene.addLine(
-                x * _PIXELS_PER_METER,
-                -lateral * _PIXELS_PER_METER,
-                x * _PIXELS_PER_METER,
-                lateral * _PIXELS_PER_METER,
-                grid_pen,
+                left.x(), left.y(), right.x(), right.y(), grid_pen
             )
-        for y in range(-int(lateral), int(lateral) + 1, 10):
+
+        for y_left in range(-int(lateral), int(lateral) + 1, 10):
+            back = self._scene_point(-rear, y_left)
+            ahead = self._scene_point(front, y_left)
             self.graphics_scene.addLine(
-                -rear * _PIXELS_PER_METER,
-                -y * _PIXELS_PER_METER,
-                front * _PIXELS_PER_METER,
-                -y * _PIXELS_PER_METER,
-                grid_pen,
+                back.x(), back.y(), ahead.x(), ahead.y(), grid_pen
             )
 
         x_pen = QPen(QColor("#40d7ff"), 2.0)
         y_pen = QPen(QColor("#7cff8f"), 2.0)
         x_pen.setCosmetic(True)
         y_pen.setCosmetic(True)
+
+        back = self._scene_point(-rear, 0.0)
+        ahead = self._scene_point(front, 0.0)
         self.graphics_scene.addLine(
-            -rear * _PIXELS_PER_METER,
-            0.0,
-            front * _PIXELS_PER_METER,
-            0.0,
-            x_pen,
+            back.x(), back.y(), ahead.x(), ahead.y(), x_pen
         )
+
+        right = self._scene_point(0.0, -lateral)
+        left = self._scene_point(0.0, lateral)
         self.graphics_scene.addLine(
-            0.0,
-            lateral * _PIXELS_PER_METER,
-            0.0,
-            -lateral * _PIXELS_PER_METER,
-            y_pen,
+            right.x(), right.y(), left.x(), left.y(), y_pen
         )
 
         x_text = self.graphics_scene.addSimpleText("+x 前进")
         x_text.setBrush(QBrush(QColor("#40d7ff")))
-        x_text.setPos((front - 8.0) * _PIXELS_PER_METER, 6.0)
+        x_text.setPos(6.0, -(front - 3.0) * _PIXELS_PER_METER)
+
         y_text = self.graphics_scene.addSimpleText("+y 左侧")
         y_text.setBrush(QBrush(QColor("#7cff8f")))
-        y_text.setPos(6.0, -(lateral - 3.0) * _PIXELS_PER_METER)
+        y_text.setPos(
+            -(lateral - 2.0) * _PIXELS_PER_METER,
+            6.0,
+        )
+
+    def _path_item(self, points, pen: QPen) -> None:
+        if len(points) < 2:
+            return
+        first = self._scene_point(points[0][0], points[0][1])
+        path = QPainterPath(first)
+        for point in points[1:]:
+            path.lineTo(self._scene_point(point[0], point[1]))
+        item = QGraphicsPathItem(path)
+        item.setPen(pen)
+        self.graphics_scene.addItem(item)
 
     def _draw_lanes(self, snapshot) -> None:
         center_pen = QPen(
@@ -138,36 +148,14 @@ class PerceptionGraphicsView(QGraphicsView):
         boundary_pen.setCosmetic(True)
 
         for lane in snapshot.road_segments:
-            for points, pen in (
-                (lane.left_boundary, boundary_pen),
-                (lane.right_boundary, boundary_pen),
-                (lane.centerline, center_pen),
-            ):
-                if len(points) < 2:
-                    continue
-                path = QPainterPath(
-                    self._vehicle_point(
-                        snapshot,
-                        points[0][0],
-                        points[0][1],
-                    )
-                )
-                for point in points[1:]:
-                    path.lineTo(
-                        self._vehicle_point(
-                            snapshot,
-                            point[0],
-                            point[1],
-                        )
-                    )
-                item = QGraphicsPathItem(path)
-                item.setPen(pen)
-                self.graphics_scene.addItem(item)
+            self._path_item(lane.left_boundary, boundary_pen)
+            self._path_item(lane.right_boundary, boundary_pen)
+            self._path_item(lane.centerline, center_pen)
 
     def _draw_objects(self, snapshot) -> None:
         for obj in snapshot.objects:
-            center = self._vehicle_point(snapshot, obj.x, obj.y)
-            yaw = obj.yaw - snapshot.ego.yaw
+            center = self._scene_point(obj.x, obj.y)
+
             if obj.object_type == "circle":
                 radius = (
                     0.5
@@ -181,22 +169,20 @@ class PerceptionGraphicsView(QGraphicsView):
                     2.0 * radius,
                 )
             else:
-                half_l = 0.5 * obj.length * _PIXELS_PER_METER
-                half_w = 0.5 * obj.width * _PIXELS_PER_METER
+                half_l = 0.5 * obj.length
+                half_w = 0.5 * obj.width
+                c = math.cos(obj.yaw)
+                s = math.sin(obj.yaw)
                 polygon = QPolygonF()
-                c = math.cos(yaw)
-                s = math.sin(yaw)
                 for local_x, local_y in (
                     (half_l, half_w),
                     (half_l, -half_w),
                     (-half_l, -half_w),
                     (-half_l, half_w),
                 ):
-                    scene_x = center.x() + c * local_x - s * local_y
-                    scene_y = center.y() - (
-                        s * local_x + c * local_y
-                    )
-                    polygon.append(QPointF(scene_x, scene_y))
+                    x_forward = obj.x + c * local_x - s * local_y
+                    y_left = obj.y + s * local_x + c * local_y
+                    polygon.append(self._scene_point(x_forward, y_left))
                 item = QGraphicsPolygonItem(polygon)
 
             item.setPen(QPen(QColor("#ff9e57"), 1.8))
@@ -217,7 +203,7 @@ class PerceptionGraphicsView(QGraphicsView):
             "unknown": QColor("#d8dde3"),
         }
         for signal in snapshot.traffic_signals:
-            center = self._vehicle_point(snapshot, signal.x, signal.y)
+            center = self._scene_point(signal.x, signal.y)
             radius = 4.5
             item = QGraphicsEllipseItem(
                 center.x() - radius,
@@ -227,32 +213,33 @@ class PerceptionGraphicsView(QGraphicsView):
             )
             item.setPen(QPen(QColor("#101010"), 1.2))
             item.setBrush(
-                QBrush(
-                    colors.get(
-                        signal.state,
-                        colors["unknown"],
-                    )
-                )
+                QBrush(colors.get(signal.state, colors["unknown"]))
             )
             self.graphics_scene.addItem(item)
 
     def _draw_ego(self) -> None:
-        length = 4.6 * _PIXELS_PER_METER
-        width = 1.85 * _PIXELS_PER_METER
-        item = QGraphicsRectItem(
-            -0.5 * length,
-            -0.5 * width,
-            length,
-            width,
+        half_l = 0.5 * 4.6
+        half_w = 0.5 * 1.85
+        polygon = QPolygonF(
+            [
+                self._scene_point(half_l, half_w),
+                self._scene_point(half_l, -half_w),
+                self._scene_point(-half_l, -half_w),
+                self._scene_point(-half_l, half_w),
+            ]
         )
+        item = QGraphicsPolygonItem(polygon)
         item.setPen(QPen(QColor("#35f2ff"), 2.0))
         item.setBrush(QBrush(QColor(37, 205, 230, 150)))
         self.graphics_scene.addItem(item)
+
+        origin = self._scene_point(0.0, 0.0)
+        heading = self._scene_point(3.0, 0.0)
         self.graphics_scene.addLine(
-            0.0,
-            0.0,
-            0.65 * length,
-            0.0,
+            origin.x(),
+            origin.y(),
+            heading.x(),
+            heading.y(),
             QPen(QColor("#ffffff"), 2.0),
         )
 
@@ -261,6 +248,7 @@ class PerceptionGraphicsView(QGraphicsView):
             f"感知帧 {snapshot.frame}  "
             f"measurement={snapshot.measurement_time:.2f}s  "
             f"publish={snapshot.publish_time:.2f}s  "
+            f"坐标系={snapshot.coordinate_frame}  "
             f"目标={len(snapshot.objects)}  "
             f"交通灯={len(snapshot.traffic_signals)}  "
             f"车道段={len(snapshot.road_segments)}"
