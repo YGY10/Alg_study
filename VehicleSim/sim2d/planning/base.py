@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from sim2d.types import Observation, PlanResult
+from sim2d.perception import PlanningInput
+from sim2d.types import PlanResult
 
 
 class Planner(ABC):
@@ -14,6 +15,11 @@ class Planner(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def plan(self, observation: Observation) -> PlanResult:
-        """根据当前观测生成控制量和规划轨迹。"""
+    def plan(self, planning_input: PlanningInput) -> PlanResult:
+        """
+        根据地图先验和局部感知生成控制量与规划轨迹。
+
+        PlanningInput 保留旧 Observation 的 time/frame/ego/obstacles/goal
+        字段，因此现有规划器可渐进迁移。
+        """
         raise NotImplementedError
