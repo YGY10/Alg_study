@@ -30,6 +30,9 @@ from sim2d.gui.graphics_items import (
     VehicleGraphicsItem,
     trajectory_to_path,
 )
+from sim2d.gui.traffic_signal_graphics import (
+    TrafficSignalGraphicsItem,
+)
 from sim2d.map import (
     Lane,
     LaneProjection,
@@ -183,6 +186,27 @@ class SimulationView(QGraphicsView):
         # True：调试模式，显示所有去重后的 lane 边界。
         self.show_lane_boundaries = False
 
+        # 交通灯总开关。
+        self.show_traffic_signals = True
+        self.show_traffic_signal_ids = False
+
+        # world: 只显示真实世界交通灯
+        # map: 只显示地图先验交通灯
+        # compare: 同时显示两层
+        self.traffic_signal_layer_mode = "world"
+
+        # 地图先验交通灯图元。
+        self.traffic_signal_items: list[TrafficSignalGraphicsItem] = []
+
+        # 真实世界交通灯动态图元，按 entity_id 复用。
+        self.world_traffic_signal_items: dict[
+            str,
+            TrafficSignalGraphicsItem,
+        ] = {}
+
+        # 小于该视图缩放比例时使用远景紧凑图标。
+        self.traffic_signal_detail_scale = 0.35
+
         # 边界线段量化精度，单位 m。
         # 用于识别方向相反或重复采样得到的同一物理边界。
         self.boundary_quantization = 0.01
@@ -275,6 +299,84 @@ class SimulationView(QGraphicsView):
 
         if self.road_network is not None:
             self.render_road_network(self.road_network)
+
+    def set_show_traffic_signals(
+        self,
+        visible: bool,
+    ) -> None:
+        """控制所有交通灯图层的总可见性。"""
+        visible = bool(visible)
+
+        if self.show_traffic_signals == visible:
+            return
+
+        self.show_traffic_signals = visible
+
+        if self.road_network is not None:
+            self.render_road_network(self.road_network)
+
+        self._apply_world_traffic_signal_visibility()
+
+    def set_traffic_signal_layer_mode(
+        self,
+        mode: str,
+    ) -> None:
+        """设置交通灯图层模式：world、map 或 compare。"""
+        normalized = str(mode).strip().lower()
+
+        if normalized not in {
+            "world",
+            "map",
+            "compare",
+        }:
+            raise ValueError("Unsupported traffic signal layer mode: " f"{mode!r}")
+
+        if self.traffic_signal_layer_mode == normalized:
+            return
+
+        self.traffic_signal_layer_mode = normalized
+
+        if self.road_network is not None:
+            self.render_road_network(self.road_network)
+
+        self._apply_world_traffic_signal_visibility()
+
+    def _traffic_signal_layer_visible(
+        self,
+        layer: str,
+    ) -> bool:
+        if not self.show_traffic_signals:
+            return False
+
+        if self.traffic_signal_layer_mode == "compare":
+            return True
+
+        return self.traffic_signal_layer_mode == layer
+
+    def _apply_world_traffic_signal_visibility(
+        self,
+    ) -> None:
+        visible = self._traffic_signal_layer_visible("world")
+
+        for item in self.world_traffic_signal_items.values():
+            item.setVisible(visible)
+
+    def set_show_traffic_signal_ids(
+        self,
+        visible: bool,
+    ) -> None:
+        """
+        控制交通灯 signal ID 调试标注。
+
+        ID 仅在 detailed 模式显示。
+        """
+        visible = bool(visible)
+
+        if self.show_traffic_signal_ids == visible:
+            return
+
+        self.show_traffic_signal_ids = visible
+        self._update_traffic_signal_display_mode()
 
     def set_selection_enabled(
         self,
@@ -633,6 +735,10 @@ class SimulationView(QGraphicsView):
         if self.show_lane_centerlines:
             self._draw_lane_centerlines(road_network.lanes)
 
+        # 第四层：地图先验交通灯。
+        if self._traffic_signal_layer_visible("map"):
+            self._draw_traffic_signals(road_network)
+
         if not all_points:
             self.graphics_scene.setSceneRect(
                 -10.0 * PIXELS_PER_METER,
@@ -666,6 +772,77 @@ class SimulationView(QGraphicsView):
             scene_width,
             scene_height,
         )
+
+    def _draw_traffic_signals(
+        self,
+        road_network: RoadNetwork,
+    ) -> None:
+        """
+        绘制 RoadNetwork 中的物理交通灯。
+
+        当前尚未接入运行时状态机，因此统一以 unknown 状态显示。
+        signalReference 不会产生额外图元。
+        """
+        display_mode = self._traffic_signal_display_mode()
+
+        self.traffic_signal_items.clear()
+
+        for signal in road_network.traffic_signals:
+            item = TrafficSignalGraphicsItem(
+                signal,
+                state="unknown",
+                show_id=self.show_traffic_signal_ids,
+                display_mode=display_mode,
+                layer="map",
+            )
+
+            self.graphics_scene.addItem(item)
+
+            self.traffic_signal_items.append(item)
+            self.map_items.append(item)
+
+    def _view_scale(
+        self,
+    ) -> float:
+        """
+        返回当前 QGraphicsView 的均匀缩放比例。
+
+        视图可能经过 -90 度旋转，因此不能只读取 m11。
+        """
+        transform = self.transform()
+
+        return math.hypot(
+            transform.m11(),
+            transform.m12(),
+        )
+
+    def _traffic_signal_display_mode(
+        self,
+    ) -> str:
+        if self._view_scale() < self.traffic_signal_detail_scale:
+            return "compact"
+
+        return "detailed"
+
+    def _update_traffic_signal_display_mode(
+        self,
+    ) -> None:
+        """
+        根据当前视图缩放比例切换所有交通灯图元。
+
+        只修改图元显示模式，不重新解析或重绘道路网络。
+        """
+        mode = self._traffic_signal_display_mode()
+
+        all_items = list(self.traffic_signal_items) + list(
+            self.world_traffic_signal_items.values()
+        )
+
+        for item in all_items:
+            item.set_display_mode(mode)
+
+            # ID 只在近景详细模式显示。
+            item.set_show_id(self.show_traffic_signal_ids and mode == "detailed")
 
     def _draw_lane_surface(
         self,
@@ -1142,6 +1319,7 @@ class SimulationView(QGraphicsView):
                 self.graphics_scene.removeItem(item)
 
         self.map_items.clear()
+        self.traffic_signal_items.clear()
 
     def render_snapshot(
         self,
@@ -1162,11 +1340,60 @@ class SimulationView(QGraphicsView):
         self.planned_item.setPath(trajectory_to_path(snapshot.planned_trajectory))
 
         self._update_obstacles(snapshot)
+        self._update_world_traffic_signals(snapshot)
 
         if snapshot.collision:
             self.vehicle_item.setBrush(QBrush(QColor("#d32f2f")))
         else:
             self.vehicle_item.setBrush(QBrush(QColor("#2386c8")))
+
+    def _update_world_traffic_signals(
+        self,
+        snapshot: SimulationSnapshot,
+    ) -> None:
+        """
+        使用 SimulationSnapshot 更新真实世界交通灯动态图层。
+
+        地图层图元由 render_road_network() 创建；
+        世界层图元在每个 snapshot 中按 entity_id 增量更新。
+        """
+        active_ids: set[str] = set()
+        display_mode = self._traffic_signal_display_mode()
+
+        for signal in snapshot.world_traffic_signals:
+            active_ids.add(signal.entity_id)
+
+            item = self.world_traffic_signal_items.get(signal.entity_id)
+
+            if item is None:
+                item = TrafficSignalGraphicsItem(
+                    signal,
+                    state=signal.state,
+                    show_id=(
+                        self.show_traffic_signal_ids and display_mode == "detailed"
+                    ),
+                    display_mode=display_mode,
+                    layer="world",
+                )
+
+                self.graphics_scene.addItem(item)
+
+                self.world_traffic_signal_items[signal.entity_id] = item
+            else:
+                item.update_signal(
+                    signal,
+                    state=signal.state,
+                )
+
+            item.setVisible(self.show_traffic_signals)
+
+        stale_ids = set(self.world_traffic_signal_items) - active_ids
+
+        for entity_id in stale_ids:
+            item = self.world_traffic_signal_items.pop(entity_id)
+
+            if item.scene() is self.graphics_scene:
+                self.graphics_scene.removeItem(item)
 
     def _update_obstacles(
         self,
@@ -1248,6 +1475,8 @@ class SimulationView(QGraphicsView):
             scene_rect,
             Qt.AspectRatioMode.KeepAspectRatio,
         )
+
+        self._update_traffic_signal_display_mode()
 
     def mouseMoveEvent(
         self,
@@ -1410,12 +1639,7 @@ class SimulationView(QGraphicsView):
     ) -> None:
         factor = 1.15 if event.angleDelta().y() > 0 else 1.0 / 1.15
 
-        transform = self.transform()
-
-        current_scale = math.hypot(
-            transform.m11(),
-            transform.m12(),
-        )
+        current_scale = self._view_scale()
 
         if factor > 1.0 and current_scale > 5.0:
             event.accept()
@@ -1429,5 +1653,7 @@ class SimulationView(QGraphicsView):
             factor,
             factor,
         )
+
+        self._update_traffic_signal_display_mode()
 
         event.accept()

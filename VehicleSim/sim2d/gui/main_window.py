@@ -64,6 +64,8 @@ from sim2d.types import (
     VehicleState,
 )
 
+from sim2d.world import TrafficLightState
+
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -536,8 +538,48 @@ class MainWindow(QMainWindow):
             self._on_show_lane_centerlines_changed
         )
 
+        self.show_traffic_signals_check = QCheckBox("显示交通灯")
+        self.show_traffic_signals_check.setChecked(True)
+        self.show_traffic_signals_check.toggled.connect(
+            self._on_show_traffic_signals_changed
+        )
+
+        self.traffic_signal_layer_combo = QComboBox()
+        self.traffic_signal_layer_combo.addItem(
+            "真实交通灯",
+            "world",
+        )
+        self.traffic_signal_layer_combo.addItem(
+            "地图交通灯",
+            "map",
+        )
+        self.traffic_signal_layer_combo.addItem(
+            "对比显示",
+            "compare",
+        )
+        self.traffic_signal_layer_combo.setCurrentIndex(0)
+        self.traffic_signal_layer_combo.currentIndexChanged.connect(
+            self._on_traffic_signal_layer_mode_changed
+        )
+
+        self.show_traffic_signal_ids_check = QCheckBox("显示交通灯 ID（调试）")
+        self.show_traffic_signal_ids_check.setChecked(False)
+        self.show_traffic_signal_ids_check.toggled.connect(
+            self._on_show_traffic_signal_ids_changed
+        )
+
         view_layout.addWidget(self.show_lane_boundaries_check)
         view_layout.addWidget(self.show_lane_centerlines_check)
+        view_layout.addWidget(self.show_traffic_signals_check)
+
+        traffic_signal_layer_form = QFormLayout()
+        traffic_signal_layer_form.addRow(
+            "交通灯图层",
+            self.traffic_signal_layer_combo,
+        )
+        view_layout.addLayout(traffic_signal_layer_form)
+
+        view_layout.addWidget(self.show_traffic_signal_ids_check)
 
         fit_button = QPushButton("适配整个场景")
 
@@ -1063,6 +1105,44 @@ class MainWindow(QMainWindow):
 
         self.append_log("MAP_DEBUG_CENTERLINES " f"enabled={bool(enabled)}")
 
+    def _on_show_traffic_signals_changed(
+        self,
+        enabled: bool,
+    ) -> None:
+        enabled = bool(enabled)
+
+        self.simulation_view.set_show_traffic_signals(enabled)
+
+        self.traffic_signal_layer_combo.setEnabled(enabled)
+        self.show_traffic_signal_ids_check.setEnabled(enabled)
+
+        self.append_log("TRAFFIC_SIGNALS " f"enabled={enabled}")
+
+    def _on_traffic_signal_layer_mode_changed(
+        self,
+        _: int,
+    ) -> None:
+        mode = self.traffic_signal_layer_combo.currentData()
+
+        if mode not in {
+            "world",
+            "map",
+            "compare",
+        }:
+            raise RuntimeError("Unknown traffic signal layer mode: " f"{mode!r}")
+
+        self.simulation_view.set_traffic_signal_layer_mode(mode)
+
+        self.append_log("TRAFFIC_SIGNAL_LAYER " f"mode={mode}")
+
+    def _on_show_traffic_signal_ids_changed(
+        self,
+        enabled: bool,
+    ) -> None:
+        self.simulation_view.set_show_traffic_signal_ids(enabled)
+
+        self.append_log("MAP_TRAFFIC_SIGNAL_IDS " f"enabled={bool(enabled)}")
+
     def _restore_last_opendrive_map(
         self,
     ) -> None:
@@ -1254,6 +1334,7 @@ class MainWindow(QMainWindow):
             f"reason={load_reason} "
             f"path={map_path} "
             f"lanes={road_network.lane_count} "
+            f"traffic_signals={road_network.traffic_signal_count} "
             f"topology_edges={topology_edge_count} "
             f"sample_step={self.map_sample_step:.3f}"
         )
@@ -1645,6 +1726,20 @@ class MainWindow(QMainWindow):
             obstacles=obstacles,
         )
 
+        # 地图层交通灯映射为真实世界交通灯。
+        # 当前默认无位姿偏差，后续可在这里配置地图误差。
+        if self.road_network is not None:
+            # self.env.initialize_world_traffic_signals(
+            #     self.road_network.traffic_signals,
+            # )
+            self.env.initialize_world_traffic_signals(
+                self.road_network.traffic_signals,
+                position_offset_x=0.8,
+                position_offset_y=0.4,
+                yaw_offset=0.05,
+                initial_state=TrafficLightState.RED,
+            )
+
         # 地图路线无需等待第一帧 plan()，场景应用或复位后立即显示。
         if self.current_lane_route is not None:
             self.env.set_planner_debug(
@@ -1955,7 +2050,15 @@ class MainWindow(QMainWindow):
         self,
         message: str,
     ) -> None:
-        prefix = f"[t={self.env.time:7.3f}] " f"[frame={self.env.frame:05d}] "
+        if self.env.is_initialized:
+            time_value = self.env.time
+            frame_value = self.env.frame
+        else:
+            # GUI 启动和 reset() 前置配置阶段可能产生日志。
+            time_value = 0.0
+            frame_value = 0
+
+        prefix = f"[t={time_value:7.3f}] " f"[frame={frame_value:05d}] "
 
         self.log_console.appendPlainText(prefix + message)
 

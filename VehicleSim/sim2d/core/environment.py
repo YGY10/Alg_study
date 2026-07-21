@@ -16,15 +16,23 @@ from sim2d.dynamics.base import (
 from sim2d.dynamics.kinematic_bicycle import (
     KinematicBicycleBackend,
 )
+from sim2d.map.types import TrafficSignal
 from sim2d.types import (
     GoalState,
     Observation,
     Obstacle,
     SimulationSnapshot,
     StepResult,
+    TrafficSignalSnapshot,
     VehicleConfig,
     VehicleControl,
     VehicleState,
+)
+from sim2d.world import (
+    TrafficLightState,
+    World,
+    WorldState,
+    WorldTrafficSignal,
 )
 
 
@@ -107,7 +115,7 @@ class DrivingEnv:
         repr=False,
     )
 
-    _ego_state: VehicleState | None = field(
+    _world: World | None = field(
         default=None,
         init=False,
         repr=False,
@@ -121,18 +129,6 @@ class DrivingEnv:
 
     _goal: GoalState | None = field(
         default=None,
-        init=False,
-        repr=False,
-    )
-
-    _obstacles: tuple[Obstacle, ...] = field(
-        default=(),
-        init=False,
-        repr=False,
-    )
-
-    _time: float = field(
-        default=0.0,
         init=False,
         repr=False,
     )
@@ -243,12 +239,20 @@ class DrivingEnv:
 
         reset_state = self._dynamics.reset(initial_state)
 
-        self._initial_state = reset_state
-        self._ego_state = reset_state
-        self._goal = goal
-        self._obstacles = tuple(obstacles)
+        world_obstacles = tuple(obstacles)
 
-        self._time = 0.0
+        self._world = World(
+            state=WorldState(
+                time=0.0,
+                ego_state=reset_state,
+                obstacles=world_obstacles,
+                traffic_signals=(),
+            )
+        )
+
+        self._initial_state = reset_state
+        self._goal = goal
+
         self._frame = 0
 
         self._terminated = False
@@ -257,7 +261,7 @@ class DrivingEnv:
         self._collision = has_collision(
             state=reset_state,
             config=self.vehicle_config,
-            obstacles=self._obstacles,
+            obstacles=self.world.state.obstacles,
         )
 
         self._goal_reached = self._check_goal_reached(reset_state)
@@ -267,7 +271,7 @@ class DrivingEnv:
         self._min_clearance = minimum_clearance(
             state=reset_state,
             config=self.vehicle_config,
-            obstacles=self._obstacles,
+            obstacles=self.world.state.obstacles,
         )
 
         self._history = [reset_state]
@@ -302,44 +306,45 @@ class DrivingEnv:
                 "Call reset() before stepping again."
             )
 
-        assert self._ego_state is not None
+        world_state = self.world.state
 
-        previous_distance = self._distance_to_goal(self._ego_state)
+        previous_distance = self._distance_to_goal(world_state.ego_state)
 
         next_state = self._dynamics.step(
             control=control,
             dt=self.environment_config.dt,
         )
 
-        self._ego_state = next_state
-
-        self._time += self.environment_config.dt
+        world_state = self.world.step(
+            dt=self.environment_config.dt,
+            ego_state=next_state,
+        )
 
         self._frame += 1
 
-        self._history.append(next_state)
+        self._history.append(world_state.ego_state)
 
         self._collision = has_collision(
-            state=next_state,
+            state=world_state.ego_state,
             config=self.vehicle_config,
-            obstacles=self._obstacles,
+            obstacles=world_state.obstacles,
         )
 
         self._min_clearance = minimum_clearance(
-            state=next_state,
+            state=world_state.ego_state,
             config=self.vehicle_config,
-            obstacles=self._obstacles,
+            obstacles=world_state.obstacles,
         )
 
-        self._goal_reached = self._check_goal_reached(next_state)
+        self._goal_reached = self._check_goal_reached(world_state.ego_state)
 
-        self._timeout = self._time >= self.environment_config.max_time
+        self._timeout = world_state.time >= self.environment_config.max_time
 
         self._terminated = self._collision or self._goal_reached
 
         self._truncated = self._timeout and not self._terminated
 
-        current_distance = self._distance_to_goal(next_state)
+        current_distance = self._distance_to_goal(world_state.ego_state)
 
         reward = self._compute_reward(
             previous_distance=previous_distance,
@@ -352,7 +357,7 @@ class DrivingEnv:
             "timeout": self._timeout,
             "min_clearance": self._min_clearance,
             "frame": self._frame,
-            "time": self._time,
+            "time": world_state.time,
             "control": control,
         }
 
@@ -370,14 +375,15 @@ class DrivingEnv:
         """
         self._require_initialized()
 
-        assert self._ego_state is not None
         assert self._goal is not None
 
+        world_state = self.world.state
+
         return Observation(
-            time=self._time,
+            time=world_state.time,
             frame=self._frame,
-            ego=self._ego_state,
-            obstacles=self._obstacles,
+            ego=world_state.ego_state,
+            obstacles=world_state.obstacles,
             goal=self._goal,
         )
 
@@ -387,19 +393,56 @@ class DrivingEnv:
         """
         self._require_initialized()
 
-        assert self._ego_state is not None
+        world_state = self.world.state
 
         return SimulationSnapshot(
             frame=self._frame,
-            time=self._time,
-            ego=self._ego_state,
-            obstacles=self._obstacles,
+            time=world_state.time,
+            ego=world_state.ego_state,
+            obstacles=world_state.obstacles,
             planned_trajectory=(self._copy_optional_array(self._planned_trajectory)),
             reference_path=(self._copy_optional_array(self._reference_path)),
             history_trajectory=(self._history_as_array()),
             collision=self._collision,
             min_clearance=self._min_clearance,
+            world_traffic_signals=tuple(
+                TrafficSignalSnapshot(
+                    entity_id=signal.entity_id,
+                    map_signal_id=signal.map_signal_id,
+                    x=float(signal.x),
+                    y=float(signal.y),
+                    yaw=float(signal.yaw),
+                    state=signal.state.value,
+                    remaining_time=signal.remaining_time,
+                )
+                for signal in world_state.traffic_signals
+            ),
             debug=dict(self._debug),
+        )
+
+    def initialize_world_traffic_signals(
+        self,
+        map_signals: tuple[TrafficSignal, ...],
+        *,
+        position_offset_x: float = 0.0,
+        position_offset_y: float = 0.0,
+        yaw_offset: float = 0.0,
+        initial_state: TrafficLightState = TrafficLightState.UNKNOWN,
+    ) -> tuple[WorldTrafficSignal, ...]:
+        """
+        从地图层交通灯初始化真实世界交通灯。
+
+        该接口与 reset() 分离，避免修改现有 reset 调用链。
+        调用前必须先完成 reset()，使 World 已经存在。
+        """
+        self._require_initialized()
+
+        return self.world.initialize_traffic_signals(
+            map_signals,
+            position_offset_x=position_offset_x,
+            position_offset_y=position_offset_y,
+            yaw_offset=yaw_offset,
+            initial_state=initial_state,
         )
 
     def set_planner_debug(
@@ -439,6 +482,11 @@ class DrivingEnv:
         self._debug = {} if debug is None else dict(debug)
 
     @property
+    def is_initialized(self) -> bool:
+        """环境是否已经完成至少一次 reset()。"""
+        return self._world is not None and self._goal is not None
+
+    @property
     def is_done(self) -> bool:
         return self._terminated or self._truncated
 
@@ -456,15 +504,24 @@ class DrivingEnv:
 
     @property
     def time(self) -> float:
-        return self._time
+        self._require_initialized()
+
+        return self.world.state.time
 
     @property
     def state(self) -> VehicleState:
         self._require_initialized()
 
-        assert self._ego_state is not None
+        return self.world.state.ego_state
 
-        return self._ego_state
+    @property
+    def world(self) -> World:
+        """返回当前真实世界容器。"""
+        self._require_initialized()
+
+        assert self._world is not None
+
+        return self._world
 
     def _compute_reward(
         self,
@@ -549,7 +606,7 @@ class DrivingEnv:
     def _require_initialized(
         self,
     ) -> None:
-        if self._ego_state is None or self._goal is None:
+        if not self.is_initialized:
             raise RuntimeError("Environment has not been reset. " "Call reset() first.")
 
     @staticmethod
