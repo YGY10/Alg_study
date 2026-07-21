@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Protocol
 
 from sim2d.core.environment import DrivingEnv
@@ -75,15 +76,35 @@ def _get_perception_snapshot(self: DrivingEnv):
     )
 
 
+def _vehicle_to_world(snapshot, x: float, y: float) -> tuple[float, float]:
+    """将车辆坐标系点转换回全局坐标，仅供旧规划器兼容字段使用。"""
+    ego = snapshot.ego
+    c = math.cos(ego.yaw)
+    s = math.sin(ego.yaw)
+    return (
+        ego.x + c * float(x) - s * float(y),
+        ego.y + s * float(x) + c * float(y),
+    )
+
+
+def _normalize_angle(angle: float) -> float:
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
 def _perceived_obstacles(snapshot) -> tuple[object, ...]:
+    """生成旧规划器使用的全局坐标障碍物兼容视图。
+
+    新规划器应直接使用 snapshot.objects，其中所有目标均为车辆坐标系。
+    """
     obstacles: list[object] = []
     for item in snapshot.objects:
+        world_x, world_y = _vehicle_to_world(snapshot, item.x, item.y)
         if item.object_type == "circle":
             obstacles.append(
                 CircleObstacle(
                     obstacle_id=item.object_id,
-                    x=item.x,
-                    y=item.y,
+                    x=world_x,
+                    y=world_y,
                     radius=0.5 * max(item.length, item.width),
                 )
             )
@@ -91,9 +112,9 @@ def _perceived_obstacles(snapshot) -> tuple[object, ...]:
             obstacles.append(
                 BoxObstacle(
                     obstacle_id=item.object_id,
-                    x=item.x,
-                    y=item.y,
-                    yaw=item.yaw,
+                    x=world_x,
+                    y=world_y,
+                    yaw=_normalize_angle(snapshot.ego.yaw + item.yaw),
                     length=item.length,
                     width=item.width,
                 )
@@ -102,11 +123,10 @@ def _perceived_obstacles(snapshot) -> tuple[object, ...]:
 
 
 def _get_planning_input(self: DrivingEnv) -> PlanningInput:
-    """
-    返回规划器输入。
+    """返回规划器输入。
 
-    旧规划器继续读取 time/frame/ego/obstacles/goal；新规划器可进一步读取
-    perception、map_network 和 previous_trajectory。
+    perception 内的目标、交通灯和车道几何均为车辆坐标系。为保持现有
+    BezierPlanner 可运行，顶层 obstacles 仍提供转换后的全局坐标兼容视图。
     """
     self._require_initialized()
     assert self._goal is not None
