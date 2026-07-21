@@ -53,6 +53,9 @@ class World:
         if ego_state is not None:
             self.state.ego_state = ego_state
 
+        for signal in self.state.traffic_signals:
+            signal.advance(dt)
+
         self.state.time += dt
 
         return self.state
@@ -62,15 +65,13 @@ class World:
         road_network: RoadNetwork,
         deformation: RoadDeformationConfig,
         *,
-        initial_signal_state: TrafficLightState = TrafficLightState.UNKNOWN,
+        initial_signal_state: TrafficLightState = TrafficLightState.RED,
     ) -> None:
         """
         使用同一连续形变场初始化世界道路与世界交通灯。
 
-        首先保留 OpenDRIVE 显式拓扑，并根据 lane 端点位置与航向补全
-        缺失连接；随后世界道路继承修复后的 predecessor/successor。
-        几何仍使用同一个连续空间场，因此共享地图连接点在世界层映射
-        到同一个点，不会产生逐 lane 独立偏移导致的断裂。
+        世界交通灯按索引分配相位偏移，使同一地图上的灯不会全部同步
+        变色。当前是确定性测试周期，后续可替换为 controller 分组周期。
         """
         repaired_network = repair_road_network_topology(
             road_network
@@ -86,8 +87,11 @@ class World:
                 signal,
                 deformation,
                 initial_signal_state,
+                phase_offset=(index % 4) * 6.25,
             )
-            for signal in repaired_network.traffic_signals
+            for index, signal in enumerate(
+                repaired_network.traffic_signals
+            )
         )
 
     @staticmethod
@@ -95,6 +99,8 @@ class World:
         signal: TrafficSignal,
         deformation: RoadDeformationConfig,
         state: TrafficLightState,
+        *,
+        phase_offset: float = 0.0,
     ) -> WorldTrafficSignal:
         x, y, yaw = deform_pose(
             x=signal.x,
@@ -112,7 +118,7 @@ class World:
             y=y,
             yaw=yaw,
             state=state,
-            remaining_time=None,
+            phase_offset=phase_offset,
         )
 
     def initialize_traffic_signals(
@@ -122,9 +128,9 @@ class World:
         position_offset_x: float = 0.0,
         position_offset_y: float = 0.0,
         yaw_offset: float = 0.0,
-        initial_state: TrafficLightState = TrafficLightState.UNKNOWN,
+        initial_state: TrafficLightState = TrafficLightState.RED,
     ) -> tuple[WorldTrafficSignal, ...]:
-        """保留旧接口，用统一刚体偏差初始化交通灯。"""
+        """保留旧接口，用统一刚体偏差初始化动态交通灯。"""
         world_signals = tuple(
             WorldTrafficSignal.from_map_signal(
                 signal,
@@ -132,8 +138,9 @@ class World:
                 position_offset_y=position_offset_y,
                 yaw_offset=yaw_offset,
                 state=initial_state,
+                phase_offset=(index % 4) * 6.25,
             )
-            for signal in map_signals
+            for index, signal in enumerate(map_signals)
         )
 
         self.state.traffic_signals = world_signals
