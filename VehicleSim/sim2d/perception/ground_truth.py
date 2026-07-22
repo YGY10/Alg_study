@@ -6,8 +6,8 @@ from dataclasses import replace
 
 import numpy as np
 
+from sim2d.perception.ideal_lane_sensor import perceive_lane_corridors
 from sim2d.perception.types import (
-    PerceivedLaneSegment,
     PerceivedObject,
     PerceivedTrafficSignal,
     PerceptionConfig,
@@ -18,10 +18,11 @@ from sim2d.world.state import WorldState
 
 
 class GroundTruthLocalPerception:
-    """第一版局部真值感知。
+    """局部理想感知。
 
-    数据来自 World，但仅发布自车附近有限范围内的信息。除 ego 全局定位外，
-    目标、交通灯和道路几何统一转换到车辆坐标系：+x 向前，+y 向左。
+    数据来自 World，但只通过有限视野的局部几何扫描发布给规划器。
+    目标、交通灯和道路几何统一位于车辆坐标系：+x 向前，+y 向左。
+    道路感知不发布地图 lane id、前驱或后继拓扑。
     """
 
     def __init__(self, config: PerceptionConfig | None = None) -> None:
@@ -87,12 +88,11 @@ class GroundTruthLocalPerception:
             if self._rng.random() >= self.config.signal_dropout_probability
         )
 
-        road_segments = tuple(
-            segment
-            for lane in world_state.road_lanes
-            if self._rng.random() >= self.config.lane_dropout_probability
-            for segment in (self._clip_lane(lane, ego),)
-            if segment is not None
+        road_segments = perceive_lane_corridors(
+            world_state.road_lanes,
+            ego,
+            self.config,
+            self._rng,
         )
 
         return PerceptionSnapshot(
@@ -103,6 +103,7 @@ class GroundTruthLocalPerception:
             objects=objects,
             traffic_signals=signals,
             road_segments=road_segments,
+            source="ideal_lane_scan",
             coordinate_frame="vehicle",
             debug={
                 "coordinate_frame": "vehicle",
@@ -113,6 +114,12 @@ class GroundTruthLocalPerception:
                 "lateral_range": self.config.lateral_range,
                 "update_period": self.config.update_period,
                 "latency": self.config.latency,
+                "lane_sensor": "transverse_scan_plus_fan_rays",
+                "lane_transverse_spacing": self.config.lane_transverse_spacing,
+                "lane_ray_count": self.config.lane_ray_count,
+                "lane_ray_half_angle": self.config.lane_ray_half_angle,
+                "lane_corridor_count": len(road_segments),
+                "lane_topology_published": False,
             },
         )
 
@@ -139,11 +146,11 @@ class GroundTruthLocalPerception:
     ) -> tuple[float, float]:
         dx = float(x) - ego.x
         dy = float(y) - ego.y
-        c = math.cos(ego.yaw)
-        s = math.sin(ego.yaw)
+        cosine = math.cos(ego.yaw)
+        sine = math.sin(ego.yaw)
         return (
-            c * dx + s * dy,
-            -s * dx + c * dy,
+            cosine * dx + sine * dy,
+            -sine * dx + cosine * dy,
         )
 
     @staticmethod
@@ -250,55 +257,4 @@ class GroundTruthLocalPerception:
             yaw=relative_yaw,
             state=signal.state.value,
             remaining_time=signal.remaining_time,
-        )
-
-    def _clip_lane(
-        self,
-        lane,
-        ego: VehicleState,
-    ) -> PerceivedLaneSegment | None:
-        centerline = np.asarray(lane.centerline, dtype=np.float64)
-        visible = np.asarray(
-            [
-                self._inside_view(ego, point[0], point[1])
-                for point in centerline
-            ],
-            dtype=bool,
-        )
-        indices = np.flatnonzero(visible)
-        if indices.size == 0:
-            return None
-
-        start = max(0, int(indices[0]) - 1)
-        end = min(centerline.shape[0], int(indices[-1]) + 2)
-        if end - start < 2:
-            return None
-
-        def transform_points(points) -> np.ndarray:
-            world_points = np.asarray(points, dtype=np.float64)[start:end]
-            dx = world_points[:, 0] - ego.x
-            dy = world_points[:, 1] - ego.y
-            c = math.cos(ego.yaw)
-            s = math.sin(ego.yaw)
-            local = np.column_stack(
-                (
-                    c * dx + s * dy,
-                    -s * dx + c * dy,
-                )
-            )
-            if self.config.position_noise_std > 0.0:
-                local += self._rng.normal(
-                    0.0,
-                    self.config.position_noise_std,
-                    local.shape,
-                )
-            return local
-
-        return PerceivedLaneSegment(
-            map_lane_id=lane.map_lane_id,
-            centerline=transform_points(lane.centerline),
-            left_boundary=transform_points(lane.left_boundary),
-            right_boundary=transform_points(lane.right_boundary),
-            predecessor_ids=lane.predecessor_ids,
-            successor_ids=lane.successor_ids,
         )
