@@ -63,6 +63,7 @@ class ConstantVelocityPredictor:
 
         return PredictedObjectTrajectory(
             object_id=obj.object_id,
+            object_type=obj.object_type,
             semantic_type=obj.semantic_type,
             times=times,
             positions=positions,
@@ -70,5 +71,5 @@ class ConstantVelocityPredictor:
             speed=obj.speed,
             length=obj.length,
             width=obj.width,
-            radius=obj.radius,
+            confidence=obj.confidence,
         )

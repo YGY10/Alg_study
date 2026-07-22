@@ -152,6 +152,7 @@ class OptimizationResult:
 @dataclass(frozen=True)
 class PredictedObjectTrajectory:
     object_id: str
+    object_type: str
     semantic_type: str
     times: FloatArray
     positions: FloatArray
@@ -159,7 +160,7 @@ class PredictedObjectTrajectory:
     speed: float
     length: float
     width: float
-    radius: float | None = None
+    confidence: float
 
 
 @dataclass(frozen=True)
