@@ -30,6 +30,12 @@ class PerceptionConfig:
     lane_dropout_probability: float = 0.0
     random_seed: int = 0
 
+    # 理想车道几何传感器：近处横向扫描 + 前向扇形射线扫描。
+    lane_transverse_spacing: float = 1.0
+    lane_ray_count: int = 121
+    lane_ray_half_angle: float = np.deg2rad(100.0)
+    lane_output_point_count: int = 81
+
     def validate(self) -> None:
         values = np.asarray(
             [
@@ -45,6 +51,8 @@ class PerceptionConfig:
                 self.object_dropout_probability,
                 self.signal_dropout_probability,
                 self.lane_dropout_probability,
+                self.lane_transverse_spacing,
+                self.lane_ray_half_angle,
             ],
             dtype=np.float64,
         )
@@ -71,6 +79,17 @@ class PerceptionConfig:
             self.speed_noise_std,
         ) < 0.0:
             raise ValueError("Noise standard deviations must be non-negative")
+        if self.lane_transverse_spacing <= 0.0:
+            raise ValueError("lane_transverse_spacing must be positive")
+        if not isinstance(self.lane_ray_count, int) or self.lane_ray_count < 3:
+            raise ValueError("lane_ray_count must be an integer >= 3")
+        if not 0.0 < self.lane_ray_half_angle <= np.pi:
+            raise ValueError("lane_ray_half_angle must be within (0, pi]")
+        if (
+            not isinstance(self.lane_output_point_count, int)
+            or self.lane_output_point_count < 2
+        ):
+            raise ValueError("lane_output_point_count must be an integer >= 2")
 
 
 @dataclass(frozen=True)
