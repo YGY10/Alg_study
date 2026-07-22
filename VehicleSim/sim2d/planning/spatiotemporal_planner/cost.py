@@ -283,7 +283,7 @@ class SpatiotemporalCost:
 
             total += float(confidence_scale * object_cost)
 
-        return total / len(predictions.trajectories)
+        return total
 
     def _safety_margin(
         self,

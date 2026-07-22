@@ -18,6 +18,8 @@ from .types import (
     PredictedObjectTrajectory,
     SpatiotemporalTrajectory,
 )
+from .optimizer import SpatiotemporalOptimizer
+from .cost import SpatiotemporalCost
 
 __all__ = [
     "ConstantVelocityPredictor",
@@ -36,4 +38,6 @@ __all__ = [
     "world_goal_to_local",
     "world_reference_path_to_local",
     "world_state_to_local",
+    "SpatiotemporalOptimizer",
+    "SpatiotemporalCost",
 ]

@@ -38,6 +38,11 @@ class SpatiotemporalPlannerConfig:
     initial_step_size: float = 0.05
     # 碰撞软约束
     collision_softness: float = 0.5
+    # 优化收敛与线搜索
+    gradient_tolerance: float = 1e-4
+    cost_tolerance: float = 1e-6
+    line_search_decay: float = 0.5
+    min_step_size: float = 1e-6
 
     def validate(self) -> None:
         if self.dt <= 0.0:
@@ -54,3 +59,26 @@ class SpatiotemporalPlannerConfig:
 
         if self.collision_softness <= 0.0:
             raise ValueError("collision_softness must be positive")
+        if self.max_iterations <= 0:
+            raise ValueError("max_iterations must be positive")
+
+        if self.gradient_epsilon <= 0.0:
+            raise ValueError("gradient_epsilon must be positive")
+
+        if self.initial_step_size <= 0.0:
+            raise ValueError("initial_step_size must be positive")
+
+        if self.gradient_tolerance < 0.0:
+            raise ValueError("gradient_tolerance must be non-negative")
+
+        if self.cost_tolerance < 0.0:
+            raise ValueError("cost_tolerance must be non-negative")
+
+        if not 0.0 < self.line_search_decay < 1.0:
+            raise ValueError("line_search_decay must be within (0, 1)")
+
+        if self.min_step_size <= 0.0:
+            raise ValueError("min_step_size must be positive")
+
+        if self.min_step_size > self.initial_step_size:
+            raise ValueError("min_step_size must not exceed initial_step_size")
