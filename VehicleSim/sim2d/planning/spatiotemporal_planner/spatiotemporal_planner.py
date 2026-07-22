@@ -19,13 +19,21 @@ from .coordinates import (
     build_local_planning_context,
     local_trajectory_to_world,
 )
+from .lane_reference import (
+    build_perception_lane_reference,
+    local_reference_path_to_world,
+)
 from .optimizer import SpatiotemporalOptimizer
 from .prediction import ConstantVelocityPredictor
 from .types import OptimizationResult
 
 
 class SpatiotemporalPlanner(Planner):
-    """冻结自车坐标系下的时空联合规划器。"""
+    """冻结自车坐标系下的时空联合规划器。
+
+    正常道路行驶优先跟随感知车道中心线；地图导航路径只作为高层
+    路线先验和感知车道不可用时的几何 fallback，不再默认逐点跟踪。
+    """
 
     def __init__(
         self,
@@ -35,6 +43,8 @@ class SpatiotemporalPlanner(Planner):
         fallback_handle_scale: float = 0.35,
         fallback_minimum_handle_length: float = 2.0,
         fallback_maximum_handle_length: float = 12.0,
+        perception_lane_minimum_confidence: float = 0.5,
+        perception_lane_maximum_distance: float = 6.0,
     ) -> None:
         vehicle_config.validate()
 
@@ -53,6 +63,14 @@ class SpatiotemporalPlanner(Planner):
                 "fallback_maximum_handle_length must not be smaller "
                 "than fallback_minimum_handle_length"
             )
+        if not 0.0 <= perception_lane_minimum_confidence <= 1.0:
+            raise ValueError(
+                "perception_lane_minimum_confidence must be within [0, 1]"
+            )
+        if perception_lane_maximum_distance <= 0.0:
+            raise ValueError(
+                "perception_lane_maximum_distance must be positive"
+            )
 
         self.vehicle_config = vehicle_config
         self.config = config
@@ -61,6 +79,12 @@ class SpatiotemporalPlanner(Planner):
         self.fallback_handle_scale = fallback_handle_scale
         self.fallback_minimum_handle_length = fallback_minimum_handle_length
         self.fallback_maximum_handle_length = fallback_maximum_handle_length
+        self.perception_lane_minimum_confidence = (
+            perception_lane_minimum_confidence
+        )
+        self.perception_lane_maximum_distance = (
+            perception_lane_maximum_distance
+        )
 
         self.predictor = ConstantVelocityPredictor()
         self.optimizer = SpatiotemporalOptimizer(
@@ -68,7 +92,7 @@ class SpatiotemporalPlanner(Planner):
             vehicle_config=vehicle_config,
         )
 
-        # 参考路径均保存在世界坐标系中，列为：
+        # 地图导航路径均保存在世界坐标系中，列为：
         # [x, y, yaw, arc_length, curvature]。
         self._external_reference_path: np.ndarray | None = None
         self._fallback_reference_path: np.ndarray | None = None
@@ -77,18 +101,25 @@ class SpatiotemporalPlanner(Planner):
         self._previous_controls: np.ndarray | None = None
         self._previous_control: VehicleControl | None = None
         self._last_optimization_result: OptimizationResult | None = None
+        self._last_reference_source: str | None = None
+        self._last_perception_lane_id: str | None = None
 
     def reset(self) -> None:
-        """清除 episode 状态；外部参考路径也会被清除。"""
+        """清除 episode 状态；外部地图路径也会被清除。"""
         self._external_reference_path = None
         self._fallback_reference_path = None
         self._fallback_goal_signature = None
-        self._previous_controls = None
-        self._previous_control = None
+        self._clear_warm_start()
         self._last_optimization_result = None
+        self._last_reference_source = None
+        self._last_perception_lane_id = None
 
     def set_reference_path(self, reference_path: np.ndarray) -> None:
-        """设置世界坐标地图参考路径，格式为 [N, 5]。"""
+        """设置世界坐标地图导航路径，格式为 [N, 5]。
+
+        该路径不再作为正常车道跟随的默认几何参考；当感知车道不可用
+        时，规划器才使用它作为 fallback。
+        """
         path = np.asarray(reference_path, dtype=np.float64)
         self._validate_reference_path(path)
 
@@ -98,7 +129,7 @@ class SpatiotemporalPlanner(Planner):
         self._clear_warm_start()
 
     def clear_external_reference_path(self) -> None:
-        """清除外部路径，下一次规划回退到自动 Bézier 路径。"""
+        """清除外部地图路径，保留自动 Bézier fallback 能力。"""
         self._external_reference_path = None
         self._fallback_reference_path = None
         self._fallback_goal_signature = None
@@ -113,16 +144,63 @@ class SpatiotemporalPlanner(Planner):
         return self._last_optimization_result
 
     def plan(self, planning_input: PlanningInput) -> PlanResult:
-        """优化当前控制量，并返回世界坐标预测轨迹。"""
-        world_reference_path = self._ensure_reference_path(
+        """优先基于感知车道优化控制，并返回世界坐标预测轨迹。"""
+        navigation_world_path = self._ensure_navigation_path(
             ego=planning_input.ego,
             goal=planning_input.goal,
         )
 
         context = build_local_planning_context(
             planning_input=planning_input,
-            reference_path=world_reference_path,
+            reference_path=navigation_world_path,
         )
+
+        perception_lane = build_perception_lane_reference(
+            context.road_segments,
+            minimum_confidence=(
+                self.perception_lane_minimum_confidence
+            ),
+            maximum_lateral_distance=(
+                self.perception_lane_maximum_distance
+            ),
+        )
+
+        if perception_lane is not None:
+            optimization_reference = perception_lane.reference_path
+            output_reference_path = local_reference_path_to_world(
+                perception_lane.reference_path,
+                context.world_origin,
+            )
+            reference_source = "perception_lane"
+            perception_lane_id = perception_lane.lane_id
+            perception_lane_confidence = perception_lane.confidence
+        else:
+            if context.reference_path is None:
+                raise RuntimeError(
+                    "no perception lane and no navigation fallback path"
+                )
+            optimization_reference = context.reference_path
+            output_reference_path = navigation_world_path.copy()
+            reference_source = (
+                "navigation_fallback"
+                if self.has_external_reference_path
+                else "bezier_fallback"
+            )
+            perception_lane_id = None
+            perception_lane_confidence = None
+
+        reference_changed = (
+            self._last_reference_source is not None
+            and (
+                self._last_reference_source != reference_source
+                or self._last_perception_lane_id != perception_lane_id
+            )
+        )
+        if reference_changed:
+            self._clear_warm_start()
+
+        self._last_reference_source = reference_source
+        self._last_perception_lane_id = perception_lane_id
 
         warm_start_used = (
             self._previous_controls is not None
@@ -151,7 +229,7 @@ class SpatiotemporalPlanner(Planner):
             ego_state=context.ego,
             initial_controls=initial_controls,
             predictions=predictions,
-            reference_path=context.reference_path,
+            reference_path=optimization_reference,
             previous_control=self._previous_control,
         )
 
@@ -174,7 +252,7 @@ class SpatiotemporalPlanner(Planner):
             action=action,
             trajectory=world_trajectory.states.copy(),
             controls=local_trajectory.controls.copy(),
-            reference_path=world_reference_path.copy(),
+            reference_path=output_reference_path.copy(),
             debug={
                 "planner": "SpatiotemporalPlanner",
                 "status": optimization_result.status,
@@ -194,13 +272,25 @@ class SpatiotemporalPlanner(Planner):
                 "coordinate_frame_internal": "frozen_vehicle",
                 "coordinate_frame_output": "world",
                 "perceived_object_count": len(context.objects),
-                "reference_path_points": world_reference_path.shape[0],
-                "reference_path_source": (
+                "perceived_lane_count": len(context.road_segments),
+                "perception_lane_id": perception_lane_id,
+                "perception_lane_confidence": (
+                    perception_lane_confidence
+                ),
+                "reference_path_points": (
+                    output_reference_path.shape[0]
+                ),
+                "reference_path_source": reference_source,
+                "navigation_path_available": (
+                    navigation_world_path is not None
+                ),
+                "navigation_path_source": (
                     "external"
                     if self.has_external_reference_path
                     else "fallback_bezier"
                 ),
                 "warm_start_used": warm_start_used,
+                "reference_changed": reference_changed,
             },
         )
 
@@ -227,12 +317,13 @@ class SpatiotemporalPlanner(Planner):
         )
         return controls
 
-    def _ensure_reference_path(
+    def _ensure_navigation_path(
         self,
         *,
         ego: VehicleState,
         goal: GoalState,
     ) -> np.ndarray:
+        """返回地图导航路径或无地图时的 Bézier fallback。"""
         if self._external_reference_path is not None:
             return self._external_reference_path
 
