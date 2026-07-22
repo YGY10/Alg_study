@@ -26,6 +26,10 @@ from sim2d.gui.traffic_actor_editor import install as install_traffic_actor_edit
 from sim2d.perception.traffic_actor_extension import (
     install as install_traffic_actor_perception,
 )
+from sim2d.planning import (
+    SpatiotemporalPlanner,
+    SpatiotemporalPlannerConfig,
+)
 
 install_road_layers()
 install_road_compare()
@@ -58,6 +62,24 @@ def main() -> None:
     apply_application_icon(app)
 
     window = MainWindow()
+
+    # MainWindow 为兼容旧入口仍会先构造 BezierPlanner。GUI 完成构造后，
+    # 在这里切换为时空联合规划器，并重新执行 reset_environment()，使地图
+    # 路线、感知输入和场景编辑扩展全部直接使用新规划器。
+    window.planner = SpatiotemporalPlanner(
+        vehicle_config=window.vehicle_config,
+        config=SpatiotemporalPlannerConfig(
+            dt=0.1,
+            horizon_steps=20,
+            target_speed=4.0,
+            max_iterations=3,
+            gradient_epsilon=1e-3,
+            initial_step_size=0.02,
+        ),
+    )
+    window.setWindowTitle("VehicleSim 2D - 时空联合规划器")
+    window.reset_environment()
+
     apply_application_icon(app, window)
     window.show()
 
