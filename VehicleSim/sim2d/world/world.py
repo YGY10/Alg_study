@@ -3,9 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from sim2d.map.topology_repair import (
-    repair_road_network_topology,
-)
+from sim2d.map.topology_repair import repair_road_network_topology
 from sim2d.map.types import RoadNetwork, TrafficSignal
 from sim2d.types import VehicleState
 from sim2d.world.road_deformation import (
@@ -14,6 +12,7 @@ from sim2d.world.road_deformation import (
     deform_road_network,
 )
 from sim2d.world.state import WorldState
+from sim2d.world.traffic_actor import advance_obstacle
 from sim2d.world.traffic_signal import (
     TrafficLightState,
     WorldTrafficSignal,
@@ -39,25 +38,25 @@ class World:
             )
 
         dt = float(dt)
-
         if not math.isfinite(dt):
-            raise ValueError(
-                f"dt must be finite, got {dt}"
-            )
-
+            raise ValueError(f"dt must be finite, got {dt}")
         if dt <= 0.0:
-            raise ValueError(
-                f"dt must be positive, got {dt}"
-            )
+            raise ValueError(f"dt must be positive, got {dt}")
 
         if ego_state is not None:
             self.state.ego_state = ego_state
+
+        # 行人、小车和大车按各自初始方向做恒速运动。静态旧障碍物没有
+        # speed 属性，advance_obstacle 会原样返回，保持向后兼容。
+        self.state.obstacles = tuple(
+            advance_obstacle(obstacle, dt)
+            for obstacle in self.state.obstacles
+        )
 
         for signal in self.state.traffic_signals:
             signal.advance(dt)
 
         self.state.time += dt
-
         return self.state
 
     def initialize_map_geometry(
@@ -67,21 +66,12 @@ class World:
         *,
         initial_signal_state: TrafficLightState = TrafficLightState.RED,
     ) -> None:
-        """
-        使用同一连续形变场初始化世界道路与世界交通灯。
-
-        世界交通灯按索引分配相位偏移，使同一地图上的灯不会全部同步
-        变色。当前是确定性测试周期，后续可替换为 controller 分组周期。
-        """
-        repaired_network = repair_road_network_topology(
-            road_network
-        )
-
+        """使用同一连续形变场初始化世界道路与世界交通灯。"""
+        repaired_network = repair_road_network_topology(road_network)
         self.state.road_lanes = deform_road_network(
             repaired_network,
             deformation,
         )
-
         self.state.traffic_signals = tuple(
             self._deform_traffic_signal(
                 signal,
@@ -89,9 +79,7 @@ class World:
                 initial_signal_state,
                 phase_offset=(index % 4) * 6.25,
             )
-            for index, signal in enumerate(
-                repaired_network.traffic_signals
-            )
+            for index, signal in enumerate(repaired_network.traffic_signals)
         )
 
     @staticmethod
@@ -108,9 +96,7 @@ class World:
             yaw=signal.yaw,
             config=deformation,
         )
-
         signal_id = str(signal.signal_id)
-
         return WorldTrafficSignal(
             entity_id=f"world_signal_{signal_id}",
             map_signal_id=signal_id,
@@ -142,7 +128,5 @@ class World:
             )
             for index, signal in enumerate(map_signals)
         )
-
         self.state.traffic_signals = world_signals
-
         return world_signals
