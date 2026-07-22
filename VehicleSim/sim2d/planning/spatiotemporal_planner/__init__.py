@@ -9,6 +9,11 @@ from .coordinates import (
     world_state_to_local,
 )
 from .cost import SpatiotemporalCost
+from .lane_reference import (
+    PerceptionLaneReference,
+    build_perception_lane_reference,
+    local_reference_path_to_world,
+)
 from .optimizer import SpatiotemporalOptimizer
 from .prediction import ConstantVelocityPredictor
 from .rollout import TrajectoryRollout
@@ -28,6 +33,7 @@ __all__ = [
     "LocalPlanningContext",
     "ObjectPredictionSet",
     "OptimizationResult",
+    "PerceptionLaneReference",
     "PredictedObjectTrajectory",
     "SpatiotemporalCost",
     "SpatiotemporalOptimizer",
@@ -36,6 +42,8 @@ __all__ = [
     "SpatiotemporalTrajectory",
     "TrajectoryRollout",
     "build_local_planning_context",
+    "build_perception_lane_reference",
+    "local_reference_path_to_world",
     "local_state_to_world",
     "local_trajectory_to_world",
     "normalize_angle",
