@@ -31,10 +31,7 @@ class ControlSequence:
         value = np.asarray(self.controls, dtype=np.float64)
 
         if value.ndim != 2 or value.shape[1] != 2:
-            raise ValueError(
-                "controls must have shape [N, 2], "
-                f"got {value.shape}"
-            )
+            raise ValueError("controls must have shape [N, 2], " f"got {value.shape}")
 
         if not np.all(np.isfinite(value)):
             raise ValueError("controls contain non-finite values")
@@ -65,32 +62,21 @@ class SpatiotemporalTrajectory:
         controls = np.asarray(self.controls, dtype=np.float64)
 
         if times.ndim != 1:
-            raise ValueError(
-                "times must have shape [N], "
-                f"got {times.shape}"
-            )
+            raise ValueError("times must have shape [N], " f"got {times.shape}")
 
         if states.ndim != 2 or states.shape[1] != 4:
-            raise ValueError(
-                "states must have shape [N, 4], "
-                f"got {states.shape}"
-            )
+            raise ValueError("states must have shape [N, 4], " f"got {states.shape}")
 
         if controls.ndim != 2 or controls.shape[1] != 2:
             raise ValueError(
-                "controls must have shape [N-1, 2], "
-                f"got {controls.shape}"
+                "controls must have shape [N-1, 2], " f"got {controls.shape}"
             )
 
         if states.shape[0] != times.shape[0]:
-            raise ValueError(
-                "states and times must have equal length"
-            )
+            raise ValueError("states and times must have equal length")
 
         if controls.shape[0] != states.shape[0] - 1:
-            raise ValueError(
-                "controls length must be states length minus one"
-            )
+            raise ValueError("controls length must be states length minus one")
 
         if times.size == 0:
             raise ValueError("trajectory must contain at least one state")
@@ -138,9 +124,7 @@ class LocalPlanningContext:
             or abs(self.ego.y) > 1e-12
             or abs(self.ego.yaw) > 1e-12
         ):
-            raise ValueError(
-                "local ego pose must be exactly (0, 0, 0)"
-            )
+            raise ValueError("local ego pose must be exactly (0, 0, 0)")
 
         if self.reference_path is not None:
             path = np.asarray(self.reference_path, dtype=np.float64)
@@ -163,3 +147,22 @@ class OptimizationResult:
     status: str
     cost_terms: dict[str, float] = field(default_factory=dict)
     debug: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PredictedObjectTrajectory:
+    object_id: str
+    semantic_type: str
+    times: FloatArray
+    positions: FloatArray
+    yaws: FloatArray
+    speed: float
+    length: float
+    width: float
+    radius: float | None = None
+
+
+@dataclass(frozen=True)
+class ObjectPredictionSet:
+    times: FloatArray
+    trajectories: tuple[PredictedObjectTrajectory, ...]
