@@ -31,7 +31,10 @@ class ControlSequence:
         value = np.asarray(self.controls, dtype=np.float64)
 
         if value.ndim != 2 or value.shape[1] != 2:
-            raise ValueError("controls must have shape [N, 2], " f"got {value.shape}")
+            raise ValueError(
+                "controls must have shape [N, 2], "
+                f"got {value.shape}"
+            )
 
         if not np.all(np.isfinite(value)):
             raise ValueError("controls contain non-finite values")
@@ -62,14 +65,21 @@ class SpatiotemporalTrajectory:
         controls = np.asarray(self.controls, dtype=np.float64)
 
         if times.ndim != 1:
-            raise ValueError("times must have shape [N], " f"got {times.shape}")
+            raise ValueError(
+                "times must have shape [N], "
+                f"got {times.shape}"
+            )
 
         if states.ndim != 2 or states.shape[1] != 4:
-            raise ValueError("states must have shape [N, 4], " f"got {states.shape}")
+            raise ValueError(
+                "states must have shape [N, 4], "
+                f"got {states.shape}"
+            )
 
         if controls.ndim != 2 or controls.shape[1] != 2:
             raise ValueError(
-                "controls must have shape [N-1, 2], " f"got {controls.shape}"
+                "controls must have shape [N-1, 2], "
+                f"got {controls.shape}"
             )
 
         if states.shape[0] != times.shape[0]:
@@ -151,6 +161,8 @@ class OptimizationResult:
 
 @dataclass(frozen=True)
 class PredictedObjectTrajectory:
+    """单个交通参与者在冻结自车坐标系中的恒速预测。"""
+
     object_id: str
     object_type: str
     semantic_type: str
@@ -162,8 +174,101 @@ class PredictedObjectTrajectory:
     width: float
     confidence: float
 
+    def __post_init__(self) -> None:
+        times = np.asarray(self.times, dtype=np.float64)
+        positions = np.asarray(self.positions, dtype=np.float64)
+        yaws = np.asarray(self.yaws, dtype=np.float64)
+
+        if times.ndim != 1:
+            raise ValueError(
+                "times must have shape [N], "
+                f"got {times.shape}"
+            )
+        if times.size == 0:
+            raise ValueError("times must not be empty")
+        if positions.ndim != 2 or positions.shape[1] != 2:
+            raise ValueError(
+                "positions must have shape [N, 2], "
+                f"got {positions.shape}"
+            )
+        if yaws.ndim != 1:
+            raise ValueError(
+                "yaws must have shape [N], "
+                f"got {yaws.shape}"
+            )
+        if positions.shape[0] != times.shape[0]:
+            raise ValueError("positions and times must have equal length")
+        if yaws.shape[0] != times.shape[0]:
+            raise ValueError("yaws and times must have equal length")
+
+        if not np.all(np.isfinite(times)):
+            raise ValueError("times contain non-finite values")
+        if not np.all(np.isfinite(positions)):
+            raise ValueError("positions contain non-finite values")
+        if not np.all(np.isfinite(yaws)):
+            raise ValueError("yaws contain non-finite values")
+        if abs(float(times[0])) > 1e-12:
+            raise ValueError("times must start at zero")
+        if not np.all(np.diff(times) > 0.0):
+            raise ValueError("times must be strictly increasing")
+
+        metadata = np.asarray(
+            [self.speed, self.length, self.width, self.confidence],
+            dtype=np.float64,
+        )
+        if not np.all(np.isfinite(metadata)):
+            raise ValueError("prediction metadata contains non-finite values")
+        if self.speed < 0.0:
+            raise ValueError("speed must be non-negative")
+        if self.length <= 0.0 or self.width <= 0.0:
+            raise ValueError("predicted object dimensions must be positive")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("confidence must be within [0, 1]")
+
+        object.__setattr__(self, "times", times.copy())
+        object.__setattr__(self, "positions", positions.copy())
+        object.__setattr__(self, "yaws", yaws.copy())
+        object.__setattr__(self, "speed", float(self.speed))
+        object.__setattr__(self, "length", float(self.length))
+        object.__setattr__(self, "width", float(self.width))
+        object.__setattr__(self, "confidence", float(self.confidence))
+
 
 @dataclass(frozen=True)
 class ObjectPredictionSet:
+    """共享同一时间轴的多目标预测集合。"""
+
     times: FloatArray
     trajectories: tuple[PredictedObjectTrajectory, ...]
+
+    def __post_init__(self) -> None:
+        times = np.asarray(self.times, dtype=np.float64)
+        trajectories = tuple(self.trajectories)
+
+        if times.ndim != 1:
+            raise ValueError(
+                "times must have shape [N], "
+                f"got {times.shape}"
+            )
+        if times.size == 0:
+            raise ValueError("times must not be empty")
+        if not np.all(np.isfinite(times)):
+            raise ValueError("times contain non-finite values")
+        if abs(float(times[0])) > 1e-12:
+            raise ValueError("times must start at zero")
+        if not np.all(np.diff(times) > 0.0):
+            raise ValueError("times must be strictly increasing")
+
+        for trajectory in trajectories:
+            if trajectory.times.shape != times.shape or not np.allclose(
+                trajectory.times,
+                times,
+                rtol=0.0,
+                atol=1e-12,
+            ):
+                raise ValueError(
+                    "all object trajectories must use the prediction-set time axis"
+                )
+
+        object.__setattr__(self, "times", times.copy())
+        object.__setattr__(self, "trajectories", trajectories)
