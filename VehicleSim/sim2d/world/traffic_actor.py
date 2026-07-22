@@ -68,7 +68,11 @@ def create_traffic_actor(
 
     x、y、yaw 均为世界坐标；speed 沿 actor 自身 yaw 方向运动。
     """
-    normalized = TrafficActorType(str(actor_type))
+    normalized = (
+        actor_type
+        if isinstance(actor_type, TrafficActorType)
+        else TrafficActorType(str(actor_type))
+    )
 
     if normalized is TrafficActorType.PEDESTRIAN:
         actor: TrafficActor = PedestrianObstacle(
