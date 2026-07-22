@@ -32,11 +32,14 @@ def perceive_lane_corridors(
         if rng.random() < config.lane_dropout_probability:
             continue
 
-        left_world = np.asarray(lane.left_boundary, dtype=np.float64)
-        right_world = np.asarray(lane.right_boundary, dtype=np.float64)
-
-        left_local = _world_polyline_to_vehicle(left_world, ego)
-        right_local = _world_polyline_to_vehicle(right_world, ego)
+        left_local = _world_polyline_to_vehicle(
+            np.asarray(lane.left_boundary, dtype=np.float64),
+            ego,
+        )
+        right_local = _world_polyline_to_vehicle(
+            np.asarray(lane.right_boundary, dtype=np.float64),
+            ego,
+        )
 
         left_hits = _scan_boundary(left_local, config)
         right_hits = _scan_boundary(right_local, config)
@@ -104,7 +107,6 @@ def _scan_boundary(
         config.lane_transverse_spacing,
         dtype=np.float64,
     )
-
     for scan_x in scan_x_values:
         hits.extend(_intersections_with_vertical_line(polyline, float(scan_x)))
 
@@ -132,7 +134,6 @@ def _scan_boundary(
         and abs(float(hit.point[1])) <= config.lateral_range + 1e-9
         and _inside_field_of_view(hit.point, config.field_of_view)
     ]
-
     filtered.sort(key=lambda item: item.progress)
     return _deduplicate_hits(filtered)
 
@@ -178,8 +179,8 @@ def _nearest_ray_intersection(
             continue
 
         distance, parameter = np.linalg.solve(matrix, start)
-        distance = float(-distance)
-        parameter = float(-parameter)
+        distance = float(distance)
+        parameter = float(parameter)
 
         if distance < -1e-9 or distance > max_distance + 1e-9:
             continue
