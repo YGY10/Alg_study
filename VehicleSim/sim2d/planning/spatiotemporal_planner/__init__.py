@@ -8,8 +8,11 @@ from .coordinates import (
     world_reference_path_to_local,
     world_state_to_local,
 )
+from .cost import SpatiotemporalCost
+from .optimizer import SpatiotemporalOptimizer
 from .prediction import ConstantVelocityPredictor
 from .rollout import TrajectoryRollout
+from .spatiotemporal_planner import SpatiotemporalPlanner
 from .types import (
     ControlSequence,
     LocalPlanningContext,
@@ -18,8 +21,6 @@ from .types import (
     PredictedObjectTrajectory,
     SpatiotemporalTrajectory,
 )
-from .optimizer import SpatiotemporalOptimizer
-from .cost import SpatiotemporalCost
 
 __all__ = [
     "ConstantVelocityPredictor",
@@ -28,6 +29,9 @@ __all__ = [
     "ObjectPredictionSet",
     "OptimizationResult",
     "PredictedObjectTrajectory",
+    "SpatiotemporalCost",
+    "SpatiotemporalOptimizer",
+    "SpatiotemporalPlanner",
     "SpatiotemporalPlannerConfig",
     "SpatiotemporalTrajectory",
     "TrajectoryRollout",
@@ -38,6 +42,4 @@ __all__ = [
     "world_goal_to_local",
     "world_reference_path_to_local",
     "world_state_to_local",
-    "SpatiotemporalOptimizer",
-    "SpatiotemporalCost",
 ]
