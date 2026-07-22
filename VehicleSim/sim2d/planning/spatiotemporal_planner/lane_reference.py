@@ -11,7 +11,7 @@ from sim2d.types import VehicleState
 
 @dataclass(frozen=True)
 class PerceptionLaneReference:
-    """由感知车道生成的冻结自车坐标参考走廊。"""
+    """由纯几何感知走廊生成的冻结自车坐标参考线。"""
 
     lane_id: str
     confidence: float
@@ -50,10 +50,10 @@ def build_perception_lane_reference(
     maximum_lateral_distance: float = 6.0,
     backward_margin: float = 2.0,
 ) -> PerceptionLaneReference | None:
-    """选择当前自车所在感知车道，并生成局部参考线。
+    """从扫描恢复的几何走廊中找到当前自车实际所在走廊。
 
-    地图导航不参与此处的几何跟踪。候选车道按照原点到中心线距离、
-    中心线方向与自车朝向的一致性以及感知置信度综合排序。
+    不读取地图 lane id、successor 或导航路线。首选左右边界包围车辆原点的
+    走廊；只有扫描不完整时才回退到最近且方向一致的几何走廊。
     """
     if not road_segments:
         return None
@@ -64,7 +64,16 @@ def build_perception_lane_reference(
     if backward_margin < 0.0:
         raise ValueError("backward_margin must be non-negative")
 
-    best: tuple[float, PerceivedLaneSegment, np.ndarray, np.ndarray, np.ndarray] | None = None
+    candidates: list[
+        tuple[
+            int,
+            float,
+            PerceivedLaneSegment,
+            np.ndarray,
+            np.ndarray,
+            np.ndarray,
+        ]
+    ] = []
 
     for segment in road_segments:
         if segment.confidence < minimum_confidence:
@@ -89,7 +98,7 @@ def build_perception_lane_reference(
             continue
         tangent = tangent / tangent_norm
 
-        # 感知折线可能按反方向存储；统一成沿自车前方增长。
+        # 扫描恢复曲线可能按道路原始存储方向排列；统一成沿自车前方增长。
         if float(tangent[0]) < 0.0:
             centerline = centerline[::-1].copy()
             left_boundary, right_boundary = (
@@ -104,34 +113,43 @@ def build_perception_lane_reference(
                 continue
             tangent = tangent / tangent_norm
 
+        left_y = float(left_boundary[nearest_index, 1])
+        right_y = float(right_boundary[nearest_index, 1])
+        lower_y = min(left_y, right_y)
+        upper_y = max(left_y, right_y)
+        contains_ego = lower_y - 1e-6 <= 0.0 <= upper_y + 1e-6
+
         heading_error = abs(math.atan2(float(tangent[1]), float(tangent[0])))
         score = (
             nearest_distance
             + 2.0 * heading_error
             + 1.5 * (1.0 - float(segment.confidence))
         )
-
-        if best is None or score < best[0]:
-            best = (
+        candidates.append(
+            (
+                0 if contains_ego else 1,
                 score,
                 segment,
                 centerline,
                 left_boundary,
                 right_boundary,
             )
+        )
 
-    if best is None:
+    if not candidates:
         return None
 
-    _, segment, centerline, left_boundary, right_boundary = best
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    _, _, segment, centerline, left_boundary, right_boundary = candidates[0]
     nearest_index = int(np.argmin(np.linalg.norm(centerline, axis=1)))
 
-    # 保留少量车后点，避免参考线恰好从自车前方开始造成首点跳变。
     start_index = nearest_index
     while start_index > 0 and centerline[start_index - 1, 0] >= -backward_margin:
         start_index -= 1
 
     centerline = centerline[start_index:].copy()
+    left_boundary = left_boundary[start_index:].copy()
+    right_boundary = right_boundary[start_index:].copy()
     if centerline.shape[0] < 2:
         return None
 
@@ -141,8 +159,8 @@ def build_perception_lane_reference(
         lane_id=segment.map_lane_id,
         confidence=float(segment.confidence),
         reference_path=reference_path,
-        left_boundary=left_boundary.copy(),
-        right_boundary=right_boundary.copy(),
+        left_boundary=left_boundary,
+        right_boundary=right_boundary,
     )
 
 
@@ -192,8 +210,10 @@ def _polyline_to_reference_path(points: np.ndarray) -> np.ndarray:
     )
 
     if points.shape[0] >= 3:
-        dyaw_ds = np.gradient(yaws, arc_length, edge_order=1)
-        curvature = np.asarray(dyaw_ds, dtype=np.float64)
+        curvature = np.asarray(
+            np.gradient(yaws, arc_length, edge_order=1),
+            dtype=np.float64,
+        )
     else:
         curvature = np.zeros(points.shape[0], dtype=np.float64)
 
