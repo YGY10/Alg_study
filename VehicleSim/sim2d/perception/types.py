@@ -19,9 +19,6 @@ class PerceptionConfig:
     rear_range: float = 20.0
     lateral_range: float = 35.0
     field_of_view: float = 2.0 * np.pi
-
-    # 与 EnvironmentConfig.dt=0.05 s 对齐。这样默认每个仿真帧都会生成
-    # 一帧新的感知结果，不会因为 10 Hz 缓存让调试视图看起来停住。
     update_period: float = 0.05
     latency: float = 0.0
 
@@ -80,7 +77,8 @@ class PerceptionConfig:
 class PerceivedObject:
     """车辆坐标系中的感知目标。
 
-    x 为前向距离，y 为左向距离，yaw 为相对自车航向。
+    object_type 表示碰撞几何（circle/box）；semantic_type 表示交通语义
+    （pedestrian/small_car/large_vehicle）。
     """
 
     object_id: str
@@ -92,12 +90,11 @@ class PerceivedObject:
     length: float
     width: float
     confidence: float = 1.0
+    semantic_type: str = "unknown"
 
 
 @dataclass(frozen=True)
 class PerceivedTrafficSignal:
-    """车辆坐标系中的感知交通灯。"""
-
     entity_id: str
     map_signal_id: str | None
     x: float
@@ -110,8 +107,6 @@ class PerceivedTrafficSignal:
 
 @dataclass(frozen=True)
 class PerceivedLaneSegment:
-    """车辆坐标系中的局部车道几何，所有点均为 [x_forward, y_left]。"""
-
     map_lane_id: str
     centerline: FloatArray
     left_boundary: FloatArray
@@ -130,13 +125,6 @@ class PerceivedLaneSegment:
 
 @dataclass(frozen=True)
 class PerceptionSnapshot:
-    """规划器可见的局部感知快照。
-
-    ego 是带感知误差的全局自车定位，用于地图匹配和兼容现有规划器。
-    objects、traffic_signals、road_segments 全部使用车辆坐标系：
-    +x 向前，+y 向左，自车原点为 (0, 0)，相对航向为 0。
-    """
-
     measurement_time: float
     publish_time: float
     frame: int
@@ -158,7 +146,6 @@ class PlanningInput:
     ego: VehicleState
     obstacles: tuple[Any, ...]
     goal: GoalState
-
     perception: PerceptionSnapshot
     map_network: Any | None = None
     previous_trajectory: FloatArray | None = None
