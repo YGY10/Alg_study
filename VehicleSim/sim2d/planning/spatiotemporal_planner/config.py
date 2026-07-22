@@ -36,6 +36,8 @@ class SpatiotemporalPlannerConfig:
     max_iterations: int = 40
     gradient_epsilon: float = 1e-3
     initial_step_size: float = 0.05
+    # 碰撞软约束
+    collision_softness: float = 0.5
 
     def validate(self) -> None:
         if self.dt <= 0.0:
@@ -49,3 +51,6 @@ class SpatiotemporalPlannerConfig:
 
         if self.target_speed < 0.0:
             raise ValueError("target_speed must be non-negative")
+
+        if self.collision_softness <= 0.0:
+            raise ValueError("collision_softness must be positive")
