@@ -36,6 +36,12 @@ class PerceptionConfig:
     lane_ray_half_angle: float = np.deg2rad(100.0)
     lane_output_point_count: int = 81
 
+    # 纯几何车道线片段关联参数。只依赖端点、切线和空间距离，
+    # 不使用 map lane id、前驱后继或导航路径。
+    lane_line_join_distance: float = 2.0
+    lane_line_join_heading: float = np.deg2rad(40.0)
+    lane_line_duplicate_distance: float = 0.35
+
     def validate(self) -> None:
         values = np.asarray(
             [
@@ -53,6 +59,9 @@ class PerceptionConfig:
                 self.lane_dropout_probability,
                 self.lane_transverse_spacing,
                 self.lane_ray_half_angle,
+                self.lane_line_join_distance,
+                self.lane_line_join_heading,
+                self.lane_line_duplicate_distance,
             ],
             dtype=np.float64,
         )
@@ -90,15 +99,17 @@ class PerceptionConfig:
             or self.lane_output_point_count < 2
         ):
             raise ValueError("lane_output_point_count must be an integer >= 2")
+        if self.lane_line_join_distance <= 0.0:
+            raise ValueError("lane_line_join_distance must be positive")
+        if not 0.0 < self.lane_line_join_heading <= np.pi:
+            raise ValueError("lane_line_join_heading must be within (0, pi]")
+        if self.lane_line_duplicate_distance < 0.0:
+            raise ValueError("lane_line_duplicate_distance must be non-negative")
 
 
 @dataclass(frozen=True)
 class PerceivedObject:
-    """车辆坐标系中的感知目标。
-
-    object_type 表示碰撞几何（circle/box）；semantic_type 表示交通语义
-    （pedestrian/small_car/large_vehicle）。
-    """
+    """车辆坐标系中的感知目标。"""
 
     object_id: str
     object_type: str
@@ -125,7 +136,33 @@ class PerceivedTrafficSignal:
 
 
 @dataclass(frozen=True)
+class PerceivedLaneLine:
+    """纯感知发布的一条局部车道线。
+
+    ``points`` 是车辆坐标系中的有序点列。line_id 只在当前感知帧内用于
+    区分实例，不是地图 lane id，也不表达任何拓扑或导航关系。
+    """
+
+    line_id: str
+    points: FloatArray
+    confidence: float = 1.0
+    line_type: str = "unknown"
+
+    def __post_init__(self) -> None:
+        value = np.asarray(self.points, dtype=np.float64)
+        if value.ndim != 2 or value.shape[1] != 2 or value.shape[0] < 2:
+            raise ValueError("points must have shape [N, 2], N >= 2")
+        if not np.all(np.isfinite(value)):
+            raise ValueError("points contain non-finite values")
+        if not np.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("confidence must be within [0, 1]")
+        object.__setattr__(self, "points", value.copy())
+
+
+@dataclass(frozen=True)
 class PerceivedLaneSegment:
+    """旧版走廊兼容类型；新 PNC 链路不再由感知模块生成。"""
+
     map_lane_id: str
     centerline: FloatArray
     left_boundary: FloatArray
@@ -150,7 +187,8 @@ class PerceptionSnapshot:
     ego: VehicleState
     objects: tuple[PerceivedObject, ...]
     traffic_signals: tuple[PerceivedTrafficSignal, ...]
-    road_segments: tuple[PerceivedLaneSegment, ...]
+    road_segments: tuple[PerceivedLaneSegment, ...] = ()
+    lane_lines: tuple[PerceivedLaneLine, ...] = ()
     source: str = "ground_truth_local"
     coordinate_frame: str = "vehicle"
     debug: dict[str, Any] = field(default_factory=dict)
