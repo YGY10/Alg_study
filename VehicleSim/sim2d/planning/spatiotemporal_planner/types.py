@@ -109,6 +109,11 @@ class LocalPlanningContext:
                 raise ValueError("reference_path contains non-finite values")
             object.__setattr__(self, "reference_path", path.copy())
 
+    @property
+    def road_segments(self) -> tuple[PerceivedLaneLine, ...]:
+        """旧规划器调用名兼容；实际内容是感知车道线，不是 lane segment。"""
+        return self.lane_lines
+
 
 @dataclass(frozen=True)
 class OptimizationResult:
