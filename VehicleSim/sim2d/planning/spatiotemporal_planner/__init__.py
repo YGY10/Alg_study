@@ -12,13 +12,15 @@ from .cost import SpatiotemporalCost
 from .lane_reference import (
     PerceptionLaneReference,
     build_perception_lane_reference,
-    local_reference_path_to_world,
 )
 from .optimizer import SpatiotemporalOptimizer
 from .pnc_map import (
+    PNCMap,
+    PNCMapUpdate,
     PNCReferenceLine,
     build_current_reference_line,
     build_reference_lines,
+    local_reference_path_to_world,
     select_current_reference_line,
 )
 from .prediction import ConstantVelocityPredictor
@@ -39,6 +41,8 @@ __all__ = [
     "LocalPlanningContext",
     "ObjectPredictionSet",
     "OptimizationResult",
+    "PNCMap",
+    "PNCMapUpdate",
     "PNCReferenceLine",
     "PerceptionLaneReference",
     "PredictedObjectTrajectory",
