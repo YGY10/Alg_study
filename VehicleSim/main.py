@@ -30,6 +30,7 @@ from sim2d.perception.traffic_actor_extension import (
     install as install_traffic_actor_perception,
 )
 from sim2d.performance_debug import install as install_performance_debug
+from sim2d.planning_diagnostics import install as install_planning_diagnostics
 from sim2d.planning import (
     SpatiotemporalPlanner,
     SpatiotemporalPlannerConfig,
@@ -54,6 +55,8 @@ install_traffic_actor_editor()
 
 # 性能调试必须在 MainWindow 实例化之前安装，才能覆盖每周期入口。
 install_performance_debug()
+# 规划诊断安装在性能调试之后，使其读取本周期已经写入 snapshot 的规划结果。
+install_planning_diagnostics()
 
 from sim2d.gui.main_window import MainWindow  # noqa: E402
 
