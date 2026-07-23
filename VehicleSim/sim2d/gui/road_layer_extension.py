@@ -101,9 +101,7 @@ def _set_road_layer_mode(
         "map",
         "compare",
     }:
-        raise ValueError(
-            f"Unsupported road layer mode: {mode!r}"
-        )
+        raise ValueError(f"Unsupported road layer mode: {mode!r}")
 
     self.road_layer_mode = normalized
     _apply_road_layer_visibility(self)
@@ -133,9 +131,7 @@ def _apply_road_layer_visibility(
         (),
     ):
         item.setVisible(show_map)
-        item.setOpacity(
-            0.28 if mode == "compare" else 1.0
-        )
+        item.setOpacity(0.28 if mode == "compare" else 1.0)
 
     for item in getattr(
         view,
@@ -213,15 +209,9 @@ def _draw_world_lane(
         close=True,
     )
 
-    surface_item = QGraphicsPathItem(
-        surface_path
-    )
-    surface_item.setBrush(
-        _world_lane_brush(lane.lane_type)
-    )
-    surface_item.setPen(
-        QPen(Qt.PenStyle.NoPen)
-    )
+    surface_item = QGraphicsPathItem(surface_path)
+    surface_item.setBrush(_world_lane_brush(lane.lane_type))
+    surface_item.setPen(QPen(Qt.PenStyle.NoPen))
     surface_item.setZValue(-99.0)
     view.graphics_scene.addItem(surface_item)
     view.world_road_items.append(surface_item)
@@ -237,9 +227,7 @@ def _draw_world_lane(
             boundary,
         )
 
-    boundary_item = QGraphicsPathItem(
-        boundary_path
-    )
+    boundary_item = QGraphicsPathItem(boundary_path)
 
     boundary_pen = QPen(
         QColor("#f4f0dc"),
@@ -346,9 +334,7 @@ def _build_road_deformation_dock(
         "道路 Map / World",
         window,
     )
-    dock.setObjectName(
-        "road_deformation_dock"
-    )
+    dock.setObjectName("road_deformation_dock")
 
     panel = QWidget(dock)
     layout = QVBoxLayout(panel)
@@ -371,21 +357,21 @@ def _build_road_deformation_dock(
     window.road_offset_x_spin = _make_spin(
         -100.0,
         100.0,
-        0.8,
+        0.0,
         0.1,
         " m",
     )
     window.road_offset_y_spin = _make_spin(
         -100.0,
         100.0,
-        0.4,
+        0.0,
         0.1,
         " m",
     )
     window.road_yaw_spin = _make_spin(
         -180.0,
         180.0,
-        2.86,
+        0.0,
         0.1,
         "°",
     )
@@ -408,14 +394,14 @@ def _build_road_deformation_dock(
     window.road_local_longitudinal_spin = _make_spin(
         -20.0,
         20.0,
-        0.3,
+        0.0,
         0.1,
         " m",
     )
     window.road_local_lateral_spin = _make_spin(
         -20.0,
         20.0,
-        0.8,
+        0.0,
         0.1,
         " m",
     )
@@ -467,9 +453,7 @@ def _build_road_deformation_dock(
 
     layout.addLayout(form)
 
-    apply_button = QPushButton(
-        "应用道路偏差"
-    )
+    apply_button = QPushButton("应用道路偏差")
     layout.addWidget(apply_button)
     layout.addStretch(1)
 
@@ -482,9 +466,7 @@ def _build_road_deformation_dock(
     window.road_layer_combo.currentIndexChanged.connect(
         lambda _: _on_road_layer_changed(window)
     )
-    apply_button.clicked.connect(
-        lambda: _apply_world_map_geometry(window)
-    )
+    apply_button.clicked.connect(lambda: _apply_world_map_geometry(window))
 
     window.road_deformation_dock = dock
 
@@ -514,12 +496,8 @@ def _on_road_layer_changed(
     window: MainWindow,
 ) -> None:
     mode = window.road_layer_combo.currentData()
-    window.simulation_view.set_road_layer_mode(
-        mode
-    )
-    window.append_log(
-        f"ROAD_LAYER mode={mode}"
-    )
+    window.simulation_view.set_road_layer_mode(mode)
+    window.append_log(f"ROAD_LAYER mode={mode}")
 
 
 def _road_deformation_config(
@@ -528,24 +506,12 @@ def _road_deformation_config(
     return RoadDeformationConfig(
         offset_x=window.road_offset_x_spin.value(),
         offset_y=window.road_offset_y_spin.value(),
-        yaw_offset=math.radians(
-            window.road_yaw_spin.value()
-        ),
-        longitudinal_scale=(
-            window.road_longitudinal_scale_spin.value()
-        ),
-        lateral_scale=(
-            window.road_lateral_scale_spin.value()
-        ),
-        local_longitudinal_amplitude=(
-            window.road_local_longitudinal_spin.value()
-        ),
-        local_lateral_amplitude=(
-            window.road_local_lateral_spin.value()
-        ),
-        local_wavelength=(
-            window.road_wavelength_spin.value()
-        ),
+        yaw_offset=math.radians(window.road_yaw_spin.value()),
+        longitudinal_scale=(window.road_longitudinal_scale_spin.value()),
+        lateral_scale=(window.road_lateral_scale_spin.value()),
+        local_longitudinal_amplitude=(window.road_local_longitudinal_spin.value()),
+        local_lateral_amplitude=(window.road_local_lateral_spin.value()),
+        local_wavelength=(window.road_wavelength_spin.value()),
     )
 
 
@@ -559,9 +525,7 @@ def _apply_world_map_geometry(
     if not window.env.is_initialized:
         return
 
-    deformation = _road_deformation_config(
-        window
-    )
+    deformation = _road_deformation_config(window)
 
     window.env.world.initialize_map_geometry(
         window.road_network,
@@ -569,9 +533,7 @@ def _apply_world_map_geometry(
         initial_signal_state=TrafficLightState.RED,
     )
 
-    window.simulation_view.set_world_road_lanes(
-        window.env.world.state.road_lanes
-    )
+    window.simulation_view.set_world_road_lanes(window.env.world.state.road_lanes)
 
     window.simulation_view.render_snapshot(
         window.env.get_snapshot(),
@@ -579,9 +541,7 @@ def _apply_world_map_geometry(
     )
 
     mode = window.road_layer_combo.currentData()
-    window.simulation_view.set_road_layer_mode(
-        mode
-    )
+    window.simulation_view.set_road_layer_mode(mode)
 
     window.append_log(
         "ROAD_DEFORMATION_APPLIED "
