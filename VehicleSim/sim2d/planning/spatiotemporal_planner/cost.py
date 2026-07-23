@@ -7,10 +7,7 @@ import numpy as np
 from sim2d.types import VehicleConfig, VehicleControl
 
 from .config import SpatiotemporalPlannerConfig
-from .types import (
-    ObjectPredictionSet,
-    SpatiotemporalTrajectory,
-)
+from .types import ObjectPredictionSet, SpatiotemporalTrajectory
 
 
 class SpatiotemporalCost:
@@ -23,10 +20,8 @@ class SpatiotemporalCost:
     ) -> None:
         config.validate()
         vehicle_config.validate()
-
         self.config = config
         self.vehicle_config = vehicle_config
-
         self._ego_collision_radius = 0.5 * math.hypot(
             vehicle_config.length,
             vehicle_config.width,
@@ -38,24 +33,25 @@ class SpatiotemporalCost:
         predictions: ObjectPredictionSet,
         reference_path: np.ndarray | None,
         previous_control: VehicleControl | None = None,
+        left_boundary: np.ndarray | None = None,
+        right_boundary: np.ndarray | None = None,
     ) -> tuple[float, dict[str, float]]:
-        """返回加权总成本和未加权分项。
+        """返回加权总成本和加权分项。"""
+        self._validate_time_alignment(trajectory=trajectory, predictions=predictions)
 
-        trajectory、predictions、reference_path 必须全部位于同一个
-        规划时刻冻结的自车坐标系。
-        """
-        self._validate_time_alignment(
-            trajectory=trajectory,
-            predictions=predictions,
-        )
-
-        reference_cost, heading_cost, terminal_cost = self._reference_cost(
+        (
+            reference_cost,
+            heading_cost,
+            terminal_cost,
+            corridor_cost,
+            progress_cost,
+        ) = self._reference_cost(
             trajectory=trajectory,
             reference_path=reference_path,
+            left_boundary=left_boundary,
+            right_boundary=right_boundary,
         )
-
         speed_cost = self._speed_cost(trajectory)
-
         (
             acceleration_cost,
             steering_cost,
@@ -65,101 +61,190 @@ class SpatiotemporalCost:
             trajectory=trajectory,
             previous_control=previous_control,
         )
-
         collision_cost = self._collision_cost(
             trajectory=trajectory,
             predictions=predictions,
         )
+        lateral_acceleration_cost = self._lateral_acceleration_cost(trajectory)
 
         weighted_terms = {
-            "reference": (self.config.weight_reference * reference_cost),
-            "heading": (self.config.weight_heading * heading_cost),
-            "speed": (self.config.weight_speed * speed_cost),
-            "acceleration": (self.config.weight_acceleration * acceleration_cost),
-            "steering": (self.config.weight_steering * steering_cost),
+            "reference": self.config.weight_reference * reference_cost,
+            "heading": self.config.weight_heading * heading_cost,
+            "speed": self.config.weight_speed * speed_cost,
+            "acceleration": self.config.weight_acceleration * acceleration_cost,
+            "steering": self.config.weight_steering * steering_cost,
             "acceleration_rate": (
                 self.config.weight_acceleration_rate * acceleration_rate_cost
             ),
-            "steering_rate": (self.config.weight_steering_rate * steering_rate_cost),
-            "collision": (self.config.weight_collision * collision_cost),
-            "terminal": (self.config.weight_terminal * terminal_cost),
+            "steering_rate": self.config.weight_steering_rate * steering_rate_cost,
+            "collision": self.config.weight_collision * collision_cost,
+            "terminal": self.config.weight_terminal * terminal_cost,
+            "corridor": self.config.weight_corridor * corridor_cost,
+            "frenet_progress": self.config.weight_frenet_progress * progress_cost,
+            "lateral_acceleration": (
+                self.config.weight_lateral_acceleration * lateral_acceleration_cost
+            ),
         }
-
         total_cost = float(sum(weighted_terms.values()))
-
         if not np.isfinite(total_cost):
             raise ValueError("total cost is non-finite")
-
-        return total_cost, {
-            name: float(value) for name, value in weighted_terms.items()
-        }
+        return total_cost, {name: float(value) for name, value in weighted_terms.items()}
 
     def _reference_cost(
         self,
         trajectory: SpatiotemporalTrajectory,
         reference_path: np.ndarray | None,
-    ) -> tuple[float, float, float]:
-        """计算位置、航向和终端参考线跟踪代价。"""
+        left_boundary: np.ndarray | None,
+        right_boundary: np.ndarray | None,
+    ) -> tuple[float, float, float, float, float]:
+        """在 reference Frenet 坐标系中计算横向、航向和走廊代价。"""
         if reference_path is None:
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0, 0.0
 
-        path = np.asarray(
-            reference_path,
-            dtype=np.float64,
-        )
-
-        if path.ndim != 2 or path.shape[1] < 3:
-            raise ValueError(
-                "reference_path must have shape [M, K], " f"K >= 3, got {path.shape}"
-            )
-
-        if path.shape[0] == 0:
-            return 0.0, 0.0, 0.0
-
+        path = np.asarray(reference_path, dtype=np.float64)
+        if path.ndim != 2 or path.shape[1] < 3 or path.shape[0] < 2:
+            raise ValueError("reference_path must have shape [M, K], M >= 2, K >= 3")
         if not np.all(np.isfinite(path)):
             raise ValueError("reference_path contains non-finite values")
 
-        ego_positions = trajectory.states[:, :2]
-        ego_yaws = trajectory.states[:, 2]
-
-        reference_positions = path[:, :2]
-        reference_yaws = path[:, 2]
-
-        nearest_indices = self._nearest_reference_indices(
-            query_points=ego_positions,
-            reference_points=reference_positions,
+        projection = self._project_to_reference(
+            query_points=trajectory.states[:, :2],
+            reference_path=path,
         )
+        lateral = projection["lateral"]
+        projected_yaw = projection["yaw"]
+        projected_s = projection["s"]
+        segment_indices = projection["segment_indices"]
+        parameters = projection["parameters"]
 
-        nearest_positions = reference_positions[nearest_indices]
-        nearest_yaws = reference_yaws[nearest_indices]
-
-        position_errors = ego_positions - nearest_positions
-        squared_distances = np.sum(
-            position_errors**2,
-            axis=1,
+        heading_errors = self._normalize_angle(
+            trajectory.states[:, 2] - projected_yaw
         )
-
-        heading_errors = self._normalize_angle(ego_yaws - nearest_yaws)
-
-        reference_cost = float(np.mean(squared_distances))
+        reference_cost = float(np.mean(lateral**2))
         heading_cost = float(np.mean(heading_errors**2))
+        terminal_cost = float(lateral[-1] ** 2 + heading_errors[-1] ** 2)
 
-        terminal_cost = float(squared_distances[-1] + heading_errors[-1] ** 2)
+        s_differences = np.diff(projected_s)
+        backward_progress = np.maximum(
+            -(s_differences + self.config.frenet_nonmonotonic_tolerance),
+            0.0,
+        )
+        progress_cost = (
+            float(np.mean(backward_progress**2))
+            if backward_progress.size
+            else 0.0
+        )
+
+        corridor_cost = 0.0
+        if left_boundary is not None and right_boundary is not None:
+            left = np.asarray(left_boundary, dtype=np.float64)
+            right = np.asarray(right_boundary, dtype=np.float64)
+            if (
+                left.shape != path[:, :2].shape
+                or right.shape != path[:, :2].shape
+            ):
+                raise ValueError(
+                    "left_boundary and right_boundary must match reference point count"
+                )
+            normals = np.column_stack((-np.sin(projected_yaw), np.cos(projected_yaw)))
+            left_projected = (
+                left[segment_indices]
+                + parameters[:, None]
+                * (left[segment_indices + 1] - left[segment_indices])
+            )
+            right_projected = (
+                right[segment_indices]
+                + parameters[:, None]
+                * (right[segment_indices + 1] - right[segment_indices])
+            )
+            projected_positions = projection["positions"]
+            left_l = np.sum((left_projected - projected_positions) * normals, axis=1)
+            right_l = np.sum((right_projected - projected_positions) * normals, axis=1)
+            lower = np.minimum(left_l, right_l)
+            upper = np.maximum(left_l, right_l)
+
+            clearance = 0.5 * self.vehicle_config.width + self.config.corridor_vehicle_margin
+            lower_allowed = lower + clearance
+            upper_allowed = upper - clearance
+            invalid_width = lower_allowed > upper_allowed
+            lower_allowed[invalid_width] = 0.5 * (lower[invalid_width] + upper[invalid_width])
+            upper_allowed[invalid_width] = lower_allowed[invalid_width]
+
+            violation = np.maximum(lower_allowed - lateral, 0.0) + np.maximum(
+                lateral - upper_allowed,
+                0.0,
+            )
+            corridor_cost = float(np.mean(violation**2))
 
         return (
             reference_cost,
             heading_cost,
             terminal_cost,
+            corridor_cost,
+            progress_cost,
         )
 
-    def _speed_cost(
+    def _project_to_reference(
         self,
-        trajectory: SpatiotemporalTrajectory,
-    ) -> float:
-        speeds = trajectory.states[:, 3]
+        *,
+        query_points: np.ndarray,
+        reference_path: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        starts = reference_path[:-1, :2]
+        vectors = reference_path[1:, :2] - starts
+        squared_lengths = np.sum(vectors**2, axis=1)
+        usable = squared_lengths > 1e-12
+        if not np.any(usable):
+            raise ValueError("reference_path has no usable segment")
 
-        speed_errors = speeds - self.config.target_speed
+        delta = query_points[:, None, :] - starts[None, :, :]
+        parameters = np.zeros((query_points.shape[0], vectors.shape[0]))
+        parameters[:, usable] = (
+            np.sum(delta[:, usable, :] * vectors[None, usable, :], axis=2)
+            / squared_lengths[usable][None, :]
+        )
+        parameters = np.clip(parameters, 0.0, 1.0)
+        projections = starts[None, :, :] + parameters[:, :, None] * vectors[None, :, :]
+        squared_distances = np.sum(
+            (query_points[:, None, :] - projections) ** 2,
+            axis=2,
+        )
+        segment_indices = np.argmin(squared_distances, axis=1)
+        rows = np.arange(query_points.shape[0])
+        selected_t = parameters[rows, segment_indices]
+        selected_positions = projections[rows, segment_indices]
 
+        if reference_path.shape[1] >= 4:
+            reference_s = reference_path[:, 3]
+        else:
+            reference_s = np.concatenate(
+                (
+                    np.array([0.0]),
+                    np.cumsum(np.linalg.norm(vectors, axis=1)),
+                )
+            )
+        projected_s = reference_s[segment_indices] + selected_t * (
+            reference_s[segment_indices + 1] - reference_s[segment_indices]
+        )
+
+        yaw_unwrapped = np.unwrap(reference_path[:, 2])
+        projected_yaw = yaw_unwrapped[segment_indices] + selected_t * (
+            yaw_unwrapped[segment_indices + 1] - yaw_unwrapped[segment_indices]
+        )
+        projected_yaw = self._normalize_angle(projected_yaw)
+        normals = np.column_stack((-np.sin(projected_yaw), np.cos(projected_yaw)))
+        lateral = np.sum((query_points - selected_positions) * normals, axis=1)
+        return {
+            "positions": selected_positions,
+            "s": projected_s,
+            "lateral": lateral,
+            "yaw": projected_yaw,
+            "segment_indices": segment_indices,
+            "parameters": selected_t,
+        }
+
+    def _speed_cost(self, trajectory: SpatiotemporalTrajectory) -> float:
+        speed_errors = trajectory.states[:, 3] - self.config.target_speed
         return float(np.mean(speed_errors**2))
 
     def _control_cost(
@@ -168,63 +253,51 @@ class SpatiotemporalCost:
         previous_control: VehicleControl | None,
     ) -> tuple[float, float, float, float]:
         controls = trajectory.controls
-
         if controls.shape[0] == 0:
             return 0.0, 0.0, 0.0, 0.0
-
         accelerations = controls[:, 0]
         steerings = controls[:, 1]
-
         acceleration_cost = float(np.mean(accelerations**2))
         steering_cost = float(np.mean(steerings**2))
-
-        if previous_control is None:
-            previous = controls[0]
-        else:
-            previous = previous_control.as_array()
-
-        extended_controls = np.vstack(
-            (
-                previous,
-                controls,
-            )
-        )
-
-        control_rates = (
-            np.diff(
-                extended_controls,
-                axis=0,
-            )
-            / self.config.dt
-        )
-
+        previous = controls[0] if previous_control is None else previous_control.as_array()
+        extended_controls = np.vstack((previous, controls))
+        control_rates = np.diff(extended_controls, axis=0) / self.config.dt
         acceleration_rates = control_rates[:, 0]
         steering_rates = control_rates[:, 1]
-
         acceleration_rate_cost = float(np.mean(acceleration_rates**2))
         steering_rate_cost = float(np.mean(steering_rates**2))
-
-        # 对超过配置变化率上限的部分增加额外二次惩罚。
         acceleration_rate_excess = np.maximum(
             np.abs(acceleration_rates) - self.config.max_acceleration_rate,
             0.0,
         )
-
         steering_rate_excess = np.maximum(
             np.abs(steering_rates) - self.config.max_steering_rate,
             0.0,
         )
-
         acceleration_rate_cost += float(10.0 * np.mean(acceleration_rate_excess**2))
-
         steering_rate_cost += float(10.0 * np.mean(steering_rate_excess**2))
-
         return (
             acceleration_cost,
             steering_cost,
             acceleration_rate_cost,
             steering_rate_cost,
         )
+
+    def _lateral_acceleration_cost(
+        self,
+        trajectory: SpatiotemporalTrajectory,
+    ) -> float:
+        if trajectory.controls.shape[0] == 0:
+            return 0.0
+        speeds = trajectory.states[:-1, 3]
+        steering = trajectory.controls[:, 1]
+        curvature = np.tan(steering) / self.vehicle_config.wheel_base
+        lateral_acceleration = speeds**2 * curvature
+        excess = np.maximum(
+            np.abs(lateral_acceleration) - self.config.maximum_lateral_acceleration,
+            0.0,
+        )
+        return float(np.mean(excess**2))
 
     def _collision_cost(
         self,
@@ -233,72 +306,38 @@ class SpatiotemporalCost:
     ) -> float:
         if not predictions.trajectories:
             return 0.0
-
         ego_positions = trajectory.states[:, :2]
         softness = self.config.collision_softness
-
         total = 0.0
-
         for prediction in predictions.trajectories:
-            object_radius = 0.5 * math.hypot(
-                prediction.length,
-                prediction.width,
-            )
-
+            object_radius = 0.5 * math.hypot(prediction.length, prediction.width)
             safety_margin = self._safety_margin(prediction.semantic_type)
-
             center_distances = np.linalg.norm(
                 ego_positions - prediction.positions,
                 axis=1,
             )
-
             clearance = (
                 center_distances
                 - self._ego_collision_radius
                 - object_radius
                 - safety_margin
             )
-
-            soft_violation = softness * np.logaddexp(
-                0.0,
-                -clearance / softness,
-            )
-
+            soft_violation = softness * np.logaddexp(0.0, -clearance / softness)
             object_cost = np.mean(soft_violation**2)
-
-            # 真实几何包围圆发生重叠时，再增加明显惩罚。
-            geometric_clearance = (
-                center_distances - self._ego_collision_radius - object_radius
-            )
-
-            overlap = np.maximum(
-                -geometric_clearance,
-                0.0,
-            )
-
+            geometric_clearance = center_distances - self._ego_collision_radius - object_radius
+            overlap = np.maximum(-geometric_clearance, 0.0)
             object_cost += 10.0 * np.mean(overlap**2)
-
-            # 低置信度不能完全忽略，但可以适当降低其影响。
-            confidence_scale = 0.25 + (0.75 * prediction.confidence)
-
+            confidence_scale = 0.25 + 0.75 * prediction.confidence
             total += float(confidence_scale * object_cost)
-
         return total
 
-    def _safety_margin(
-        self,
-        semantic_type: str,
-    ) -> float:
+    def _safety_margin(self, semantic_type: str) -> float:
         if semantic_type == "pedestrian":
             return self.config.pedestrian_margin
-
         if semantic_type == "small_car":
             return self.config.small_car_margin
-
         if semantic_type == "large_vehicle":
             return self.config.large_vehicle_margin
-
-        # 对未知目标使用最保守的已配置距离。
         return max(
             self.config.pedestrian_margin,
             self.config.small_car_margin,
@@ -306,26 +345,7 @@ class SpatiotemporalCost:
         )
 
     @staticmethod
-    def _nearest_reference_indices(
-        query_points: np.ndarray,
-        reference_points: np.ndarray,
-    ) -> np.ndarray:
-        differences = query_points[:, None, :] - reference_points[None, :, :]
-
-        squared_distances = np.sum(
-            differences**2,
-            axis=2,
-        )
-
-        return np.argmin(
-            squared_distances,
-            axis=1,
-        )
-
-    @staticmethod
-    def _normalize_angle(
-        angles: np.ndarray,
-    ) -> np.ndarray:
+    def _normalize_angle(angles: np.ndarray) -> np.ndarray:
         return (angles + np.pi) % (2.0 * np.pi) - np.pi
 
     @staticmethod
@@ -334,16 +354,11 @@ class SpatiotemporalCost:
         predictions: ObjectPredictionSet,
     ) -> None:
         if trajectory.times.shape != predictions.times.shape:
-            raise ValueError(
-                "trajectory and predictions must have " "the same time-axis shape"
-            )
-
+            raise ValueError("trajectory and predictions must have the same time-axis shape")
         if not np.allclose(
             trajectory.times,
             predictions.times,
             rtol=0.0,
             atol=1e-12,
         ):
-            raise ValueError(
-                "trajectory and predictions must use " "the same time axis"
-            )
+            raise ValueError("trajectory and predictions must use the same time axis")
