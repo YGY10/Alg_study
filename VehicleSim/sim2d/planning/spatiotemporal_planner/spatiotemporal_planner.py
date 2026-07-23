@@ -13,7 +13,7 @@ from .coordinates import build_local_planning_context, local_trajectory_to_world
 from .optimizer import SpatiotemporalOptimizer
 from .pnc_map import PNCMap, local_reference_path_to_world
 from .prediction import ConstantVelocityPredictor
-from .types import OptimizationResult
+from .types import OptimizationResult, SpatiotemporalTrajectory
 
 
 class SpatiotemporalPlanner(Planner):
@@ -155,11 +155,24 @@ class SpatiotemporalPlanner(Planner):
         self._last_reference_source = reference_source
         self._last_pnc_reference_id = pnc_reference_id
 
-        warm_start_used = (
+        warm_start_available = (
             self._previous_controls is not None
             and self._previous_controls.shape == (self.config.horizon_steps, 2)
         )
-        initial_controls = self._make_initial_controls(current_speed=context.ego.speed)
+        (
+            initial_controls,
+            initial_source,
+            feedforward_controls,
+            feedforward_trajectory,
+            feedforward_diagnostics,
+            warm_start_diagnostics,
+        ) = self._select_initial_controls(
+            ego_state=context.ego,
+            reference_path=optimization_reference,
+            left_boundary=optimization_left_boundary,
+            right_boundary=optimization_right_boundary,
+        )
+
         prediction_times = (
             np.arange(self.config.horizon_steps + 1, dtype=np.float64)
             * self.config.dt
@@ -174,6 +187,16 @@ class SpatiotemporalPlanner(Planner):
             predictions=predictions,
             reference_path=optimization_reference,
             previous_control=self._previous_control,
+            left_boundary=optimization_left_boundary,
+            right_boundary=optimization_right_boundary,
+        )
+        optimization_result = self._apply_feasibility_fallback(
+            optimization_result=optimization_result,
+            feedforward_controls=feedforward_controls,
+            feedforward_trajectory=feedforward_trajectory,
+            feedforward_diagnostics=feedforward_diagnostics,
+            predictions=predictions,
+            reference_path=optimization_reference,
             left_boundary=optimization_left_boundary,
             right_boundary=optimization_right_boundary,
         )
@@ -223,10 +246,337 @@ class SpatiotemporalPlanner(Planner):
                 "navigation_path_source": (
                     "external" if self.has_external_reference_path else "fallback_bezier"
                 ),
-                "warm_start_used": warm_start_used,
+                "warm_start_used": warm_start_available,
+                "initial_control_source": initial_source,
+                "warm_start_diagnostics": warm_start_diagnostics,
+                "feedforward_diagnostics": feedforward_diagnostics,
                 "reference_changed": reference_changed,
                 "corridor_constraint_used": optimization_left_boundary is not None,
             },
+        )
+
+    def _select_initial_controls(
+        self,
+        *,
+        ego_state: VehicleState,
+        reference_path: np.ndarray | None,
+        left_boundary: np.ndarray | None,
+        right_boundary: np.ndarray | None,
+    ) -> tuple[
+        np.ndarray,
+        str,
+        np.ndarray | None,
+        SpatiotemporalTrajectory | None,
+        dict[str, float | int | bool] | None,
+        dict[str, float | int | bool] | None,
+    ]:
+        warm_controls = self._make_initial_controls(current_speed=ego_state.speed)
+        if reference_path is None or left_boundary is None or right_boundary is None:
+            return warm_controls, "warm_or_cruise", None, None, None, None
+
+        feedforward_controls = self._make_reference_feedforward_controls(
+            ego_state=ego_state,
+            reference_path=reference_path,
+        )
+        feedforward_trajectory = self.optimizer.rollout.rollout_from_ego(
+            ego_state=ego_state,
+            controls=feedforward_controls,
+        )
+        feedforward_diagnostics = self.optimizer._trajectory_diagnostics(
+            trajectory=feedforward_trajectory,
+            reference_path=reference_path,
+            left_boundary=left_boundary,
+            right_boundary=right_boundary,
+        )
+
+        if self._previous_controls is None:
+            return (
+                feedforward_controls,
+                "reference_feedforward",
+                feedforward_controls,
+                feedforward_trajectory,
+                feedforward_diagnostics,
+                None,
+            )
+
+        warm_trajectory = self.optimizer.rollout.rollout_from_ego(
+            ego_state=ego_state,
+            controls=warm_controls,
+        )
+        warm_diagnostics = self.optimizer._trajectory_diagnostics(
+            trajectory=warm_trajectory,
+            reference_path=reference_path,
+            left_boundary=left_boundary,
+            right_boundary=right_boundary,
+        )
+        warm_violation = float(warm_diagnostics["max_footprint_violation"])
+        feedforward_violation = float(
+            feedforward_diagnostics["max_footprint_violation"]
+        )
+        warm_is_acceptable = (
+            warm_violation <= self.config.warm_start_max_violation
+            and warm_violation <= feedforward_violation + 0.02
+        )
+        if warm_is_acceptable:
+            return (
+                warm_controls,
+                "warm_start",
+                feedforward_controls,
+                feedforward_trajectory,
+                feedforward_diagnostics,
+                warm_diagnostics,
+            )
+        return (
+            feedforward_controls,
+            "reference_feedforward_recovery",
+            feedforward_controls,
+            feedforward_trajectory,
+            feedforward_diagnostics,
+            warm_diagnostics,
+        )
+
+    def _apply_feasibility_fallback(
+        self,
+        *,
+        optimization_result: OptimizationResult,
+        feedforward_controls: np.ndarray | None,
+        feedforward_trajectory: SpatiotemporalTrajectory | None,
+        feedforward_diagnostics: dict[str, float | int | bool] | None,
+        predictions,
+        reference_path: np.ndarray | None,
+        left_boundary: np.ndarray | None,
+        right_boundary: np.ndarray | None,
+    ) -> OptimizationResult:
+        if (
+            feedforward_controls is None
+            or feedforward_trajectory is None
+            or feedforward_diagnostics is None
+        ):
+            return optimization_result
+
+        optimized_diagnostics = optimization_result.debug.get(
+            "trajectory_diagnostics", {}
+        )
+        optimized_violation = float(
+            optimized_diagnostics.get("max_footprint_violation", math.inf)
+        )
+        feedforward_violation = float(
+            feedforward_diagnostics.get("max_footprint_violation", math.inf)
+        )
+        needs_fallback = (
+            optimized_violation > self.config.result_max_violation
+            and feedforward_violation
+            + self.config.fallback_violation_improvement
+            < optimized_violation
+        )
+        if not needs_fallback:
+            debug = dict(optimization_result.debug)
+            debug["feasibility_fallback_used"] = False
+            debug["feedforward_max_violation"] = feedforward_violation
+            return OptimizationResult(
+                trajectory=optimization_result.trajectory,
+                success=optimization_result.success,
+                total_cost=optimization_result.total_cost,
+                iterations=optimization_result.iterations,
+                status=optimization_result.status,
+                cost_terms=dict(optimization_result.cost_terms),
+                debug=debug,
+            )
+
+        fallback_cost, fallback_terms = self.optimizer.cost.evaluate(
+            trajectory=feedforward_trajectory,
+            predictions=predictions,
+            reference_path=reference_path,
+            previous_control=self._previous_control,
+            left_boundary=left_boundary,
+            right_boundary=right_boundary,
+        )
+        optimized_collision = float(optimization_result.cost_terms.get("collision", 0.0))
+        fallback_collision = float(fallback_terms.get("collision", 0.0))
+        if fallback_collision > optimized_collision + 1e-6:
+            debug = dict(optimization_result.debug)
+            debug["feasibility_fallback_used"] = False
+            debug["feasibility_fallback_rejected_by_collision"] = True
+            debug["feedforward_max_violation"] = feedforward_violation
+            return OptimizationResult(
+                trajectory=optimization_result.trajectory,
+                success=optimization_result.success,
+                total_cost=optimization_result.total_cost,
+                iterations=optimization_result.iterations,
+                status=optimization_result.status,
+                cost_terms=dict(optimization_result.cost_terms),
+                debug=debug,
+            )
+
+        debug = dict(optimization_result.debug)
+        debug.update(
+            {
+                "feasibility_fallback_used": True,
+                "optimized_status_before_fallback": optimization_result.status,
+                "optimized_cost_before_fallback": optimization_result.total_cost,
+                "optimized_max_violation_before_fallback": optimized_violation,
+                "feedforward_max_violation": feedforward_violation,
+                "optimized_controls": feedforward_controls.copy(),
+                "trajectory_diagnostics": dict(feedforward_diagnostics),
+            }
+        )
+        return OptimizationResult(
+            trajectory=feedforward_trajectory,
+            success=feedforward_violation <= self.config.result_max_violation,
+            total_cost=float(fallback_cost),
+            iterations=optimization_result.iterations,
+            status="feasibility_feedforward_fallback",
+            cost_terms=dict(fallback_terms),
+            debug=debug,
+        )
+
+    def _make_reference_feedforward_controls(
+        self,
+        *,
+        ego_state: VehicleState,
+        reference_path: np.ndarray,
+    ) -> np.ndarray:
+        path = np.asarray(reference_path, dtype=np.float64)
+        controls = np.zeros((self.config.horizon_steps, 2), dtype=np.float64)
+        state = self.optimizer.rollout.local_initial_state(ego_state)
+        previous_steering = (
+            0.0 if self._previous_control is None else self._previous_control.steering
+        )
+        pure_pursuit_weight = self.config.feedforward_pure_pursuit_weight
+        steering_step_limit = max(
+            self.config.max_steering_rate * self.config.dt,
+            0.10,
+        )
+
+        for index in range(self.config.horizon_steps):
+            projection = self._project_state_to_reference(state, path)
+            current_s = projection["s"]
+            lookahead = float(
+                np.clip(
+                    self.config.feedforward_lookahead_base
+                    + self.config.feedforward_lookahead_speed_gain * state.speed,
+                    self.config.feedforward_lookahead_base,
+                    self.config.feedforward_lookahead_max,
+                )
+            )
+            target = self._interpolate_reference(path, current_s + lookahead)
+            dx = target[0] - state.x
+            dy = target[1] - state.y
+            target_distance = max(math.hypot(dx, dy), 0.5)
+            alpha = self._normalize_angle(math.atan2(dy, dx) - state.yaw)
+            pure_pursuit = math.atan2(
+                2.0 * self.vehicle_config.wheel_base * math.sin(alpha),
+                target_distance,
+            )
+            curvature_feedforward = math.atan(
+                self.vehicle_config.wheel_base * target[4]
+            )
+            steering = (
+                pure_pursuit_weight * pure_pursuit
+                + (1.0 - pure_pursuit_weight) * curvature_feedforward
+            )
+            steering = float(
+                np.clip(
+                    steering,
+                    previous_steering - steering_step_limit,
+                    previous_steering + steering_step_limit,
+                )
+            )
+            steering = float(
+                np.clip(
+                    steering,
+                    self.vehicle_config.steering_min,
+                    self.vehicle_config.steering_max,
+                )
+            )
+
+            preview_end = current_s + self.config.feedforward_curve_preview_distance
+            preview_mask = (path[:, 3] >= current_s) & (path[:, 3] <= preview_end)
+            if np.any(preview_mask):
+                preview_curvature = float(np.max(np.abs(path[preview_mask, 4])))
+            else:
+                preview_curvature = abs(float(target[4]))
+            curve_speed = math.sqrt(
+                self.config.curve_speed_lateral_acceleration
+                / max(preview_curvature, 1e-6)
+            )
+            target_speed = float(
+                np.clip(
+                    curve_speed,
+                    self.config.minimum_curve_speed,
+                    self.config.target_speed,
+                )
+            )
+            acceleration = float(
+                np.clip(
+                    (target_speed - state.speed)
+                    / self.config.feedforward_speed_response_time,
+                    self.vehicle_config.acceleration_min,
+                    self.vehicle_config.acceleration_max,
+                )
+            )
+            controls[index] = (acceleration, steering)
+            control = VehicleControl(acceleration=acceleration, steering=steering)
+            state = self.optimizer.rollout.motion_model.predict_step(
+                state,
+                control,
+                self.config.dt,
+            )
+            previous_steering = steering
+        return controls
+
+    @staticmethod
+    def _project_state_to_reference(
+        state: VehicleState,
+        reference_path: np.ndarray,
+    ) -> dict[str, float]:
+        point = np.array([state.x, state.y], dtype=np.float64)
+        starts = reference_path[:-1, :2]
+        vectors = reference_path[1:, :2] - starts
+        squared = np.sum(vectors * vectors, axis=1)
+        usable = squared > 1e-12
+        parameters = np.zeros(vectors.shape[0], dtype=np.float64)
+        parameters[usable] = (
+            np.sum((point - starts[usable]) * vectors[usable], axis=1)
+            / squared[usable]
+        )
+        parameters = np.clip(parameters, 0.0, 1.0)
+        projected = starts + parameters[:, None] * vectors
+        index = int(np.argmin(np.sum((projected - point) ** 2, axis=1)))
+        parameter = float(parameters[index])
+        yaw_values = np.unwrap(reference_path[:, 2])
+        yaw = float(
+            yaw_values[index]
+            + parameter * (yaw_values[index + 1] - yaw_values[index])
+        )
+        s = float(
+            reference_path[index, 3]
+            + parameter
+            * (reference_path[index + 1, 3] - reference_path[index, 3])
+        )
+        curvature = float(
+            reference_path[index, 4]
+            + parameter
+            * (reference_path[index + 1, 4] - reference_path[index, 4])
+        )
+        normal = np.array([-math.sin(yaw), math.cos(yaw)], dtype=np.float64)
+        lateral = float(np.dot(point - projected[index], normal))
+        return {"s": s, "lateral": lateral, "yaw": yaw, "curvature": curvature}
+
+    @staticmethod
+    def _interpolate_reference(reference_path: np.ndarray, s: float) -> np.ndarray:
+        arc = reference_path[:, 3]
+        value = float(np.clip(s, arc[0], arc[-1]))
+        yaw = np.unwrap(reference_path[:, 2])
+        return np.array(
+            [
+                np.interp(value, arc, reference_path[:, 0]),
+                np.interp(value, arc, reference_path[:, 1]),
+                (np.interp(value, arc, yaw) + np.pi) % (2.0 * np.pi) - np.pi,
+                value,
+                np.interp(value, arc, reference_path[:, 4]),
+            ],
+            dtype=np.float64,
         )
 
     def _make_initial_controls(self, *, current_speed: float) -> np.ndarray:
@@ -336,6 +686,10 @@ class SpatiotemporalPlanner(Planner):
     def _clear_warm_start(self) -> None:
         self._previous_controls = None
         self._previous_control = None
+
+    @staticmethod
+    def _normalize_angle(angle: float) -> float:
+        return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
     @staticmethod
     def _validate_reference_path(reference_path: np.ndarray) -> None:
