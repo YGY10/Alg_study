@@ -1,15 +1,26 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+import numpy as np
+
 from sim2d.perception import PerceivedLaneLine
 
 from .pnc_map import (
-    PNCReferenceLine,
     build_current_reference_line,
     local_reference_path_to_world,
 )
 
-# 保留旧名称，避免上层规划器接口和已有测试一次性全部失效。
-PerceptionLaneReference = PNCReferenceLine
+
+@dataclass(frozen=True)
+class PerceptionLaneReference:
+    """规划器使用的当前参考线兼容视图。"""
+
+    lane_id: str
+    confidence: float
+    reference_path: np.ndarray
+    left_boundary: np.ndarray
+    right_boundary: np.ndarray
 
 
 def build_perception_lane_reference(
@@ -26,7 +37,15 @@ def build_perception_lane_reference(
         minimum_confidence=minimum_confidence,
         maximum_lateral_distance=maximum_lateral_distance,
     )
-    return selected
+    if selected is None:
+        return None
+    return PerceptionLaneReference(
+        lane_id=selected.reference_id,
+        confidence=selected.confidence,
+        reference_path=selected.reference_path,
+        left_boundary=selected.left_boundary,
+        right_boundary=selected.right_boundary,
+    )
 
 
 __all__ = [
