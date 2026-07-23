@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import numpy as np
 
@@ -119,6 +120,12 @@ class SpatiotemporalOptimizer:
 
         if best.total_cost < initial_cost:
             success = True
+        diagnostics = self._trajectory_diagnostics(
+            trajectory=best.trajectory,
+            reference_path=reference_path,
+            left_boundary=left_boundary,
+            right_boundary=right_boundary,
+        )
         return OptimizationResult(
             trajectory=best.trajectory,
             success=success,
@@ -134,6 +141,7 @@ class SpatiotemporalOptimizer:
                 "accepted_step_history": tuple(float(value) for value in accepted_step_history),
                 "optimized_controls": best.controls.copy(),
                 "corridor_used": left_boundary is not None and right_boundary is not None,
+                "trajectory_diagnostics": diagnostics,
             },
         )
 
@@ -251,6 +259,149 @@ class SpatiotemporalOptimizer:
                 return candidate, float(step_size)
             step_size *= self.config.line_search_decay
         return None, 0.0
+
+    def _trajectory_diagnostics(
+        self,
+        *,
+        trajectory: SpatiotemporalTrajectory,
+        reference_path: np.ndarray | None,
+        left_boundary: np.ndarray | None,
+        right_boundary: np.ndarray | None,
+    ) -> dict[str, float | int | bool]:
+        speeds = np.asarray(trajectory.states[:, 3], dtype=np.float64)
+        result: dict[str, float | int | bool] = {
+            "planned_speed_min": float(np.min(speeds)),
+            "planned_speed_max": float(np.max(speeds)),
+            "planned_speed_terminal": float(speeds[-1]),
+            "curve_target_speed_min": float(self.config.target_speed),
+            "corridor_width_min": math.nan,
+            "corridor_width_mean": math.nan,
+            "corridor_width_max": math.nan,
+            "max_footprint_violation": 0.0,
+            "mean_footprint_violation": 0.0,
+            "violating_state_count": 0,
+            "violating_footprint_count": 0,
+        }
+        if reference_path is None:
+            return result
+
+        path = np.asarray(reference_path, dtype=np.float64)
+        center_projection = self._project_points_to_reference(
+            trajectory.states[:, :2], path
+        )
+        segment_indices = center_projection["segment_indices"]
+        parameters = center_projection["parameters"]
+        if path.shape[1] >= 5:
+            curvature = path[segment_indices, 4] + parameters * (
+                path[segment_indices + 1, 4] - path[segment_indices, 4]
+            )
+            curve_speed = np.sqrt(
+                self.config.curve_speed_lateral_acceleration
+                / np.maximum(np.abs(curvature), 1e-6)
+            )
+            curve_speed = np.clip(
+                curve_speed,
+                self.config.minimum_curve_speed,
+                self.config.target_speed,
+            )
+            result["curve_target_speed_min"] = float(np.min(curve_speed))
+
+        if left_boundary is None or right_boundary is None:
+            return result
+        left = np.asarray(left_boundary, dtype=np.float64)
+        right = np.asarray(right_boundary, dtype=np.float64)
+        widths = np.linalg.norm(left - right, axis=1)
+        result["corridor_width_min"] = float(np.min(widths))
+        result["corridor_width_mean"] = float(np.mean(widths))
+        result["corridor_width_max"] = float(np.max(widths))
+
+        footprint_points, state_indices = self._footprint_points(trajectory.states)
+        projection = self._project_points_to_reference(footprint_points, path)
+        indices = projection["segment_indices"]
+        t = projection["parameters"]
+        positions = projection["positions"]
+        yaw = projection["yaw"]
+        normals = np.column_stack((-np.sin(yaw), np.cos(yaw)))
+        lateral = np.sum((footprint_points - positions) * normals, axis=1)
+        left_projected = left[indices] + t[:, None] * (left[indices + 1] - left[indices])
+        right_projected = right[indices] + t[:, None] * (right[indices + 1] - right[indices])
+        left_l = np.sum((left_projected - positions) * normals, axis=1)
+        right_l = np.sum((right_projected - positions) * normals, axis=1)
+        lower = np.minimum(left_l, right_l)
+        upper = np.maximum(left_l, right_l)
+        violation = np.maximum(lower - lateral, 0.0) + np.maximum(lateral - upper, 0.0)
+        result["max_footprint_violation"] = float(np.max(violation))
+        result["mean_footprint_violation"] = float(np.mean(violation))
+        violating = violation > 1e-6
+        result["violating_footprint_count"] = int(np.count_nonzero(violating))
+        result["violating_state_count"] = int(
+            np.unique(state_indices[violating]).size
+        )
+        return result
+
+    def _footprint_points(
+        self,
+        states: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        half_length = 0.5 * self.vehicle_config.length + self.config.corridor_vehicle_margin
+        half_width = 0.5 * self.vehicle_config.width + self.config.corridor_vehicle_margin
+        offsets = np.array(
+            [
+                [half_length, half_width],
+                [half_length, -half_width],
+                [-half_length, half_width],
+                [-half_length, -half_width],
+                [0.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        yaw = states[:, 2]
+        cosine = np.cos(yaw)
+        sine = np.sin(yaw)
+        rotation = np.stack(
+            (
+                np.stack((cosine, -sine), axis=1),
+                np.stack((sine, cosine), axis=1),
+            ),
+            axis=1,
+        )
+        rotated = np.einsum("nij,kj->nki", rotation, offsets)
+        points = rotated + states[:, None, :2]
+        state_indices = np.repeat(np.arange(states.shape[0]), offsets.shape[0])
+        return points.reshape(-1, 2), state_indices
+
+    @staticmethod
+    def _project_points_to_reference(
+        points: np.ndarray,
+        reference_path: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        starts = reference_path[:-1, :2]
+        vectors = reference_path[1:, :2] - starts
+        squared_lengths = np.sum(vectors * vectors, axis=1)
+        usable = squared_lengths > 1e-12
+        delta = points[:, None, :] - starts[None, :, :]
+        parameters = np.zeros((points.shape[0], vectors.shape[0]), dtype=np.float64)
+        parameters[:, usable] = (
+            np.sum(delta[:, usable, :] * vectors[None, usable, :], axis=2)
+            / squared_lengths[usable][None, :]
+        )
+        parameters = np.clip(parameters, 0.0, 1.0)
+        projections = starts[None, :, :] + parameters[:, :, None] * vectors[None, :, :]
+        distances = np.sum((points[:, None, :] - projections) ** 2, axis=2)
+        segment_indices = np.argmin(distances, axis=1)
+        rows = np.arange(points.shape[0])
+        selected_t = parameters[rows, segment_indices]
+        selected_positions = projections[rows, segment_indices]
+        yaw_unwrapped = np.unwrap(reference_path[:, 2])
+        selected_yaw = yaw_unwrapped[segment_indices] + selected_t * (
+            yaw_unwrapped[segment_indices + 1] - yaw_unwrapped[segment_indices]
+        )
+        return {
+            "segment_indices": segment_indices,
+            "parameters": selected_t,
+            "positions": selected_positions,
+            "yaw": (selected_yaw + np.pi) % (2.0 * np.pi) - np.pi,
+        }
 
     def _validate_and_project_controls(self, controls: np.ndarray) -> np.ndarray:
         value = np.asarray(controls, dtype=np.float64)
