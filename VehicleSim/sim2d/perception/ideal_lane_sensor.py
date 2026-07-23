@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from sim2d.perception.types import PerceivedLaneSegment, PerceptionConfig
+from sim2d.perception.types import PerceivedLaneLine, PerceptionConfig
 from sim2d.types import VehicleState
 
 
@@ -23,75 +23,79 @@ class _BoundarySegments:
     progress_starts: np.ndarray
 
 
-def perceive_lane_corridors(
+def perceive_lane_lines(
     road_lanes,
     ego: VehicleState,
     config: PerceptionConfig,
     rng: np.random.Generator,
-) -> tuple[PerceivedLaneSegment, ...]:
-    """使用局部横向扫描线和前向扇形射线感知道路几何。
+) -> tuple[PerceivedLaneLine, ...]:
+    """发布车辆坐标系中的纯几何车道线点列。
 
-    输出不携带地图 lane id、前驱或后继拓扑。每个结果只表示当前帧
-    在车辆坐标系中恢复出的局部车道走廊。
+    传感器先扫描所有可见道路边界，再仅依据端点距离与切线连续性把
+    大概率属于同一条车道线的片段连接起来。输出不携带地图 lane id、
+    左右边界配对、前驱后继或导航语义。
     """
-    corridors: list[PerceivedLaneSegment] = []
+    fragments: list[np.ndarray] = []
 
     for lane in road_lanes:
         if rng.random() < config.lane_dropout_probability:
             continue
 
-        left_local = _world_polyline_to_vehicle(
-            np.asarray(lane.left_boundary, dtype=np.float64),
-            ego,
-        )
-        right_local = _world_polyline_to_vehicle(
-            np.asarray(lane.right_boundary, dtype=np.float64),
-            ego,
-        )
-
-        # 先在车辆坐标系中裁剪到感知窗口附近的局部线段。后续扫描只处理
-        # 这些候选线段，避免每条扫描线和射线遍历整幅地图中的长边界。
-        left_segments = _prepare_visible_segments(left_local, config)
-        right_segments = _prepare_visible_segments(right_local, config)
-        if left_segments is None or right_segments is None:
-            continue
-
-        left_hits = _scan_boundary(left_segments, config)
-        right_hits = _scan_boundary(right_segments, config)
-
-        if len(left_hits) < 2 or len(right_hits) < 2:
-            continue
-
-        left_boundary = _resample_hits(left_hits, config.lane_output_point_count)
-        right_boundary = _resample_hits(right_hits, config.lane_output_point_count)
-
-        if config.position_noise_std > 0.0:
-            left_boundary = left_boundary + rng.normal(
-                0.0,
-                config.position_noise_std,
-                left_boundary.shape,
+        for world_boundary in (lane.left_boundary, lane.right_boundary):
+            local = _world_polyline_to_vehicle(
+                np.asarray(world_boundary, dtype=np.float64),
+                ego,
             )
-            right_boundary = right_boundary + rng.normal(
-                0.0,
-                config.position_noise_std,
-                right_boundary.shape,
-            )
+            segments = _prepare_visible_segments(local, config)
+            if segments is None:
+                continue
 
-        centerline = 0.5 * (left_boundary + right_boundary)
+            hits = _scan_boundary(segments, config)
+            if len(hits) < 2:
+                continue
 
-        corridors.append(
-            PerceivedLaneSegment(
-                map_lane_id=f"scan_corridor_{len(corridors)}",
-                centerline=centerline,
-                left_boundary=left_boundary,
-                right_boundary=right_boundary,
-                predecessor_ids=(),
-                successor_ids=(),
-                confidence=1.0,
-            )
+            points = _resample_hits(hits, config.lane_output_point_count)
+            if config.position_noise_std > 0.0:
+                points = points + rng.normal(
+                    0.0,
+                    config.position_noise_std,
+                    points.shape,
+                )
+            fragments.append(points)
+
+    fragments = _remove_duplicate_lines(
+        fragments,
+        maximum_mean_distance=config.lane_line_duplicate_distance,
+    )
+    connected = _connect_line_fragments(
+        fragments,
+        maximum_endpoint_distance=config.lane_line_join_distance,
+        maximum_heading_error=config.lane_line_join_heading,
+        output_point_count=config.lane_output_point_count,
+    )
+    connected = _remove_duplicate_lines(
+        connected,
+        maximum_mean_distance=config.lane_line_duplicate_distance,
+    )
+
+    return tuple(
+        PerceivedLaneLine(
+            line_id=f"lane_line_{index}",
+            points=points,
+            confidence=1.0,
         )
+        for index, points in enumerate(connected)
+    )
 
-    return tuple(corridors)
+
+def perceive_lane_corridors(
+    road_lanes,
+    ego: VehicleState,
+    config: PerceptionConfig,
+    rng: np.random.Generator,
+) -> tuple[PerceivedLaneLine, ...]:
+    """兼容旧调用名；返回值已经改为感知车道线，而不是走廊。"""
+    return perceive_lane_lines(road_lanes, ego, config, rng)
 
 
 def _world_polyline_to_vehicle(
@@ -114,7 +118,6 @@ def _prepare_visible_segments(
     polyline: np.ndarray,
     config: PerceptionConfig,
 ) -> _BoundarySegments | None:
-    """保留包围盒可能与局部感知窗口相交的折线段。"""
     if polyline.ndim != 2 or polyline.shape[1] != 2 or polyline.shape[0] < 2:
         return None
 
@@ -122,7 +125,6 @@ def _prepare_visible_segments(
     ends = polyline[1:]
     vectors = ends - starts
     lengths = np.linalg.norm(vectors, axis=1)
-
     segment_minimum = np.minimum(starts, ends)
     segment_maximum = np.maximum(starts, ends)
 
@@ -133,18 +135,13 @@ def _prepare_visible_segments(
         & (segment_maximum[:, 1] >= -config.lateral_range)
         & (segment_minimum[:, 1] <= config.lateral_range)
     )
-
     indices = np.flatnonzero(visible)
     if indices.size == 0:
         return None
 
     cumulative = np.concatenate(
-        (
-            np.array([0.0], dtype=np.float64),
-            np.cumsum(lengths),
-        )
+        (np.array([0.0], dtype=np.float64), np.cumsum(lengths))
     )
-
     return _BoundarySegments(
         starts=np.asarray(starts[indices], dtype=np.float64),
         vectors=np.asarray(vectors[indices], dtype=np.float64),
@@ -174,8 +171,13 @@ def _scan_boundary(
         dtype=np.float64,
     )
     directions = np.column_stack((np.cos(angles), np.sin(angles)))
-    max_distance = math.hypot(config.forward_range, config.lateral_range)
-    hits.extend(_nearest_ray_hits(segments, directions, max_distance))
+    hits.extend(
+        _nearest_ray_hits(
+            segments,
+            directions,
+            math.hypot(config.forward_range, config.lateral_range),
+        )
+    )
 
     filtered = [
         hit
@@ -192,7 +194,6 @@ def _vertical_scan_hits(
     segments: _BoundarySegments,
     scan_x_values: np.ndarray,
 ) -> list[_BoundaryHit]:
-    """批量计算所有横向扫描线与候选线段的交点。"""
     dx = segments.vectors[:, 0]
     non_vertical = np.abs(dx) > 1e-12
     if not np.any(non_vertical):
@@ -206,7 +207,6 @@ def _vertical_scan_hits(
     parameters[:, non_vertical] = (
         scan_x_values[:, None] - segments.starts[None, non_vertical, 0]
     ) / dx[None, non_vertical]
-
     valid = (
         np.isfinite(parameters)
         & (parameters >= -1e-12)
@@ -216,11 +216,7 @@ def _vertical_scan_hits(
     if scan_indices.size == 0:
         return []
 
-    values = np.clip(
-        parameters[scan_indices, segment_indices],
-        0.0,
-        1.0,
-    )
+    values = np.clip(parameters[scan_indices, segment_indices], 0.0, 1.0)
     points = (
         segments.starts[segment_indices]
         + values[:, None] * segments.vectors[segment_indices]
@@ -229,12 +225,8 @@ def _vertical_scan_hits(
         segments.progress_starts[segment_indices]
         + values * segments.lengths[segment_indices]
     )
-
     return [
-        _BoundaryHit(
-            progress=float(item_progress),
-            point=np.asarray(point, dtype=np.float64),
-        )
+        _BoundaryHit(float(item_progress), np.asarray(point, dtype=np.float64))
         for item_progress, point in zip(progress, points)
     ]
 
@@ -244,22 +236,17 @@ def _nearest_ray_hits(
     directions: np.ndarray,
     max_distance: float,
 ) -> list[_BoundaryHit]:
-    """使用二维叉积批量计算每条射线的最近线段交点。"""
     direction_x = directions[:, 0, None]
     direction_y = directions[:, 1, None]
     segment_x = segments.vectors[None, :, 0]
     segment_y = segments.vectors[None, :, 1]
-
     denominator = direction_x * segment_y - direction_y * segment_x
 
     start_x = segments.starts[None, :, 0]
     start_y = segments.starts[None, :, 1]
-    distance_numerator = start_x * segment_y - start_y * segment_x
-    parameter_numerator = start_x * direction_y - start_y * direction_x
-
     with np.errstate(divide="ignore", invalid="ignore"):
-        distances = distance_numerator / denominator
-        parameters = parameter_numerator / denominator
+        distances = (start_x * segment_y - start_y * segment_x) / denominator
+        parameters = (start_x * direction_y - start_y * direction_x) / denominator
 
     valid = (
         (np.abs(denominator) > 1e-12)
@@ -270,12 +257,10 @@ def _nearest_ray_hits(
         & (parameters >= -1e-9)
         & (parameters <= 1.0 + 1e-9)
     )
-
     candidate_distances = np.where(valid, distances, np.inf)
     nearest_segment = np.argmin(candidate_distances, axis=1)
     nearest_distance = candidate_distances[
-        np.arange(directions.shape[0]),
-        nearest_segment,
+        np.arange(directions.shape[0]), nearest_segment
     ]
     ray_indices = np.flatnonzero(np.isfinite(nearest_distance))
     if ray_indices.size == 0:
@@ -284,37 +269,146 @@ def _nearest_ray_hits(
     segment_indices = nearest_segment[ray_indices]
     distance_values = np.maximum(nearest_distance[ray_indices], 0.0)
     parameter_values = np.clip(
-        parameters[ray_indices, segment_indices],
-        0.0,
-        1.0,
+        parameters[ray_indices, segment_indices], 0.0, 1.0
     )
     points = distance_values[:, None] * directions[ray_indices]
     progress = (
         segments.progress_starts[segment_indices]
         + parameter_values * segments.lengths[segment_indices]
     )
-
     return [
-        _BoundaryHit(
-            progress=float(item_progress),
-            point=np.asarray(point, dtype=np.float64),
-        )
+        _BoundaryHit(float(item_progress), np.asarray(point, dtype=np.float64))
         for item_progress, point in zip(progress, points)
     ]
+
+
+def _connect_line_fragments(
+    fragments: list[np.ndarray],
+    *,
+    maximum_endpoint_distance: float,
+    maximum_heading_error: float,
+    output_point_count: int,
+) -> list[np.ndarray]:
+    lines = [np.asarray(item, dtype=np.float64).copy() for item in fragments]
+    changed = True
+    while changed and len(lines) > 1:
+        changed = False
+        best: tuple[float, int, int, np.ndarray] | None = None
+        for first_index in range(len(lines)):
+            for second_index in range(first_index + 1, len(lines)):
+                merged = _best_geometric_merge(
+                    lines[first_index],
+                    lines[second_index],
+                    maximum_endpoint_distance,
+                    maximum_heading_error,
+                )
+                if merged is None:
+                    continue
+                score, points = merged
+                if best is None or score < best[0]:
+                    best = (score, first_index, second_index, points)
+        if best is not None:
+            _, first_index, second_index, points = best
+            lines[first_index] = _resample_polyline(points, output_point_count)
+            del lines[second_index]
+            changed = True
+    return lines
+
+
+def _best_geometric_merge(
+    first: np.ndarray,
+    second: np.ndarray,
+    maximum_endpoint_distance: float,
+    maximum_heading_error: float,
+) -> tuple[float, np.ndarray] | None:
+    options = (
+        (first, second),
+        (first, second[::-1]),
+        (first[::-1], second),
+        (first[::-1], second[::-1]),
+    )
+    best: tuple[float, np.ndarray] | None = None
+    for left, right in options:
+        distance = float(np.linalg.norm(left[-1] - right[0]))
+        if distance > maximum_endpoint_distance:
+            continue
+        left_tangent = _unit_tangent(left[-2], left[-1])
+        right_tangent = _unit_tangent(right[0], right[1])
+        if left_tangent is None or right_tangent is None:
+            continue
+        heading_error = math.acos(
+            float(np.clip(np.dot(left_tangent, right_tangent), -1.0, 1.0))
+        )
+        if heading_error > maximum_heading_error:
+            continue
+        score = distance + maximum_endpoint_distance * heading_error
+        connector = 0.5 * (left[-1] + right[0])
+        merged = np.vstack((left[:-1], connector, right[1:]))
+        if best is None or score < best[0]:
+            best = (score, merged)
+    return best
+
+
+def _remove_duplicate_lines(
+    lines: list[np.ndarray],
+    *,
+    maximum_mean_distance: float,
+) -> list[np.ndarray]:
+    if maximum_mean_distance <= 0.0:
+        return lines
+    unique: list[np.ndarray] = []
+    for line in lines:
+        sample = _resample_polyline(line, 25)
+        duplicate = False
+        for existing in unique:
+            other = _resample_polyline(existing, 25)
+            distance = min(
+                float(np.mean(np.linalg.norm(sample - other, axis=1))),
+                float(np.mean(np.linalg.norm(sample - other[::-1], axis=1))),
+            )
+            if distance <= maximum_mean_distance:
+                duplicate = True
+                break
+        if not duplicate:
+            unique.append(line)
+    return unique
+
+
+def _unit_tangent(start: np.ndarray, end: np.ndarray) -> np.ndarray | None:
+    value = end - start
+    norm = float(np.linalg.norm(value))
+    if norm <= 1e-12:
+        return None
+    return value / norm
 
 
 def _resample_hits(hits: list[_BoundaryHit], point_count: int) -> np.ndarray:
     progress = np.asarray([hit.progress for hit in hits], dtype=np.float64)
     points = np.asarray([hit.point for hit in hits], dtype=np.float64)
-
     if progress[-1] - progress[0] <= 1e-9:
         raise ValueError("lane scan contains insufficient longitudinal extent")
-
     sample_progress = np.linspace(progress[0], progress[-1], point_count)
     return np.column_stack(
         (
             np.interp(sample_progress, progress, points[:, 0]),
             np.interp(sample_progress, progress, points[:, 1]),
+        )
+    )
+
+
+def _resample_polyline(points: np.ndarray, point_count: int) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float64)
+    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    keep = np.concatenate((np.array([True]), segment_lengths > 1e-9))
+    points = points[keep]
+    if points.shape[0] < 2:
+        return points
+    arc = np.concatenate((np.array([0.0]), np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))))
+    samples = np.linspace(0.0, float(arc[-1]), point_count)
+    return np.column_stack(
+        (
+            np.interp(samples, arc, points[:, 0]),
+            np.interp(samples, arc, points[:, 1]),
         )
     )
 
@@ -338,4 +432,4 @@ def _inside_field_of_view(point: np.ndarray, field_of_view: float) -> bool:
     return angle <= 0.5 * field_of_view + 1e-9
 
 
-__all__ = ["perceive_lane_corridors"]
+__all__ = ["perceive_lane_corridors", "perceive_lane_lines"]
