@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import textwrap
 from dataclasses import replace
 from time import perf_counter
 from typing import Any
+
+from PySide6.QtCore import QEvent, QObject, Qt
+from PySide6.QtWidgets import QPlainTextEdit
 
 from sim2d.gui.main_window import MainWindow
 from sim2d.perception import ground_truth as ground_truth_module
@@ -17,6 +21,23 @@ from sim2d.planning.spatiotemporal_planner.spatiotemporal_planner import (
 _INSTALLED = False
 _ACTIVE_OPTIMIZER: SpatiotemporalOptimizer | None = None
 _LAST_LANE_SCAN_MS = 0.0
+_LOG_WRAP_WIDTH = 105
+
+
+class _LogConsoleDeleteFilter(QObject):
+    """允许只读日志框通过 Delete/Backspace 删除当前选中文本。"""
+
+    def eventFilter(self, watched, event) -> bool:
+        if (
+            event.type() == QEvent.Type.KeyPress
+            and event.key() in {Qt.Key.Key_Delete, Qt.Key.Key_Backspace}
+        ):
+            cursor = watched.textCursor()
+            if cursor.hasSelection():
+                cursor.removeSelectedText()
+                watched.setTextCursor(cursor)
+                return True
+        return super().eventFilter(watched, event)
 
 
 def _milliseconds(start: float) -> float:
@@ -29,11 +50,54 @@ def install() -> None:
     if _INSTALLED:
         return
 
+    _install_log_console_behavior()
     _install_perception_timing()
     _install_optimizer_timing()
     _install_planner_timing()
     _install_cycle_timing()
     _INSTALLED = True
+
+
+def _install_log_console_behavior() -> None:
+    original_build_ui = MainWindow._build_ui
+    original_append_log = MainWindow.append_log
+
+    def build_ui(self: MainWindow) -> None:
+        original_build_ui(self)
+        self.log_console.setLineWrapMode(
+            QPlainTextEdit.LineWrapMode.WidgetWidth
+        )
+        delete_filter = _LogConsoleDeleteFilter(self.log_console)
+        self.log_console.installEventFilter(delete_filter)
+        # 必须由窗口持有引用，否则 Python 对象被回收后事件过滤器会失效。
+        self._log_console_delete_filter = delete_filter
+        self.log_console.setToolTip(
+            "Ctrl+A 全选，Ctrl+C 复制；选中后按 Delete 或 Backspace 删除"
+        )
+
+    def append_log(self: MainWindow, message: str) -> None:
+        formatted_lines: list[str] = []
+        for paragraph in str(message).splitlines() or [""]:
+            leading_length = len(paragraph) - len(paragraph.lstrip(" "))
+            leading = paragraph[:leading_length]
+            body = paragraph[leading_length:]
+            if not body:
+                formatted_lines.append(leading)
+                continue
+            available_width = max(_LOG_WRAP_WIDTH - len(leading), 20)
+            wrapped = textwrap.wrap(
+                body,
+                width=available_width,
+                initial_indent=leading,
+                subsequent_indent=leading + "  ",
+                break_long_words=False,
+                break_on_hyphens=False,
+            )
+            formatted_lines.extend(wrapped or [leading])
+        original_append_log(self, "\n".join(formatted_lines))
+
+    MainWindow._build_ui = build_ui
+    MainWindow.append_log = append_log
 
 
 def _install_perception_timing() -> None:
@@ -203,7 +267,9 @@ def _install_cycle_timing() -> None:
             planner_ms = float(timing.get("planner_total", 0.0))
             perception_ms = float(timing.get("perception_total", 0.0))
             lane_scan_ms = float(timing.get("lane_scan", 0.0))
+            perception_other_ms = max(perception_ms - lane_scan_ms, 0.0)
             optimizer_ms = float(timing.get("optimizer_total", 0.0))
+            planner_other_ms = max(planner_ms - optimizer_ms, 0.0)
             gradient_ms = float(
                 optimizer_timing.get("finite_difference_gradient_ms", 0.0)
             )
@@ -213,26 +279,36 @@ def _install_cycle_timing() -> None:
             rollout_ms = float(optimizer_timing.get("rollout_ms", 0.0))
             cost_ms = float(optimizer_timing.get("cost_ms", 0.0))
             evaluate_count = int(optimizer_timing.get("cost_count", 0))
+            cycle_other_ms = max(
+                cycle_total_ms - perception_ms - planner_ms,
+                0.0,
+            )
 
             self.append_log(
                 "PERF "
-                f"cycle={cycle_total_ms:.2f}ms "
-                f"perception={perception_ms:.2f}ms "
+                f"cycle={cycle_total_ms:.2f}ms\n"
+                "  perception "
+                f"total={perception_ms:.2f}ms "
                 f"lane_scan={lane_scan_ms:.2f}ms "
-                f"planner={planner_ms:.2f}ms "
+                f"other={perception_other_ms:.2f}ms\n"
+                "  planner "
+                f"total={planner_ms:.2f}ms "
                 f"optimizer={optimizer_ms:.2f}ms "
+                f"other={planner_other_ms:.2f}ms\n"
+                "  optimizer "
                 f"gradient={gradient_ms:.2f}ms "
                 f"line_search={line_search_ms:.2f}ms "
                 f"rollout={rollout_ms:.2f}ms "
                 f"cost={cost_ms:.2f}ms "
-                f"evals={evaluate_count} "
-                f"gui_env_other={max(cycle_total_ms - planner_ms, 0.0):.2f}ms"
+                f"evals={evaluate_count}\n"
+                "  cycle_other "
+                f"env_snapshot_render_log={cycle_other_ms:.2f}ms"
             )
         except Exception as error:
             self.append_log(
                 "PERF_ERROR "
-                f"cycle={cycle_total_ms:.2f}ms "
-                f"error={type(error).__name__}: {error}"
+                f"cycle={cycle_total_ms:.2f}ms\n"
+                f"  error={type(error).__name__}: {error}"
             )
 
     MainWindow.advance_one_step = timed_advance
