@@ -45,13 +45,14 @@ class SpatiotemporalCost:
             terminal_cost,
             corridor_cost,
             progress_cost,
+            curve_speed_cost,
         ) = self._reference_cost(
             trajectory=trajectory,
             reference_path=reference_path,
             left_boundary=left_boundary,
             right_boundary=right_boundary,
         )
-        speed_cost = self._speed_cost(trajectory)
+        speed_cost = self._speed_cost(trajectory) if reference_path is None else curve_speed_cost
         (
             acceleration_cost,
             steering_cost,
@@ -96,10 +97,10 @@ class SpatiotemporalCost:
         reference_path: np.ndarray | None,
         left_boundary: np.ndarray | None,
         right_boundary: np.ndarray | None,
-    ) -> tuple[float, float, float, float, float]:
-        """在 reference Frenet 坐标系中计算横向、航向和走廊代价。"""
+    ) -> tuple[float, float, float, float, float, float]:
+        """在 reference Frenet 坐标系中计算跟踪、走廊与弯道速度代价。"""
         if reference_path is None:
-            return 0.0, 0.0, 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
         path = np.asarray(reference_path, dtype=np.float64)
         if path.ndim != 2 or path.shape[1] < 3 or path.shape[0] < 2:
@@ -114,9 +115,6 @@ class SpatiotemporalCost:
         lateral = projection["lateral"]
         projected_yaw = projection["yaw"]
         projected_s = projection["s"]
-        segment_indices = projection["segment_indices"]
-        parameters = projection["parameters"]
-
         heading_errors = self._normalize_angle(
             trajectory.states[:, 2] - projected_yaw
         )
@@ -137,44 +135,31 @@ class SpatiotemporalCost:
 
         corridor_cost = 0.0
         if left_boundary is not None and right_boundary is not None:
-            left = np.asarray(left_boundary, dtype=np.float64)
-            right = np.asarray(right_boundary, dtype=np.float64)
-            if (
-                left.shape != path[:, :2].shape
-                or right.shape != path[:, :2].shape
-            ):
-                raise ValueError(
-                    "left_boundary and right_boundary must match reference point count"
-                )
-            normals = np.column_stack((-np.sin(projected_yaw), np.cos(projected_yaw)))
-            left_projected = (
-                left[segment_indices]
-                + parameters[:, None]
-                * (left[segment_indices + 1] - left[segment_indices])
+            corridor_cost = self._footprint_corridor_cost(
+                trajectory=trajectory,
+                reference_path=path,
+                left_boundary=np.asarray(left_boundary, dtype=np.float64),
+                right_boundary=np.asarray(right_boundary, dtype=np.float64),
             )
-            right_projected = (
-                right[segment_indices]
-                + parameters[:, None]
-                * (right[segment_indices + 1] - right[segment_indices])
-            )
-            projected_positions = projection["positions"]
-            left_l = np.sum((left_projected - projected_positions) * normals, axis=1)
-            right_l = np.sum((right_projected - projected_positions) * normals, axis=1)
-            lower = np.minimum(left_l, right_l)
-            upper = np.maximum(left_l, right_l)
 
-            clearance = 0.5 * self.vehicle_config.width + self.config.corridor_vehicle_margin
-            lower_allowed = lower + clearance
-            upper_allowed = upper - clearance
-            invalid_width = lower_allowed > upper_allowed
-            lower_allowed[invalid_width] = 0.5 * (lower[invalid_width] + upper[invalid_width])
-            upper_allowed[invalid_width] = lower_allowed[invalid_width]
-
-            violation = np.maximum(lower_allowed - lateral, 0.0) + np.maximum(
-                lateral - upper_allowed,
-                0.0,
-            )
-            corridor_cost = float(np.mean(violation**2))
+        projected_curvature = self._interpolate_reference_column(
+            reference_path=path,
+            projection=projection,
+            column=4,
+            default=0.0,
+        )
+        curvature_magnitude = np.maximum(np.abs(projected_curvature), 1e-6)
+        curve_speed_limit = np.sqrt(
+            self.config.curve_speed_lateral_acceleration / curvature_magnitude
+        )
+        target_speeds = np.clip(
+            curve_speed_limit,
+            self.config.minimum_curve_speed,
+            self.config.target_speed,
+        )
+        curve_speed_cost = float(
+            np.mean((trajectory.states[:, 3] - target_speeds) ** 2)
+        )
 
         return (
             reference_cost,
@@ -182,6 +167,84 @@ class SpatiotemporalCost:
             terminal_cost,
             corridor_cost,
             progress_cost,
+            curve_speed_cost,
+        )
+
+    def _footprint_corridor_cost(
+        self,
+        *,
+        trajectory: SpatiotemporalTrajectory,
+        reference_path: np.ndarray,
+        left_boundary: np.ndarray,
+        right_boundary: np.ndarray,
+    ) -> float:
+        expected_shape = reference_path[:, :2].shape
+        if left_boundary.shape != expected_shape or right_boundary.shape != expected_shape:
+            raise ValueError(
+                "left_boundary and right_boundary must match reference point count"
+            )
+
+        states = trajectory.states
+        yaw = states[:, 2]
+        forward = np.column_stack((np.cos(yaw), np.sin(yaw)))
+        left_axis = np.column_stack((-np.sin(yaw), np.cos(yaw)))
+        half_length = 0.5 * self.vehicle_config.length + self.config.corridor_vehicle_margin
+        half_width = 0.5 * self.vehicle_config.width + self.config.corridor_vehicle_margin
+        centers = states[:, :2]
+
+        footprint = np.stack(
+            (
+                centers + half_length * forward + half_width * left_axis,
+                centers + half_length * forward - half_width * left_axis,
+                centers - half_length * forward + half_width * left_axis,
+                centers - half_length * forward - half_width * left_axis,
+                centers,
+            ),
+            axis=1,
+        )
+        flattened = footprint.reshape(-1, 2)
+        projection = self._project_to_reference(
+            query_points=flattened,
+            reference_path=reference_path,
+        )
+        segment_indices = projection["segment_indices"]
+        parameters = projection["parameters"]
+        projected_yaw = projection["yaw"]
+        projected_positions = projection["positions"]
+        normals = np.column_stack((-np.sin(projected_yaw), np.cos(projected_yaw)))
+
+        left_projected = (
+            left_boundary[segment_indices]
+            + parameters[:, None]
+            * (left_boundary[segment_indices + 1] - left_boundary[segment_indices])
+        )
+        right_projected = (
+            right_boundary[segment_indices]
+            + parameters[:, None]
+            * (right_boundary[segment_indices + 1] - right_boundary[segment_indices])
+        )
+        point_l = np.sum((flattened - projected_positions) * normals, axis=1)
+        left_l = np.sum((left_projected - projected_positions) * normals, axis=1)
+        right_l = np.sum((right_projected - projected_positions) * normals, axis=1)
+        lower = np.minimum(left_l, right_l)
+        upper = np.maximum(left_l, right_l)
+        violation = np.maximum(lower - point_l, 0.0) + np.maximum(
+            point_l - upper,
+            0.0,
+        )
+
+        violation_by_state = violation.reshape(states.shape[0], -1)
+        mean_squared = float(np.mean(violation_by_state**2))
+        max_violation = float(np.max(violation_by_state))
+        barrier_excess = np.maximum(
+            violation_by_state - self.config.corridor_barrier_threshold,
+            0.0,
+        )
+        barrier = float(np.mean(barrier_excess**2))
+        return (
+            mean_squared
+            + self.config.corridor_max_violation_multiplier * max_violation**2
+            + self.config.corridor_barrier_multiplier * barrier
         )
 
     def _project_to_reference(
@@ -198,7 +261,10 @@ class SpatiotemporalCost:
             raise ValueError("reference_path has no usable segment")
 
         delta = query_points[:, None, :] - starts[None, :, :]
-        parameters = np.zeros((query_points.shape[0], vectors.shape[0]))
+        parameters = np.zeros(
+            (query_points.shape[0], vectors.shape[0]),
+            dtype=np.float64,
+        )
         parameters[:, usable] = (
             np.sum(delta[:, usable, :] * vectors[None, usable, :], axis=2)
             / squared_lengths[usable][None, :]
@@ -226,7 +292,6 @@ class SpatiotemporalCost:
         projected_s = reference_s[segment_indices] + selected_t * (
             reference_s[segment_indices + 1] - reference_s[segment_indices]
         )
-
         yaw_unwrapped = np.unwrap(reference_path[:, 2])
         projected_yaw = yaw_unwrapped[segment_indices] + selected_t * (
             yaw_unwrapped[segment_indices + 1] - yaw_unwrapped[segment_indices]
@@ -242,6 +307,23 @@ class SpatiotemporalCost:
             "segment_indices": segment_indices,
             "parameters": selected_t,
         }
+
+    @staticmethod
+    def _interpolate_reference_column(
+        *,
+        reference_path: np.ndarray,
+        projection: dict[str, np.ndarray],
+        column: int,
+        default: float,
+    ) -> np.ndarray:
+        count = projection["segment_indices"].shape[0]
+        if reference_path.shape[1] <= column:
+            return np.full(count, default, dtype=np.float64)
+        indices = projection["segment_indices"]
+        parameters = projection["parameters"]
+        return reference_path[indices, column] + parameters * (
+            reference_path[indices + 1, column] - reference_path[indices, column]
+        )
 
     def _speed_cost(self, trajectory: SpatiotemporalTrajectory) -> float:
         speed_errors = trajectory.states[:, 3] - self.config.target_speed
