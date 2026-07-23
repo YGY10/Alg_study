@@ -6,7 +6,7 @@ from dataclasses import replace
 
 import numpy as np
 
-from sim2d.perception.ideal_lane_sensor import perceive_lane_lines
+from sim2d.perception.ideal_lane_sensor import perceive_lane_corridors
 from sim2d.perception.types import (
     PerceivedObject,
     PerceivedTrafficSignal,
@@ -87,7 +87,8 @@ class GroundTruthLocalPerception:
             if self._rng.random() >= self.config.signal_dropout_probability
         )
 
-        lane_lines = perceive_lane_lines(
+        # 兼容性能调试层的旧函数名；返回值已经是 PerceivedLaneLine 集合。
+        lane_lines = perceive_lane_corridors(
             world_state.road_lanes,
             ego,
             self.config,
