@@ -21,9 +21,14 @@ class SpatiotemporalPlannerConfig:
     small_car_margin: float = 1.2
     large_vehicle_margin: float = 1.8
 
-    # 参考线 Frenet 跟踪与车道走廊
+    # 参考线 Frenet 跟踪、车身走廊与弯道速度
     corridor_vehicle_margin: float = 0.20
+    corridor_max_violation_multiplier: float = 20.0
+    corridor_barrier_threshold: float = 0.05
+    corridor_barrier_multiplier: float = 200.0
     maximum_lateral_acceleration: float = 3.0
+    curve_speed_lateral_acceleration: float = 2.5
+    minimum_curve_speed: float = 1.0
     frenet_nonmonotonic_tolerance: float = 0.05
 
     # 代价权重
@@ -83,8 +88,20 @@ class SpatiotemporalPlannerConfig:
             raise ValueError("min_step_size must not exceed initial_step_size")
         if self.corridor_vehicle_margin < 0.0:
             raise ValueError("corridor_vehicle_margin must be non-negative")
+        if self.corridor_max_violation_multiplier < 0.0:
+            raise ValueError("corridor_max_violation_multiplier must be non-negative")
+        if self.corridor_barrier_threshold < 0.0:
+            raise ValueError("corridor_barrier_threshold must be non-negative")
+        if self.corridor_barrier_multiplier < 0.0:
+            raise ValueError("corridor_barrier_multiplier must be non-negative")
         if self.maximum_lateral_acceleration <= 0.0:
             raise ValueError("maximum_lateral_acceleration must be positive")
+        if self.curve_speed_lateral_acceleration <= 0.0:
+            raise ValueError("curve_speed_lateral_acceleration must be positive")
+        if self.minimum_curve_speed < 0.0:
+            raise ValueError("minimum_curve_speed must be non-negative")
+        if self.minimum_curve_speed > self.target_speed:
+            raise ValueError("minimum_curve_speed must not exceed target_speed")
         if self.frenet_nonmonotonic_tolerance < 0.0:
             raise ValueError("frenet_nonmonotonic_tolerance must be non-negative")
 
