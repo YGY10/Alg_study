@@ -7,7 +7,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from sim2d.perception import (
-    PerceivedLaneSegment,
+    PerceivedLaneLine,
     PerceivedObject,
     PerceivedTrafficSignal,
 )
@@ -18,42 +18,25 @@ FloatArray = NDArray[np.float64]
 
 @dataclass(frozen=True)
 class ControlSequence:
-    """
-    优化器的控制变量。
-
-    controls[k] = [acceleration, steering]
-    shape = [horizon_steps, 2]
-    """
+    """优化器控制变量，controls[k] = [acceleration, steering]。"""
 
     controls: FloatArray
 
     def __post_init__(self) -> None:
         value = np.asarray(self.controls, dtype=np.float64)
-
         if value.ndim != 2 or value.shape[1] != 2:
             raise ValueError(
                 "controls must have shape [N, 2], "
                 f"got {value.shape}"
             )
-
         if not np.all(np.isfinite(value)):
             raise ValueError("controls contain non-finite values")
-
         object.__setattr__(self, "controls", value.copy())
 
 
 @dataclass(frozen=True)
 class SpatiotemporalTrajectory:
-    """
-    规划时刻冻结自车坐标系中的时空联合轨迹。
-
-    states[k] = [x_forward, y_left, relative_yaw, speed]
-    times[k] = 相对于当前规划时刻的时间
-    controls[k] = [acceleration, steering]
-
-    states 和 times 的长度为 N + 1，controls 的长度为 N。
-    坐标系在一次优化期间保持固定，不随未来自车状态移动。
-    """
+    """规划时刻冻结自车坐标系中的时空联合轨迹。"""
 
     times: FloatArray
     states: FloatArray
@@ -65,44 +48,28 @@ class SpatiotemporalTrajectory:
         controls = np.asarray(self.controls, dtype=np.float64)
 
         if times.ndim != 1:
-            raise ValueError(
-                "times must have shape [N], "
-                f"got {times.shape}"
-            )
-
+            raise ValueError(f"times must have shape [N], got {times.shape}")
         if states.ndim != 2 or states.shape[1] != 4:
-            raise ValueError(
-                "states must have shape [N, 4], "
-                f"got {states.shape}"
-            )
-
+            raise ValueError(f"states must have shape [N, 4], got {states.shape}")
         if controls.ndim != 2 or controls.shape[1] != 2:
             raise ValueError(
                 "controls must have shape [N-1, 2], "
                 f"got {controls.shape}"
             )
-
         if states.shape[0] != times.shape[0]:
             raise ValueError("states and times must have equal length")
-
         if controls.shape[0] != states.shape[0] - 1:
             raise ValueError("controls length must be states length minus one")
-
         if times.size == 0:
             raise ValueError("trajectory must contain at least one state")
-
         if not np.all(np.isfinite(times)):
             raise ValueError("times contain non-finite values")
-
         if not np.all(np.isfinite(states)):
             raise ValueError("states contain non-finite values")
-
         if not np.all(np.isfinite(controls)):
             raise ValueError("controls contain non-finite values")
-
         if abs(float(times[0])) > 1e-12:
             raise ValueError("times must start at zero")
-
         if not np.all(np.diff(times) > 0.0):
             raise ValueError("times must be strictly increasing")
 
@@ -113,19 +80,14 @@ class SpatiotemporalTrajectory:
 
 @dataclass(frozen=True)
 class LocalPlanningContext:
-    """时空规划器内部统一使用的冻结自车坐标上下文。
-
-    ``world_origin`` 仅用于最终调试/GUI 输出时恢复世界坐标。
-    其余几何量全部位于当前规划周期冻结的自车坐标系：
-    +x 向前，+y 向左，当前自车位姿为 (0, 0, 0)。
-    """
+    """PNC 内部统一使用的冻结自车坐标上下文。"""
 
     world_origin: VehicleState
     ego: VehicleState
     goal: GoalState
     reference_path: FloatArray | None
     objects: tuple[PerceivedObject, ...]
-    road_segments: tuple[PerceivedLaneSegment, ...]
+    lane_lines: tuple[PerceivedLaneLine, ...]
     traffic_signals: tuple[PerceivedTrafficSignal, ...]
 
     def __post_init__(self) -> None:
@@ -180,10 +142,7 @@ class PredictedObjectTrajectory:
         yaws = np.asarray(self.yaws, dtype=np.float64)
 
         if times.ndim != 1:
-            raise ValueError(
-                "times must have shape [N], "
-                f"got {times.shape}"
-            )
+            raise ValueError(f"times must have shape [N], got {times.shape}")
         if times.size == 0:
             raise ValueError("times must not be empty")
         if positions.ndim != 2 or positions.shape[1] != 2:
@@ -192,15 +151,11 @@ class PredictedObjectTrajectory:
                 f"got {positions.shape}"
             )
         if yaws.ndim != 1:
-            raise ValueError(
-                "yaws must have shape [N], "
-                f"got {yaws.shape}"
-            )
+            raise ValueError(f"yaws must have shape [N], got {yaws.shape}")
         if positions.shape[0] != times.shape[0]:
             raise ValueError("positions and times must have equal length")
         if yaws.shape[0] != times.shape[0]:
             raise ValueError("yaws and times must have equal length")
-
         if not np.all(np.isfinite(times)):
             raise ValueError("times contain non-finite values")
         if not np.all(np.isfinite(positions)):
@@ -218,57 +173,44 @@ class PredictedObjectTrajectory:
         )
         if not np.all(np.isfinite(metadata)):
             raise ValueError("prediction metadata contains non-finite values")
-        if self.speed < 0.0:
-            raise ValueError("speed must be non-negative")
         if self.length <= 0.0 or self.width <= 0.0:
-            raise ValueError("predicted object dimensions must be positive")
+            raise ValueError("prediction dimensions must be positive")
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError("confidence must be within [0, 1]")
 
         object.__setattr__(self, "times", times.copy())
         object.__setattr__(self, "positions", positions.copy())
         object.__setattr__(self, "yaws", yaws.copy())
-        object.__setattr__(self, "speed", float(self.speed))
-        object.__setattr__(self, "length", float(self.length))
-        object.__setattr__(self, "width", float(self.width))
-        object.__setattr__(self, "confidence", float(self.confidence))
 
 
 @dataclass(frozen=True)
 class ObjectPredictionSet:
-    """共享同一时间轴的多目标预测集合。"""
-
     times: FloatArray
     trajectories: tuple[PredictedObjectTrajectory, ...]
 
     def __post_init__(self) -> None:
         times = np.asarray(self.times, dtype=np.float64)
-        trajectories = tuple(self.trajectories)
-
-        if times.ndim != 1:
-            raise ValueError(
-                "times must have shape [N], "
-                f"got {times.shape}"
-            )
-        if times.size == 0:
-            raise ValueError("times must not be empty")
+        if times.ndim != 1 or times.size == 0:
+            raise ValueError("times must have shape [N], N > 0")
         if not np.all(np.isfinite(times)):
             raise ValueError("times contain non-finite values")
         if abs(float(times[0])) > 1e-12:
             raise ValueError("times must start at zero")
         if not np.all(np.diff(times) > 0.0):
             raise ValueError("times must be strictly increasing")
-
-        for trajectory in trajectories:
+        for trajectory in self.trajectories:
             if trajectory.times.shape != times.shape or not np.allclose(
-                trajectory.times,
-                times,
-                rtol=0.0,
-                atol=1e-12,
+                trajectory.times, times, rtol=0.0, atol=1e-12
             ):
-                raise ValueError(
-                    "all object trajectories must use the prediction-set time axis"
-                )
-
+                raise ValueError("all predictions must use the common time axis")
         object.__setattr__(self, "times", times.copy())
-        object.__setattr__(self, "trajectories", trajectories)
+
+
+__all__ = [
+    "ControlSequence",
+    "LocalPlanningContext",
+    "ObjectPredictionSet",
+    "OptimizationResult",
+    "PredictedObjectTrajectory",
+    "SpatiotemporalTrajectory",
+]
