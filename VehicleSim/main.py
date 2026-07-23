@@ -26,6 +26,7 @@ from sim2d.gui.traffic_actor_editor import install as install_traffic_actor_edit
 from sim2d.perception.traffic_actor_extension import (
     install as install_traffic_actor_perception,
 )
+from sim2d.performance_debug import install as install_performance_debug
 from sim2d.planning import (
     SpatiotemporalPlanner,
     SpatiotemporalPlannerConfig,
@@ -46,6 +47,10 @@ install_perception_viewer_interaction()
 
 # 最后安装场景编辑器，使其能够覆盖现有 reset 链并使用已完成的主窗口扩展。
 install_traffic_actor_editor()
+
+# 性能调试必须在 MainWindow 实例化之前安装，才能覆盖每周期入口，
+# 同时采集感知、规划、优化、rollout、cost 和 GUI 总周期耗时。
+install_performance_debug()
 
 from sim2d.gui.main_window import MainWindow  # noqa: E402
 
