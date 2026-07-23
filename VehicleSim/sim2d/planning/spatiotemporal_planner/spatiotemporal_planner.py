@@ -6,13 +6,7 @@ import numpy as np
 
 from sim2d.perception import PlanningInput
 from sim2d.planning.base import Planner
-from sim2d.types import (
-    GoalState,
-    PlanResult,
-    VehicleConfig,
-    VehicleControl,
-    VehicleState,
-)
+from sim2d.types import GoalState, PlanResult, VehicleConfig, VehicleControl, VehicleState
 
 from .config import SpatiotemporalPlannerConfig
 from .coordinates import build_local_planning_context, local_trajectory_to_world
@@ -23,11 +17,7 @@ from .types import OptimizationResult
 
 
 class SpatiotemporalPlanner(Planner):
-    """冻结自车坐标系下的时空联合规划器。
-
-    感知模块只发布车道线点列；PNC Map 负责构造并跨帧跟踪 reference line；
-    地图导航路径只在感知几何不可用时作为 fallback。
-    """
+    """冻结自车坐标系下的时空联合规划器。"""
 
     def __init__(
         self,
@@ -45,7 +35,6 @@ class SpatiotemporalPlanner(Planner):
         if config is None:
             config = SpatiotemporalPlannerConfig()
         config.validate()
-
         if fallback_path_sample_count < 2:
             raise ValueError("fallback_path_sample_count must be at least 2")
         if fallback_handle_scale <= 0.0:
@@ -53,14 +42,9 @@ class SpatiotemporalPlanner(Planner):
         if fallback_minimum_handle_length <= 0.0:
             raise ValueError("fallback_minimum_handle_length must be positive")
         if fallback_maximum_handle_length < fallback_minimum_handle_length:
-            raise ValueError(
-                "fallback_maximum_handle_length must not be smaller "
-                "than fallback_minimum_handle_length"
-            )
+            raise ValueError("invalid fallback handle length range")
         if not 0.0 <= perception_lane_minimum_confidence <= 1.0:
-            raise ValueError(
-                "perception_lane_minimum_confidence must be within [0, 1]"
-            )
+            raise ValueError("perception_lane_minimum_confidence must be within [0, 1]")
         if perception_lane_maximum_distance <= 0.0:
             raise ValueError("perception_lane_maximum_distance must be positive")
 
@@ -70,22 +54,16 @@ class SpatiotemporalPlanner(Planner):
         self.fallback_handle_scale = fallback_handle_scale
         self.fallback_minimum_handle_length = fallback_minimum_handle_length
         self.fallback_maximum_handle_length = fallback_maximum_handle_length
-
         self.predictor = ConstantVelocityPredictor()
-        self.optimizer = SpatiotemporalOptimizer(
-            config=config,
-            vehicle_config=vehicle_config,
-        )
+        self.optimizer = SpatiotemporalOptimizer(config=config, vehicle_config=vehicle_config)
         self.pnc_map = PNCMap(
             minimum_confidence=perception_lane_minimum_confidence,
             maximum_lateral_distance=perception_lane_maximum_distance,
             switch_confirm_frames=pnc_map_switch_confirm_frames,
         )
-
         self._external_reference_path: np.ndarray | None = None
         self._fallback_reference_path: np.ndarray | None = None
         self._fallback_goal_signature: tuple[float, ...] | None = None
-
         self._previous_controls: np.ndarray | None = None
         self._previous_control: VehicleControl | None = None
         self._last_optimization_result: OptimizationResult | None = None
@@ -103,7 +81,6 @@ class SpatiotemporalPlanner(Planner):
         self._last_pnc_reference_id = None
 
     def set_reference_path(self, reference_path: np.ndarray) -> None:
-        """设置世界坐标导航路径；仅在感知 reference 不可用时 fallback。"""
         path = np.asarray(reference_path, dtype=np.float64)
         self._validate_reference_path(path)
         self._external_reference_path = path.copy()
@@ -134,7 +111,6 @@ class SpatiotemporalPlanner(Planner):
             planning_input=planning_input,
             reference_path=navigation_world_path,
         )
-
         map_update = self.pnc_map.update(
             context.lane_lines,
             world_origin=context.world_origin,
@@ -143,6 +119,8 @@ class SpatiotemporalPlanner(Planner):
 
         if pnc_reference is not None:
             optimization_reference = pnc_reference.reference_path
+            optimization_left_boundary = pnc_reference.left_boundary
+            optimization_right_boundary = pnc_reference.right_boundary
             output_reference_path = local_reference_path_to_world(
                 pnc_reference.reference_path,
                 context.world_origin,
@@ -156,6 +134,8 @@ class SpatiotemporalPlanner(Planner):
                     "no PNC Map perception reference and no navigation fallback path"
                 )
             optimization_reference = context.reference_path
+            optimization_left_boundary = None
+            optimization_right_boundary = None
             output_reference_path = navigation_world_path.copy()
             reference_source = (
                 "navigation_fallback"
@@ -172,7 +152,6 @@ class SpatiotemporalPlanner(Planner):
         reference_changed = source_changed or map_update.reference_changed
         if reference_changed:
             self._clear_warm_start()
-
         self._last_reference_source = reference_source
         self._last_pnc_reference_id = pnc_reference_id
 
@@ -180,10 +159,7 @@ class SpatiotemporalPlanner(Planner):
             self._previous_controls is not None
             and self._previous_controls.shape == (self.config.horizon_steps, 2)
         )
-        initial_controls = self._make_initial_controls(
-            current_speed=context.ego.speed,
-        )
-
+        initial_controls = self._make_initial_controls(current_speed=context.ego.speed)
         prediction_times = (
             np.arange(self.config.horizon_steps + 1, dtype=np.float64)
             * self.config.dt
@@ -198,17 +174,17 @@ class SpatiotemporalPlanner(Planner):
             predictions=predictions,
             reference_path=optimization_reference,
             previous_control=self._previous_control,
+            left_boundary=optimization_left_boundary,
+            right_boundary=optimization_right_boundary,
         )
 
         local_trajectory = optimization_result.trajectory
         if local_trajectory.controls.shape[0] == 0:
             raise RuntimeError("optimizer returned an empty control sequence")
-
         action = VehicleControl.from_array(local_trajectory.controls[0])
         self._previous_controls = local_trajectory.controls.copy()
         self._previous_control = action
         self._last_optimization_result = optimization_result
-
         world_trajectory = local_trajectory_to_world(
             trajectory=local_trajectory,
             origin=context.world_origin,
@@ -249,6 +225,7 @@ class SpatiotemporalPlanner(Planner):
                 ),
                 "warm_start_used": warm_start_used,
                 "reference_changed": reference_changed,
+                "corridor_constraint_used": optimization_left_boundary is not None,
             },
         )
 
@@ -256,14 +233,8 @@ class SpatiotemporalPlanner(Planner):
         if self._previous_controls is not None:
             expected_shape = (self.config.horizon_steps, 2)
             if self._previous_controls.shape == expected_shape:
-                return self.optimizer.shift_controls_for_warm_start(
-                    self._previous_controls
-                )
-
-        controls = np.zeros(
-            (self.config.horizon_steps, 2),
-            dtype=np.float64,
-        )
+                return self.optimizer.shift_controls_for_warm_start(self._previous_controls)
+        controls = np.zeros((self.config.horizon_steps, 2), dtype=np.float64)
         speed_error = self.config.target_speed - current_speed
         controls[:, 0] = float(
             np.clip(
@@ -282,7 +253,6 @@ class SpatiotemporalPlanner(Planner):
     ) -> np.ndarray:
         if self._external_reference_path is not None:
             return self._external_reference_path
-
         goal_signature = (
             goal.state.x,
             goal.state.y,
@@ -330,13 +300,7 @@ class SpatiotemporalPlanner(Planner):
         )
         p1 = p0 + handle_length * start_direction
         p2 = p3 - handle_length * goal_direction
-
-        parameter = np.linspace(
-            0.0,
-            1.0,
-            self.fallback_path_sample_count,
-            dtype=np.float64,
-        )
+        parameter = np.linspace(0.0, 1.0, self.fallback_path_sample_count)
         one_minus = 1.0 - parameter
         positions = (
             one_minus[:, None] ** 3 * p0
@@ -355,24 +319,19 @@ class SpatiotemporalPlanner(Planner):
         )
         yaws = np.arctan2(first_derivative[:, 1], first_derivative[:, 0])
         segment_lengths = np.linalg.norm(np.diff(positions, axis=0), axis=1)
-        arc_length = np.concatenate(
-            (np.array([0.0], dtype=np.float64), np.cumsum(segment_lengths))
-        )
+        arc_length = np.concatenate((np.array([0.0]), np.cumsum(segment_lengths)))
         derivative_norm_squared = np.sum(first_derivative**2, axis=1)
         curvature_numerator = (
             first_derivative[:, 0] * second_derivative[:, 1]
             - first_derivative[:, 1] * second_derivative[:, 0]
         )
-        curvature_denominator = np.power(
+        curvature = curvature_numerator / np.power(
             np.maximum(derivative_norm_squared, 1e-12),
             1.5,
         )
-        curvature = curvature_numerator / curvature_denominator
         yaws[0] = start.yaw
         yaws[-1] = goal.yaw
-        return np.column_stack(
-            (positions[:, 0], positions[:, 1], yaws, arc_length, curvature)
-        )
+        return np.column_stack((positions, yaws, arc_length, curvature))
 
     def _clear_warm_start(self) -> None:
         self._previous_controls = None
@@ -382,8 +341,7 @@ class SpatiotemporalPlanner(Planner):
     def _validate_reference_path(reference_path: np.ndarray) -> None:
         if reference_path.ndim != 2 or reference_path.shape[1] != 5:
             raise ValueError(
-                "reference_path must have shape [N, 5], "
-                f"got {reference_path.shape}"
+                f"reference_path must have shape [N, 5], got {reference_path.shape}"
             )
         if reference_path.shape[0] < 2:
             raise ValueError("reference_path must contain at least two points")
