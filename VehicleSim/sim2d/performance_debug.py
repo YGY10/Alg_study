@@ -48,7 +48,7 @@ def _milliseconds(start: float) -> float:
 
 
 def install() -> None:
-    """安装同步耗时和 PNC 几何调试，不改变规划计算结果。"""
+    """安装同步耗时和 PNC Frenet 连续性调试，不改变规划计算结果。"""
     global _INSTALLED
     if _INSTALLED:
         return
@@ -68,9 +68,7 @@ def _install_log_console_behavior() -> None:
 
     def build_ui(self: MainWindow) -> None:
         original_build_ui(self)
-        self.log_console.setLineWrapMode(
-            QPlainTextEdit.LineWrapMode.WidgetWidth
-        )
+        self.log_console.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         delete_filter = _LogConsoleDeleteFilter(self.log_console)
         self.log_console.installEventFilter(delete_filter)
         self._log_console_delete_filter = delete_filter
@@ -268,12 +266,12 @@ def _lane_line_summary(line) -> dict[str, Any]:
     }
 
 
-def _reference_summary(reference_path: np.ndarray) -> dict[str, Any]:
+def _reference_summary(reference_path: np.ndarray, ego) -> dict[str, Any]:
     path = np.asarray(reference_path, dtype=np.float64)
     if path.shape[0] == 0:
         return {"points": 0}
-    local_xy = path[:, :2]
-    nearest_index = int(np.argmin(np.linalg.norm(local_xy, axis=1)))
+    ego_xy = np.array([ego.x, ego.y], dtype=np.float64)
+    nearest_index = int(np.argmin(np.linalg.norm(path[:, :2] - ego_xy, axis=1)))
     length = float(path[-1, 3] - path[0, 3]) if path.shape[1] >= 4 else 0.0
     return {
         "points": int(path.shape[0]),
@@ -307,8 +305,7 @@ def _install_planner_timing() -> None:
                 optimizer_timing.get("optimizer_total_ms", 0.0)
             ),
             "planner_non_optimizer": max(
-                total_ms
-                - float(optimizer_timing.get("optimizer_total_ms", 0.0)),
+                total_ms - float(optimizer_timing.get("optimizer_total_ms", 0.0)),
                 0.0,
             ),
             "perception_total": float(
@@ -320,9 +317,11 @@ def _install_planner_timing() -> None:
         update = getattr(self.pnc_map, "_performance_debug_last_update", None)
         if update is not None:
             debug["pnc_candidate_costs"] = tuple(update.candidate_costs)
+            debug["pnc_candidate_continuity"] = tuple(update.candidate_continuity)
             debug["pnc_selected_orientation"] = update.selected_orientation
         debug["pnc_reference_geometry"] = _reference_summary(
-            result.reference_path
+            result.reference_path,
+            planning_input.ego,
         )
         debug["pnc_lane_line_summaries"] = tuple(
             _lane_line_summary(line)
@@ -361,9 +360,7 @@ def _install_cycle_timing() -> None:
             gradient_ms = float(
                 optimizer_timing.get("finite_difference_gradient_ms", 0.0)
             )
-            line_search_ms = float(
-                optimizer_timing.get("line_search_ms", 0.0)
-            )
+            line_search_ms = float(optimizer_timing.get("line_search_ms", 0.0))
             rollout_ms = float(optimizer_timing.get("rollout_ms", 0.0))
             cost_ms = float(optimizer_timing.get("cost_ms", 0.0))
             evaluate_count = int(optimizer_timing.get("cost_count", 0))
@@ -394,7 +391,7 @@ def _install_cycle_timing() -> None:
             )
 
             geometry = debug.get("pnc_reference_geometry", {})
-            costs = debug.get("pnc_candidate_costs", ())
+            continuity = debug.get("pnc_candidate_continuity", ())
             lane_summaries = debug.get("pnc_lane_line_summaries", ())
             if geometry:
                 self.append_log(
@@ -413,10 +410,25 @@ def _install_cycle_timing() -> None:
                     f"nearest_i={geometry.get('nearest_index')} "
                     f"nearest={_format_point(geometry.get('nearest', (math.nan, math.nan)))} "
                     f"yaw={float(geometry.get('nearest_yaw', math.nan)):.3f} "
-                    f"kappa={float(geometry.get('nearest_curvature', math.nan)):.4f}\n"
-                    "  candidate_costs "
-                    + (", ".join(f"{name}={cost:.3f}" for name, cost in costs) or "none")
+                    f"kappa={float(geometry.get('nearest_curvature', math.nan)):.4f}"
                 )
+
+                if continuity:
+                    for metrics in continuity:
+                        self.append_log(
+                            "  PNC_FRENET "
+                            f"id={metrics.candidate_id} "
+                            f"cost={metrics.cost:.3f} "
+                            f"mean_abs_l={metrics.mean_abs_l:.3f}m "
+                            f"mean_abs_dyaw={metrics.mean_abs_heading:.3f}rad "
+                            f"mean_abs_dkappa={metrics.mean_abs_curvature:.4f} "
+                            f"overlap={metrics.overlap_ratio:.3f} "
+                            f"nonmono={metrics.nonmonotonic_ratio:.3f} "
+                            f"s_span={metrics.projected_s_span:.2f}m "
+                            f"samples={metrics.sample_count}"
+                        )
+                else:
+                    self.append_log("  PNC_FRENET none")
 
                 for line in lane_summaries:
                     self.append_log(
