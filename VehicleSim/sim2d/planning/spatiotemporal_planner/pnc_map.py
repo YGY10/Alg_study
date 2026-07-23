@@ -41,6 +41,21 @@ class PNCReferenceLine:
 
 
 @dataclass(frozen=True)
+class PNCCandidateContinuity:
+    """当前候选投影到上一周期 reference Frenet 坐标系后的连续性指标。"""
+
+    candidate_id: str
+    cost: float
+    mean_abs_l: float
+    mean_abs_heading: float
+    mean_abs_curvature: float
+    overlap_ratio: float
+    nonmonotonic_ratio: float
+    projected_s_span: float
+    sample_count: int
+
+
+@dataclass(frozen=True)
 class PNCMapUpdate:
     selected: PNCReferenceLine | None
     references: tuple[PNCReferenceLine, ...]
@@ -50,6 +65,7 @@ class PNCMapUpdate:
     continuity_cost: float | None
     candidate_costs: tuple[tuple[str, float], ...] = ()
     selected_orientation: str | None = None
+    candidate_continuity: tuple[PNCCandidateContinuity, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -67,9 +83,10 @@ class _LocalReferenceCandidate:
 class PNCMap:
     """有历史状态的局部 PNC Map。
 
-    每条单帧 reference 同时保留正向和反向解释。首次选择依据自车附近航向、
-    前向长度和前向位移；有历史后，两种方向都转换到世界坐标与上一帧比较，
-    从而避免在直角弯临界位置因 tangent.x 符号变化而整条 reference 翻转。
+    每条单帧 reference 同时保留正向和反向解释。历史连续性不再按两条
+    曲线的归一化弧长逐点对应，而是将当前候选投影到上一周期稳定 reference
+    的 Frenet 坐标系，主要比较横向偏差 l、航向差、曲率差、有效重叠和
+    投影 s 的单调性。
     """
 
     def __init__(
@@ -85,6 +102,13 @@ class PNCMap:
         history_forward_length: float = 30.0,
         minimum_forward_length: float = 8.0,
         minimum_forward_progress: float = 1.0,
+        continuity_sample_count: int = 41,
+        continuity_max_projection_distance: float = 3.0,
+        continuity_l_weight: float = 1.0,
+        continuity_heading_weight: float = 1.25,
+        continuity_curvature_weight: float = 0.25,
+        continuity_nonmonotonic_weight: float = 3.0,
+        continuity_missing_overlap_weight: float = 2.0,
     ) -> None:
         if not 0.0 <= minimum_confidence <= 1.0:
             raise ValueError("minimum_confidence must be within [0, 1]")
@@ -100,6 +124,19 @@ class PNCMap:
             raise ValueError("invalid local history comparison range")
         if minimum_forward_length <= 0.0 or minimum_forward_progress < 0.0:
             raise ValueError("invalid forward validity thresholds")
+        if continuity_sample_count < 3:
+            raise ValueError("continuity_sample_count must be at least 3")
+        if continuity_max_projection_distance <= 0.0:
+            raise ValueError("continuity_max_projection_distance must be positive")
+        weights = (
+            continuity_l_weight,
+            continuity_heading_weight,
+            continuity_curvature_weight,
+            continuity_nonmonotonic_weight,
+            continuity_missing_overlap_weight,
+        )
+        if min(weights) < 0.0:
+            raise ValueError("continuity weights must be non-negative")
 
         self.minimum_confidence = minimum_confidence
         self.maximum_lateral_distance = maximum_lateral_distance
@@ -111,6 +148,13 @@ class PNCMap:
         self.history_forward_length = history_forward_length
         self.minimum_forward_length = minimum_forward_length
         self.minimum_forward_progress = minimum_forward_progress
+        self.continuity_sample_count = continuity_sample_count
+        self.continuity_max_projection_distance = continuity_max_projection_distance
+        self.continuity_l_weight = continuity_l_weight
+        self.continuity_heading_weight = continuity_heading_weight
+        self.continuity_curvature_weight = continuity_curvature_weight
+        self.continuity_nonmonotonic_weight = continuity_nonmonotonic_weight
+        self.continuity_missing_overlap_weight = continuity_missing_overlap_weight
 
         self._current_world_path: np.ndarray | None = None
         self._pending_world_path: np.ndarray | None = None
@@ -120,6 +164,26 @@ class PNCMap:
         self._current_world_path = None
         self._pending_world_path = None
         self._pending_frames = 0
+
+    def _continuity_metrics(
+        self,
+        candidate_world_path: np.ndarray,
+        history_world_path: np.ndarray,
+        *,
+        candidate_id: str,
+    ) -> PNCCandidateContinuity:
+        return _reference_continuity_metrics(
+            candidate_world_path,
+            history_world_path,
+            candidate_id=candidate_id,
+            sample_count=self.continuity_sample_count,
+            maximum_projection_distance=self.continuity_max_projection_distance,
+            lateral_weight=self.continuity_l_weight,
+            heading_weight=self.continuity_heading_weight,
+            curvature_weight=self.continuity_curvature_weight,
+            nonmonotonic_weight=self.continuity_nonmonotonic_weight,
+            missing_overlap_weight=self.continuity_missing_overlap_weight,
+        )
 
     def update(
         self,
@@ -183,31 +247,30 @@ class PNCMap:
             backward_margin=self.backward_margin,
             forward_length=self.history_forward_length,
         )
-        costs = np.asarray(
-            [
-                _reference_continuity_cost(
-                    _crop_world_reference_near_ego(
-                        path,
-                        world_origin,
-                        backward_margin=self.backward_margin,
-                        forward_length=self.history_forward_length,
-                    ),
-                    current_history,
-                )
-                for path in world_paths
-            ],
-            dtype=np.float64,
+        cropped_world_paths = tuple(
+            _crop_world_reference_near_ego(
+                path,
+                world_origin,
+                backward_margin=self.backward_margin,
+                forward_length=self.history_forward_length,
+            )
+            for path in world_paths
         )
+        continuity = tuple(
+            self._continuity_metrics(
+                path,
+                current_history,
+                candidate_id=f"{candidate.source_id}@{candidate.orientation}",
+            )
+            for candidate, path in zip(candidates, cropped_world_paths)
+        )
+        costs = np.asarray([metrics.cost for metrics in continuity], dtype=np.float64)
         history_index = int(np.argmin(costs))
         history_cost = float(costs[history_index])
         history_candidate = candidates[history_index]
         history_world = world_paths[history_index]
         candidate_costs = tuple(
-            (
-                f"{candidate.source_id}@{candidate.orientation}",
-                float(cost),
-            )
-            for candidate, cost in zip(candidates, costs)
+            (metrics.candidate_id, metrics.cost) for metrics in continuity
         )
 
         if history_cost <= self.history_retention_cost:
@@ -223,29 +286,33 @@ class PNCMap:
                 continuity_cost=history_cost,
                 candidate_costs=candidate_costs,
                 selected_orientation=history_candidate.orientation,
+                candidate_continuity=continuity,
             )
 
         target_candidate = geometric or history_candidate
         target_index = candidates.index(target_candidate)
         target_world = world_paths[target_index]
-        pending_cost = (
-            _reference_continuity_cost(
-                _crop_world_reference_near_ego(
-                    target_world,
-                    world_origin,
-                    backward_margin=self.backward_margin,
-                    forward_length=self.history_forward_length,
-                ),
-                _crop_world_reference_near_ego(
-                    self._pending_world_path,
-                    world_origin,
-                    backward_margin=self.backward_margin,
-                    forward_length=self.history_forward_length,
-                ),
+        if self._pending_world_path is not None:
+            pending_candidate = _crop_world_reference_near_ego(
+                target_world,
+                world_origin,
+                backward_margin=self.backward_margin,
+                forward_length=self.history_forward_length,
             )
-            if self._pending_world_path is not None
-            else math.inf
-        )
+            pending_history = _crop_world_reference_near_ego(
+                self._pending_world_path,
+                world_origin,
+                backward_margin=self.backward_margin,
+                forward_length=self.history_forward_length,
+            )
+            pending_cost = self._continuity_metrics(
+                pending_candidate,
+                pending_history,
+                candidate_id="pending",
+            ).cost
+        else:
+            pending_cost = math.inf
+
         if pending_cost <= self.pending_match_cost:
             self._pending_frames += 1
             self._pending_world_path = target_world
@@ -267,6 +334,7 @@ class PNCMap:
                 continuity_cost=history_cost,
                 candidate_costs=candidate_costs,
                 selected_orientation=history_candidate.orientation,
+                candidate_continuity=continuity,
             )
 
         self._current_world_path = target_world
@@ -281,6 +349,7 @@ class PNCMap:
             continuity_cost=history_cost,
             candidate_costs=candidate_costs,
             selected_orientation=target_candidate.orientation,
+            candidate_continuity=continuity,
         )
 
 
@@ -491,7 +560,6 @@ def _filter_forward_valid_candidates(
     if strict:
         return strict
 
-    # 感知范围很短时允许退化，但仍拒绝明显朝后的解释。
     relaxed = tuple(
         candidate
         for candidate in candidates
@@ -586,7 +654,7 @@ def _closest_point_on_polyline(point: np.ndarray, polyline: np.ndarray) -> np.nd
 
 
 def _orient_line_for_pairing(points: np.ndarray) -> np.ndarray:
-    """仅为左右边界配对提供稳定点序，不再使用 tangent.x 的硬阈值。"""
+    """仅为左右边界配对提供稳定点序。"""
     value = np.asarray(points, dtype=np.float64)
     if value.shape[0] < 2:
         return value.copy()
@@ -635,34 +703,202 @@ def _crop_world_reference_near_ego(
     return path[indices[0] : indices[-1] + 1].copy()
 
 
-def _reference_continuity_cost(
-    first_world_path: np.ndarray,
-    second_world_path: np.ndarray,
-) -> float:
-    first = _resample_polyline(first_world_path[:, :2], 41)
-    second = _resample_polyline(second_world_path[:, :2], 41)
-    point_distance = float(np.mean(np.linalg.norm(first - second, axis=1)))
+def _reference_continuity_metrics(
+    candidate_world_path: np.ndarray,
+    history_world_path: np.ndarray,
+    *,
+    candidate_id: str,
+    sample_count: int,
+    maximum_projection_distance: float,
+    lateral_weight: float,
+    heading_weight: float,
+    curvature_weight: float,
+    nonmonotonic_weight: float,
+    missing_overlap_weight: float,
+) -> PNCCandidateContinuity:
+    """将当前候选投影到历史 reference 的 Frenet 坐标系并计算连续性。"""
+    candidate = _resample_reference_path(candidate_world_path, sample_count)
+    history = _remove_duplicate_reference_points(history_world_path)
+    if candidate.shape[0] < 2 or history.shape[0] < 2:
+        return PNCCandidateContinuity(
+            candidate_id=candidate_id,
+            cost=math.inf,
+            mean_abs_l=math.inf,
+            mean_abs_heading=math.inf,
+            mean_abs_curvature=math.inf,
+            overlap_ratio=0.0,
+            nonmonotonic_ratio=1.0,
+            projected_s_span=0.0,
+            sample_count=int(candidate.shape[0]),
+        )
 
-    first_yaw = np.unwrap(first_world_path[:, 2])
-    second_yaw = np.unwrap(second_world_path[:, 2])
-    samples = np.linspace(0.0, 1.0, 41)
-    first_yaw_sample = np.interp(
-        samples,
-        np.linspace(0.0, 1.0, first_yaw.size),
-        first_yaw,
+    starts = history[:-1, :2]
+    vectors = history[1:, :2] - starts
+    squared_lengths = np.sum(vectors * vectors, axis=1)
+    usable = squared_lengths > 1e-12
+    if not np.any(usable):
+        return PNCCandidateContinuity(
+            candidate_id=candidate_id,
+            cost=math.inf,
+            mean_abs_l=math.inf,
+            mean_abs_heading=math.inf,
+            mean_abs_curvature=math.inf,
+            overlap_ratio=0.0,
+            nonmonotonic_ratio=1.0,
+            projected_s_span=0.0,
+            sample_count=int(candidate.shape[0]),
+        )
+
+    delta = candidate[:, None, :2] - starts[None, :, :]
+    parameters = np.zeros((candidate.shape[0], vectors.shape[0]), dtype=np.float64)
+    parameters[:, usable] = (
+        np.sum(delta[:, usable, :] * vectors[None, usable, :], axis=2)
+        / squared_lengths[usable][None, :]
     )
-    second_yaw_sample = np.interp(
-        samples,
-        np.linspace(0.0, 1.0, second_yaw.size),
-        second_yaw,
+    parameters = np.clip(parameters, 0.0, 1.0)
+    projections = starts[None, :, :] + parameters[:, :, None] * vectors[None, :, :]
+    distances = np.linalg.norm(candidate[:, None, :2] - projections, axis=2)
+    segment_indices = np.argmin(distances, axis=1)
+    row_indices = np.arange(candidate.shape[0])
+    selected_t = parameters[row_indices, segment_indices]
+    selected_projection = projections[row_indices, segment_indices]
+    selected_distance = distances[row_indices, segment_indices]
+
+    history_s = history[:, 3]
+    projected_s = (
+        history_s[segment_indices]
+        + selected_t
+        * (history_s[segment_indices + 1] - history_s[segment_indices])
     )
-    heading = float(
-        np.mean(np.abs(normalize_angle(first_yaw_sample - second_yaw_sample)))
+    history_yaw_unwrapped = np.unwrap(history[:, 2])
+    projected_yaw = (
+        history_yaw_unwrapped[segment_indices]
+        + selected_t
+        * (
+            history_yaw_unwrapped[segment_indices + 1]
+            - history_yaw_unwrapped[segment_indices]
+        )
     )
-    start_distance = float(
-        np.linalg.norm(first_world_path[0, :2] - second_world_path[0, :2])
+    projected_curvature = (
+        history[segment_indices, 4]
+        + selected_t
+        * (history[segment_indices + 1, 4] - history[segment_indices, 4])
     )
-    return point_distance + 1.25 * heading + 0.25 * start_distance
+
+    normals = np.column_stack((-np.sin(projected_yaw), np.cos(projected_yaw)))
+    lateral = np.sum((candidate[:, :2] - selected_projection) * normals, axis=1)
+    heading_error = normalize_angle(candidate[:, 2] - projected_yaw)
+    curvature_error = candidate[:, 4] - projected_curvature
+
+    valid = selected_distance <= maximum_projection_distance
+    valid_count = int(np.count_nonzero(valid))
+    if valid_count < 2:
+        return PNCCandidateContinuity(
+            candidate_id=candidate_id,
+            cost=math.inf,
+            mean_abs_l=math.inf,
+            mean_abs_heading=math.inf,
+            mean_abs_curvature=math.inf,
+            overlap_ratio=0.0,
+            nonmonotonic_ratio=1.0,
+            projected_s_span=0.0,
+            sample_count=valid_count,
+        )
+
+    valid_s = projected_s[valid]
+    projected_s_span = float(np.max(valid_s) - np.min(valid_s))
+    candidate_s_span = max(
+        float(candidate[-1, 3] - candidate[0, 3]),
+        1e-6,
+    )
+    valid_fraction = valid_count / candidate.shape[0]
+    span_ratio = min(1.0, projected_s_span / candidate_s_span)
+    overlap_ratio = float(valid_fraction * span_ratio)
+
+    s_differences = np.diff(valid_s)
+    nonmonotonic_ratio = (
+        float(np.mean(s_differences < -0.25)) if s_differences.size else 0.0
+    )
+    mean_abs_l = float(np.mean(np.abs(lateral[valid])))
+    mean_abs_heading = float(np.mean(np.abs(heading_error[valid])))
+    mean_abs_curvature = float(np.mean(np.abs(curvature_error[valid])))
+
+    cost = (
+        lateral_weight * mean_abs_l
+        + heading_weight * mean_abs_heading
+        + curvature_weight * mean_abs_curvature
+        + nonmonotonic_weight * nonmonotonic_ratio
+        + missing_overlap_weight * (1.0 - overlap_ratio)
+    )
+    return PNCCandidateContinuity(
+        candidate_id=candidate_id,
+        cost=float(cost),
+        mean_abs_l=mean_abs_l,
+        mean_abs_heading=mean_abs_heading,
+        mean_abs_curvature=mean_abs_curvature,
+        overlap_ratio=overlap_ratio,
+        nonmonotonic_ratio=nonmonotonic_ratio,
+        projected_s_span=projected_s_span,
+        sample_count=valid_count,
+    )
+
+
+def _reference_continuity_cost(
+    candidate_world_path: np.ndarray,
+    history_world_path: np.ndarray,
+) -> float:
+    """兼容内部旧调用；默认使用 Frenet 投影连续性代价。"""
+    return _reference_continuity_metrics(
+        candidate_world_path,
+        history_world_path,
+        candidate_id="anonymous",
+        sample_count=41,
+        maximum_projection_distance=3.0,
+        lateral_weight=1.0,
+        heading_weight=1.25,
+        curvature_weight=0.25,
+        nonmonotonic_weight=3.0,
+        missing_overlap_weight=2.0,
+    ).cost
+
+
+def _remove_duplicate_reference_points(path: np.ndarray) -> np.ndarray:
+    value = np.asarray(path, dtype=np.float64)
+    if value.ndim != 2 or value.shape[1] != 5 or value.shape[0] < 2:
+        return value.copy()
+    keep = np.concatenate(
+        (
+            np.array([True]),
+            np.linalg.norm(np.diff(value[:, :2], axis=0), axis=1) > 1e-9,
+        )
+    )
+    result = value[keep].copy()
+    if result.shape[0] >= 2:
+        result[:, 3] = np.concatenate(
+            (
+                np.array([0.0]),
+                np.cumsum(np.linalg.norm(np.diff(result[:, :2], axis=0), axis=1)),
+            )
+        )
+    return result
+
+
+def _resample_reference_path(path: np.ndarray, point_count: int) -> np.ndarray:
+    value = _remove_duplicate_reference_points(path)
+    if value.shape[0] < 2:
+        return value
+    arc = value[:, 3]
+    samples = np.linspace(float(arc[0]), float(arc[-1]), point_count)
+    yaw = np.unwrap(value[:, 2])
+    return np.column_stack(
+        (
+            np.interp(samples, arc, value[:, 0]),
+            np.interp(samples, arc, value[:, 1]),
+            normalize_angle(np.interp(samples, arc, yaw)),
+            samples - samples[0],
+            np.interp(samples, arc, value[:, 4]),
+        )
+    )
 
 
 def _slice_reference(
@@ -779,6 +1015,7 @@ def normalize_angle(angle: np.ndarray | float):
 
 
 __all__ = [
+    "PNCCandidateContinuity",
     "PNCMap",
     "PNCMapUpdate",
     "PNCReferenceLine",
