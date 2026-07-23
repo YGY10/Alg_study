@@ -6,7 +6,7 @@ from dataclasses import replace
 
 import numpy as np
 
-from sim2d.perception.ideal_lane_sensor import perceive_lane_corridors
+from sim2d.perception.ideal_lane_sensor import perceive_lane_lines
 from sim2d.perception.types import (
     PerceivedObject,
     PerceivedTrafficSignal,
@@ -20,9 +20,9 @@ from sim2d.world.state import WorldState
 class GroundTruthLocalPerception:
     """局部理想感知。
 
-    数据来自 World，但只通过有限视野的局部几何扫描发布给规划器。
-    目标、交通灯和道路几何统一位于车辆坐标系：+x 向前，+y 向左。
-    道路感知不发布地图 lane id、前驱或后继拓扑。
+    数据来自 World，但只通过有限视野的局部几何扫描发布给 PNC。
+    目标、交通灯和车道线统一位于车辆坐标系：+x 向前，+y 向左。
+    感知层只发布车道线点列，不发布 lane、走廊、左右配对或拓扑。
     """
 
     def __init__(self, config: PerceptionConfig | None = None) -> None:
@@ -42,8 +42,7 @@ class GroundTruthLocalPerception:
         latest = self._latest_measurement
         if (
             latest is None
-            or now - latest.measurement_time + 1e-12
-            >= self.config.update_period
+            or now - latest.measurement_time + 1e-12 >= self.config.update_period
         ):
             latest = self._measure(world_state, frame=frame)
             self._latest_measurement = latest
@@ -88,7 +87,7 @@ class GroundTruthLocalPerception:
             if self._rng.random() >= self.config.signal_dropout_probability
         )
 
-        road_segments = perceive_lane_corridors(
+        lane_lines = perceive_lane_lines(
             world_state.road_lanes,
             ego,
             self.config,
@@ -102,8 +101,9 @@ class GroundTruthLocalPerception:
             ego=ego,
             objects=objects,
             traffic_signals=signals,
-            road_segments=road_segments,
-            source="ideal_lane_scan",
+            road_segments=(),
+            lane_lines=lane_lines,
+            source="ideal_lane_line_scan",
             coordinate_frame="vehicle",
             debug={
                 "coordinate_frame": "vehicle",
@@ -118,8 +118,10 @@ class GroundTruthLocalPerception:
                 "lane_transverse_spacing": self.config.lane_transverse_spacing,
                 "lane_ray_count": self.config.lane_ray_count,
                 "lane_ray_half_angle": self.config.lane_ray_half_angle,
-                "lane_corridor_count": len(road_segments),
+                "lane_line_count": len(lane_lines),
+                "lane_corridor_count": 0,
                 "lane_topology_published": False,
+                "lane_pairing_published": False,
             },
         )
 
@@ -159,13 +161,10 @@ class GroundTruthLocalPerception:
 
     def _noisy_ego(self, ego: VehicleState) -> VehicleState:
         return VehicleState(
-            x=ego.x
-            + float(self._rng.normal(0.0, self.config.position_noise_std)),
-            y=ego.y
-            + float(self._rng.normal(0.0, self.config.position_noise_std)),
+            x=ego.x + float(self._rng.normal(0.0, self.config.position_noise_std)),
+            y=ego.y + float(self._rng.normal(0.0, self.config.position_noise_std)),
             yaw=self._normalize_angle(
-                ego.yaw
-                + float(self._rng.normal(0.0, self.config.yaw_noise_std))
+                ego.yaw + float(self._rng.normal(0.0, self.config.yaw_noise_std))
             ),
             speed=max(
                 0.0,
