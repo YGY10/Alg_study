@@ -7,6 +7,9 @@ from PySide6.QtWidgets import QApplication
 
 from sim2d.gui.app_icon import apply_application_icon
 from sim2d.gui.perception_extension import install as install_perception
+from sim2d.gui.perception_lane_line_view_extension import (
+    install as install_perception_lane_line_view,
+)
 from sim2d.gui.perception_object_debug_extension import (
     install as install_perception_object_debug,
 )
@@ -42,14 +45,14 @@ install_traffic_actor_perception()
 # 占位 controller，再安装感知窗口扩展，避免构造阶段访问尚未创建的属性。
 install_perception_viewer_bootstrap()
 install_perception_viewer()
+install_perception_lane_line_view()
 install_perception_object_debug()
 install_perception_viewer_interaction()
 
 # 最后安装场景编辑器，使其能够覆盖现有 reset 链并使用已完成的主窗口扩展。
 install_traffic_actor_editor()
 
-# 性能调试必须在 MainWindow 实例化之前安装，才能覆盖每周期入口，
-# 同时采集感知、规划、优化、rollout、cost 和 GUI 总周期耗时。
+# 性能调试必须在 MainWindow 实例化之前安装，才能覆盖每周期入口。
 install_performance_debug()
 
 from sim2d.gui.main_window import MainWindow  # noqa: E402
@@ -68,9 +71,6 @@ def main() -> None:
 
     window = MainWindow()
 
-    # MainWindow 为兼容旧入口仍会先构造 BezierPlanner。GUI 完成构造后，
-    # 在这里切换为时空联合规划器，并重新执行 reset_environment()，使地图
-    # 路线、感知输入和场景编辑扩展全部直接使用新规划器。
     window.planner = SpatiotemporalPlanner(
         vehicle_config=window.vehicle_config,
         config=SpatiotemporalPlannerConfig(
