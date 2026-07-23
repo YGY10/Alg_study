@@ -5,7 +5,7 @@ import math
 import numpy as np
 import pytest
 
-from sim2d.perception import PerceivedLaneSegment
+from sim2d.perception import PerceivedLaneLine
 from sim2d.planning.spatiotemporal_planner import (
     build_perception_lane_reference,
     local_reference_path_to_world,
@@ -13,75 +13,65 @@ from sim2d.planning.spatiotemporal_planner import (
 from sim2d.types import VehicleState
 
 
-def make_lane(
+def make_boundaries(
     *,
-    lane_id: str,
     centerline: np.ndarray,
     confidence: float = 1.0,
-) -> PerceivedLaneSegment:
+) -> tuple[PerceivedLaneLine, PerceivedLaneLine]:
     centerline = np.asarray(centerline, dtype=np.float64)
-    left = centerline + np.array([0.0, 1.75], dtype=np.float64)
-    right = centerline - np.array([0.0, 1.75], dtype=np.float64)
-    return PerceivedLaneSegment(
-        map_lane_id=lane_id,
-        centerline=centerline,
-        left_boundary=left,
-        right_boundary=right,
+    left = PerceivedLaneLine(
+        line_id="left",
+        points=centerline + np.array([0.0, 1.75]),
         confidence=confidence,
     )
-
-
-def test_selects_lane_nearest_to_ego() -> None:
-    near = make_lane(
-        lane_id="near",
-        centerline=np.array(
-            [[-2.0, 0.2], [0.0, 0.2], [10.0, 0.2]],
-            dtype=np.float64,
-        ),
+    right = PerceivedLaneLine(
+        line_id="right",
+        points=centerline - np.array([0.0, 1.75]),
+        confidence=confidence,
     )
-    far = make_lane(
-        lane_id="far",
-        centerline=np.array(
-            [[-2.0, 4.0], [0.0, 4.0], [10.0, 4.0]],
-            dtype=np.float64,
-        ),
-    )
+    return left, right
 
-    result = build_perception_lane_reference((far, near))
+
+def test_builds_reference_nearest_to_ego() -> None:
+    far_left, far_right = make_boundaries(
+        centerline=np.array([[-2.0, 4.0], [0.0, 4.0], [10.0, 4.0]])
+    )
+    near_left, near_right = make_boundaries(
+        centerline=np.array([[-2.0, 0.2], [0.0, 0.2], [10.0, 0.2]])
+    )
+    far_left = PerceivedLaneLine("far_left", far_left.points)
+    far_right = PerceivedLaneLine("far_right", far_right.points)
+    near_left = PerceivedLaneLine("near_left", near_left.points)
+    near_right = PerceivedLaneLine("near_right", near_right.points)
+
+    result = build_perception_lane_reference(
+        (far_left, far_right, near_left, near_right)
+    )
 
     assert result is not None
-    assert result.lane_id == "near"
-    assert np.allclose(result.reference_path[:, 1], 0.2)
+    assert np.allclose(result.reference_path[:, 1], 0.2, atol=1e-6)
 
 
-def test_reverses_backward_centerline() -> None:
-    lane = make_lane(
-        lane_id="reverse",
-        centerline=np.array(
-            [[10.0, 0.0], [0.0, 0.0], [-2.0, 0.0]],
-            dtype=np.float64,
-        ),
+def test_reverses_backward_lane_lines() -> None:
+    lines = make_boundaries(
+        centerline=np.array([[10.0, 0.0], [0.0, 0.0], [-2.0, 0.0]])
     )
 
-    result = build_perception_lane_reference((lane,))
+    result = build_perception_lane_reference(lines)
 
     assert result is not None
     assert result.reference_path[-1, 0] > result.reference_path[0, 0]
     assert result.reference_path[0, 2] == pytest.approx(0.0)
 
 
-def test_rejects_low_confidence_lane() -> None:
-    lane = make_lane(
-        lane_id="uncertain",
-        centerline=np.array(
-            [[-1.0, 0.0], [5.0, 0.0]],
-            dtype=np.float64,
-        ),
+def test_rejects_low_confidence_lane_lines() -> None:
+    lines = make_boundaries(
+        centerline=np.array([[-1.0, 0.0], [5.0, 0.0]]),
         confidence=0.2,
     )
 
     result = build_perception_lane_reference(
-        (lane,),
+        lines,
         minimum_confidence=0.5,
     )
 
@@ -89,8 +79,7 @@ def test_rejects_low_confidence_lane() -> None:
 
 
 def test_reference_path_has_arc_length_and_curvature() -> None:
-    lane = make_lane(
-        lane_id="curve",
+    lines = make_boundaries(
         centerline=np.array(
             [
                 [-1.0, 0.0],
@@ -98,12 +87,11 @@ def test_reference_path_has_arc_length_and_curvature() -> None:
                 [2.0, 0.2],
                 [4.0, 0.8],
                 [6.0, 1.8],
-            ],
-            dtype=np.float64,
-        ),
+            ]
+        )
     )
 
-    result = build_perception_lane_reference((lane,))
+    result = build_perception_lane_reference(lines)
 
     assert result is not None
     path = result.reference_path
@@ -114,14 +102,10 @@ def test_reference_path_has_arc_length_and_curvature() -> None:
 
 
 def test_local_reference_converts_to_world() -> None:
-    lane = make_lane(
-        lane_id="straight",
-        centerline=np.array(
-            [[0.0, 0.0], [2.0, 0.0]],
-            dtype=np.float64,
-        ),
+    lines = make_boundaries(
+        centerline=np.array([[0.0, 0.0], [2.0, 0.0]])
     )
-    result = build_perception_lane_reference((lane,))
+    result = build_perception_lane_reference(lines)
     assert result is not None
 
     world = local_reference_path_to_world(
