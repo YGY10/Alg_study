@@ -48,14 +48,15 @@ class PNCMapUpdate:
     history_used: bool
     switch_pending_frames: int
     continuity_cost: float | None
+    candidate_costs: tuple[tuple[str, float], ...] = ()
 
 
 class PNCMap:
     """有历史状态的局部 PNC Map。
 
-    单帧几何负责生成候选 reference；跨帧历史负责保持逻辑本车道，避免车辆
-    因控制误差靠近相邻车道时立即跳 reference。只有新候选连续出现若干帧，
-    或旧 reference 已无法匹配，才确认切换。
+    单帧几何负责生成候选 reference；跨帧历史负责保持逻辑本车道。所有候选
+    在进入几何选择、历史比较和 planner 输出前都统一裁剪为自车附近局部段，
+    避免第一帧使用裁剪路径、后续帧却使用完整路径造成表示跳变。
     """
 
     def __init__(
@@ -67,6 +68,8 @@ class PNCMap:
         history_retention_cost: float = 1.5,
         history_hard_limit: float = 4.0,
         pending_match_cost: float = 1.0,
+        backward_margin: float = 2.0,
+        history_forward_length: float = 30.0,
     ) -> None:
         if not 0.0 <= minimum_confidence <= 1.0:
             raise ValueError("minimum_confidence must be within [0, 1]")
@@ -78,6 +81,8 @@ class PNCMap:
             raise ValueError("history thresholds must be positive")
         if history_hard_limit < history_retention_cost:
             raise ValueError("history_hard_limit must not be smaller than retention")
+        if backward_margin < 0.0 or history_forward_length <= 0.0:
+            raise ValueError("invalid local history comparison range")
 
         self.minimum_confidence = minimum_confidence
         self.maximum_lateral_distance = maximum_lateral_distance
@@ -85,6 +90,8 @@ class PNCMap:
         self.history_retention_cost = history_retention_cost
         self.history_hard_limit = history_hard_limit
         self.pending_match_cost = pending_match_cost
+        self.backward_margin = backward_margin
+        self.history_forward_length = history_forward_length
 
         self._current_world_path: np.ndarray | None = None
         self._pending_world_path: np.ndarray | None = None
@@ -101,11 +108,16 @@ class PNCMap:
         *,
         world_origin: VehicleState,
     ) -> PNCMapUpdate:
-        references = build_reference_lines(
+        raw_references = build_reference_lines(
             lane_lines,
             minimum_confidence=self.minimum_confidence,
         )
-        geometric = select_current_reference_line(
+        references = _localize_reference_candidates(
+            raw_references,
+            maximum_lateral_distance=self.maximum_lateral_distance,
+            backward_margin=self.backward_margin,
+        )
+        geometric = _select_current_local_reference(
             references,
             maximum_lateral_distance=self.maximum_lateral_distance,
         )
@@ -122,18 +134,15 @@ class PNCMap:
                 continuity_cost=None,
             )
 
-        world_paths = [
+        world_paths = tuple(
             local_reference_path_to_world(reference.reference_path, world_origin)
             for reference in references
-        ]
+        )
 
         if self._current_world_path is None:
             selected = geometric or references[0]
-            selected_world = local_reference_path_to_world(
-                selected.reference_path,
-                world_origin,
-            )
-            self._current_world_path = selected_world
+            selected_index = references.index(selected)
+            self._current_world_path = world_paths[selected_index]
             self._pending_world_path = None
             self._pending_frames = 0
             return PNCMapUpdate(
@@ -145,9 +154,23 @@ class PNCMap:
                 continuity_cost=None,
             )
 
+        current_history = _crop_world_reference_near_ego(
+            self._current_world_path,
+            world_origin,
+            backward_margin=self.backward_margin,
+            forward_length=self.history_forward_length,
+        )
         costs = np.asarray(
             [
-                _reference_continuity_cost(path, self._current_world_path)
+                _reference_continuity_cost(
+                    _crop_world_reference_near_ego(
+                        path,
+                        world_origin,
+                        backward_margin=self.backward_margin,
+                        forward_length=self.history_forward_length,
+                    ),
+                    current_history,
+                )
                 for path in world_paths
             ],
             dtype=np.float64,
@@ -156,49 +179,60 @@ class PNCMap:
         history_cost = float(costs[history_index])
         history_reference = references[history_index]
         history_world = world_paths[history_index]
+        candidate_costs = tuple(
+            (reference.reference_id, float(cost))
+            for reference, cost in zip(references, costs)
+        )
 
-        # 正常情况下持续追踪与上一周期几何最连续的 reference。即便自车瞬时
-        # 更靠近旁车道，也不会改变逻辑本车道。
+        # 同一逻辑车道的正常滚动更新不视为 reference 切换，也不清除 optimizer
+        # warm start。重要的是输出和历史保存始终使用同一份局部裁剪候选。
         if history_cost <= self.history_retention_cost:
-            changed = not _same_reference_geometry(
-                self._current_world_path,
-                history_world,
-                threshold=0.8,
-            )
             self._current_world_path = history_world
             self._pending_world_path = None
             self._pending_frames = 0
             return PNCMapUpdate(
                 selected=history_reference,
                 references=references,
-                reference_changed=False if not changed else False,
+                reference_changed=False,
                 history_used=True,
                 switch_pending_frames=0,
                 continuity_cost=history_cost,
+                candidate_costs=candidate_costs,
             )
 
         target = geometric or history_reference
-        target_world = local_reference_path_to_world(
-            target.reference_path,
-            world_origin,
+        target_index = references.index(target)
+        target_world = world_paths[target_index]
+        pending_cost = (
+            _reference_continuity_cost(
+                _crop_world_reference_near_ego(
+                    target_world,
+                    world_origin,
+                    backward_margin=self.backward_margin,
+                    forward_length=self.history_forward_length,
+                ),
+                _crop_world_reference_near_ego(
+                    self._pending_world_path,
+                    world_origin,
+                    backward_margin=self.backward_margin,
+                    forward_length=self.history_forward_length,
+                ),
+            )
+            if self._pending_world_path is not None
+            else math.inf
         )
-
-        if self._pending_world_path is not None and _reference_continuity_cost(
-            target_world,
-            self._pending_world_path,
-        ) <= self.pending_match_cost:
+        if pending_cost <= self.pending_match_cost:
             self._pending_frames += 1
             self._pending_world_path = target_world
         else:
             self._pending_world_path = target_world
             self._pending_frames = 1
 
-        # 在确认窗口内，仍优先保持最接近历史车道的当前帧候选。这样控制偏差
-        # 不会立刻演变成 reference 跳到旁车道的正反馈。
         if (
             self._pending_frames < self.switch_confirm_frames
             and history_cost <= self.history_hard_limit
         ):
+            self._current_world_path = history_world
             return PNCMapUpdate(
                 selected=history_reference,
                 references=references,
@@ -206,6 +240,7 @@ class PNCMap:
                 history_used=True,
                 switch_pending_frames=self._pending_frames,
                 continuity_cost=history_cost,
+                candidate_costs=candidate_costs,
             )
 
         self._current_world_path = target_world
@@ -218,6 +253,7 @@ class PNCMap:
             history_used=False,
             switch_pending_frames=0,
             continuity_cost=history_cost,
+            candidate_costs=candidate_costs,
         )
 
 
@@ -298,8 +334,66 @@ def select_current_reference_line(
     maximum_lateral_distance: float = 6.0,
     backward_margin: float = 2.0,
 ) -> PNCReferenceLine | None:
-    """无历史时，根据当前几何选择包围自车的 reference。"""
-    candidates: list[tuple[int, float, PNCReferenceLine, int]] = []
+    localized = _localize_reference_candidates(
+        references,
+        maximum_lateral_distance=maximum_lateral_distance,
+        backward_margin=backward_margin,
+    )
+    return _select_current_local_reference(
+        localized,
+        maximum_lateral_distance=maximum_lateral_distance,
+    )
+
+
+def build_current_reference_line(
+    lane_lines: tuple[PerceivedLaneLine, ...],
+    *,
+    minimum_confidence: float = 0.5,
+    maximum_lateral_distance: float = 6.0,
+) -> tuple[PNCReferenceLine | None, tuple[PNCReferenceLine, ...]]:
+    references = build_reference_lines(
+        lane_lines,
+        minimum_confidence=minimum_confidence,
+    )
+    localized = _localize_reference_candidates(
+        references,
+        maximum_lateral_distance=maximum_lateral_distance,
+        backward_margin=2.0,
+    )
+    return (
+        _select_current_local_reference(
+            localized,
+            maximum_lateral_distance=maximum_lateral_distance,
+        ),
+        localized,
+    )
+
+
+def _localize_reference_candidates(
+    references: tuple[PNCReferenceLine, ...],
+    *,
+    maximum_lateral_distance: float,
+    backward_margin: float,
+) -> tuple[PNCReferenceLine, ...]:
+    localized: list[PNCReferenceLine] = []
+    for reference in references:
+        centerline = reference.reference_path[:, :2]
+        distances = np.linalg.norm(centerline, axis=1)
+        nearest_index = int(np.argmin(distances))
+        if float(distances[nearest_index]) > maximum_lateral_distance:
+            continue
+        sliced = _slice_reference(reference, nearest_index, backward_margin)
+        if sliced is not None:
+            localized.append(sliced)
+    return tuple(localized)
+
+
+def _select_current_local_reference(
+    references: tuple[PNCReferenceLine, ...],
+    *,
+    maximum_lateral_distance: float,
+) -> PNCReferenceLine | None:
+    candidates: list[tuple[int, float, PNCReferenceLine]] = []
     for reference in references:
         centerline = reference.reference_path[:, :2]
         distances = np.linalg.norm(centerline, axis=1)
@@ -321,37 +415,21 @@ def select_current_reference_line(
             <= 0.0
             <= max(signed_left, signed_right) + 1e-6
         )
-
         heading_error = abs(float(reference.reference_path[nearest_index, 2]))
-        score = nearest_distance + 2.0 * heading_error + (1.0 - reference.confidence)
-        candidates.append(
-            (0 if contains_ego else 1, score, reference, nearest_index)
+        forward_length = float(reference.reference_path[-1, 3])
+        short_path_penalty = max(0.0, 12.0 - forward_length) * 0.2
+        score = (
+            nearest_distance
+            + 2.0 * heading_error
+            + (1.0 - reference.confidence)
+            + short_path_penalty
         )
+        candidates.append((0 if contains_ego else 1, score, reference))
 
     if not candidates:
         return None
     candidates.sort(key=lambda item: (item[0], item[1]))
-    _, _, selected, nearest_index = candidates[0]
-    return _slice_reference(selected, nearest_index, backward_margin)
-
-
-def build_current_reference_line(
-    lane_lines: tuple[PerceivedLaneLine, ...],
-    *,
-    minimum_confidence: float = 0.5,
-    maximum_lateral_distance: float = 6.0,
-) -> tuple[PNCReferenceLine | None, tuple[PNCReferenceLine, ...]]:
-    references = build_reference_lines(
-        lane_lines,
-        minimum_confidence=minimum_confidence,
-    )
-    return (
-        select_current_reference_line(
-            references,
-            maximum_lateral_distance=maximum_lateral_distance,
-        ),
-        references,
-    )
+    return candidates[0][2]
 
 
 def _pair_boundaries_by_normal_projection(
@@ -362,14 +440,12 @@ def _pair_boundaries_by_normal_projection(
     minimum_lane_width: float,
     maximum_lane_width: float,
 ) -> tuple[np.ndarray, np.ndarray, float] | None:
-    """沿道路局部法向建立左右边界对应，而不是使用固定 y 差。"""
     left_sample = _resample_polyline(left_points, output_point_count)
     if left_sample.shape[0] < 2:
         return None
 
     right_sample = np.empty_like(left_sample)
     valid = np.zeros(left_sample.shape[0], dtype=bool)
-
     for index, left_point in enumerate(left_sample):
         right_point = _closest_point_on_polyline(left_point, right_points)
         tangent = _normalized_tangent(left_sample, index)
@@ -388,8 +464,6 @@ def _pair_boundaries_by_normal_projection(
     valid_ratio = float(np.mean(valid))
     if valid_ratio < 0.65:
         return None
-
-    # 少量无效点仍使用最近投影点保持数组连续；候选置信度由 valid_ratio 降低。
     return left_sample, right_sample, valid_ratio
 
 
@@ -409,20 +483,14 @@ def _closest_point_on_polyline(point: np.ndarray, polyline: np.ndarray) -> np.nd
 
 
 def _orient_line_forward(points: np.ndarray) -> np.ndarray:
-    """统一点序，但不按 x 排序；急弯时使用可见弧长和端点延伸判向。"""
     value = np.asarray(points, dtype=np.float64)
     nearest_index = int(np.argmin(np.linalg.norm(value, axis=1)))
     tangent = _normalized_tangent(value, nearest_index)
     if tangent is None:
         return value.copy()
-
-    # 道路在自车附近明显朝前/朝后时，局部切线最可靠。
     if abs(float(tangent[0])) >= 0.15:
         return value[::-1].copy() if tangent[0] < 0.0 else value.copy()
 
-    # 直角弯附近 tangent.x 接近零，不能由微小数值符号决定整条线方向。
-    # 此时把离自车最近点两侧视作两个候选延伸，优先选择可见弧长更长、
-    # 且端点离自车更远的一侧作为未来方向。通常前向感知范围大于后向范围。
     segment_lengths = np.linalg.norm(np.diff(value, axis=0), axis=1)
     before_length = float(np.sum(segment_lengths[:nearest_index]))
     after_length = float(np.sum(segment_lengths[nearest_index:]))
@@ -433,31 +501,58 @@ def _orient_line_forward(points: np.ndarray) -> np.ndarray:
     return value[::-1].copy() if before_score > after_score else value.copy()
 
 
+def _crop_world_reference_near_ego(
+    path: np.ndarray,
+    ego: VehicleState,
+    *,
+    backward_margin: float,
+    forward_length: float,
+) -> np.ndarray:
+    if path is None or path.shape[0] < 2:
+        return path
+    distances = np.linalg.norm(
+        path[:, :2] - np.array([ego.x, ego.y], dtype=np.float64),
+        axis=1,
+    )
+    nearest = int(np.argmin(distances))
+    arc = path[:, 3]
+    center_s = float(arc[nearest])
+    keep = (arc >= center_s - backward_margin) & (arc <= center_s + forward_length)
+    indices = np.flatnonzero(keep)
+    if indices.size < 2:
+        start = max(0, nearest - 1)
+        end = min(path.shape[0], nearest + 2)
+        return path[start:end].copy()
+    return path[indices[0] : indices[-1] + 1].copy()
+
+
 def _reference_continuity_cost(
     first_world_path: np.ndarray,
     second_world_path: np.ndarray,
 ) -> float:
     first = _resample_polyline(first_world_path[:, :2], 41)
     second = _resample_polyline(second_world_path[:, :2], 41)
-    distances = np.linalg.norm(first[:, None, :] - second[None, :, :], axis=2)
-    geometric = 0.5 * (
-        float(np.mean(np.min(distances, axis=1)))
-        + float(np.mean(np.min(distances, axis=0)))
+    point_distance = float(np.mean(np.linalg.norm(first - second, axis=1)))
+
+    first_yaw = np.unwrap(first_world_path[:, 2])
+    second_yaw = np.unwrap(second_world_path[:, 2])
+    first_yaw_sample = np.interp(
+        np.linspace(0.0, 1.0, 41),
+        np.linspace(0.0, 1.0, first_yaw.size),
+        first_yaw,
     )
-
-    first_yaw = float(first_world_path[min(3, first_world_path.shape[0] - 1), 2])
-    second_yaw = float(second_world_path[min(3, second_world_path.shape[0] - 1), 2])
-    heading = abs(float(normalize_angle(first_yaw - second_yaw)))
-    return geometric + 0.75 * heading
-
-
-def _same_reference_geometry(
-    first: np.ndarray,
-    second: np.ndarray,
-    *,
-    threshold: float,
-) -> bool:
-    return _reference_continuity_cost(first, second) <= threshold
+    second_yaw_sample = np.interp(
+        np.linspace(0.0, 1.0, 41),
+        np.linspace(0.0, 1.0, second_yaw.size),
+        second_yaw,
+    )
+    heading = float(
+        np.mean(np.abs(normalize_angle(first_yaw_sample - second_yaw_sample)))
+    )
+    start_distance = float(
+        np.linalg.norm(first_world_path[0, :2] - second_world_path[0, :2])
+    )
+    return point_distance + 0.75 * heading + 0.25 * start_distance
 
 
 def _slice_reference(
@@ -469,7 +564,9 @@ def _slice_reference(
     centerline = selected.reference_path[:, :2]
     travelled = 0.0
     while start_index > 0:
-        segment = float(np.linalg.norm(centerline[start_index] - centerline[start_index - 1]))
+        segment = float(
+            np.linalg.norm(centerline[start_index] - centerline[start_index - 1])
+        )
         if travelled + segment > backward_margin:
             break
         travelled += segment
@@ -539,7 +636,7 @@ def _resample_polyline(points: np.ndarray, point_count: int) -> np.ndarray:
     keep = np.concatenate((np.array([True]), segment_lengths > 1e-9))
     points = points[keep]
     if points.shape[0] < 2:
-        return points
+        return np.repeat(points, point_count, axis=0)
     arc = np.concatenate(
         (np.array([0.0]), np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
     )
