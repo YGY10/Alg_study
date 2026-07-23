@@ -31,6 +31,17 @@ class SpatiotemporalPlannerConfig:
     minimum_curve_speed: float = 1.0
     frenet_nonmonotonic_tolerance: float = 0.05
 
+    # 高效参考线前馈与可行性恢复
+    feedforward_lookahead_base: float = 2.0
+    feedforward_lookahead_speed_gain: float = 0.35
+    feedforward_lookahead_max: float = 8.0
+    feedforward_curve_preview_distance: float = 12.0
+    feedforward_speed_response_time: float = 0.6
+    feedforward_pure_pursuit_weight: float = 0.70
+    warm_start_max_violation: float = 0.15
+    result_max_violation: float = 0.10
+    fallback_violation_improvement: float = 0.05
+
     # 代价权重
     weight_reference: float = 3.0
     weight_heading: float = 1.5
@@ -104,6 +115,28 @@ class SpatiotemporalPlannerConfig:
             raise ValueError("minimum_curve_speed must not exceed target_speed")
         if self.frenet_nonmonotonic_tolerance < 0.0:
             raise ValueError("frenet_nonmonotonic_tolerance must be non-negative")
+
+        positive_values = (
+            self.feedforward_lookahead_base,
+            self.feedforward_lookahead_max,
+            self.feedforward_curve_preview_distance,
+            self.feedforward_speed_response_time,
+        )
+        if min(positive_values) <= 0.0:
+            raise ValueError("feedforward distances and response time must be positive")
+        if self.feedforward_lookahead_speed_gain < 0.0:
+            raise ValueError("feedforward_lookahead_speed_gain must be non-negative")
+        if self.feedforward_lookahead_max < self.feedforward_lookahead_base:
+            raise ValueError("feedforward_lookahead_max must not be smaller than base")
+        if not 0.0 <= self.feedforward_pure_pursuit_weight <= 1.0:
+            raise ValueError("feedforward_pure_pursuit_weight must be within [0, 1]")
+        feasibility_values = (
+            self.warm_start_max_violation,
+            self.result_max_violation,
+            self.fallback_violation_improvement,
+        )
+        if min(feasibility_values) < 0.0:
+            raise ValueError("feasibility thresholds must be non-negative")
 
         weights = (
             self.weight_reference,
