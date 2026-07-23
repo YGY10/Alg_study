@@ -23,6 +23,10 @@ from .pnc_map import (
     local_reference_path_to_world,
     select_current_reference_line,
 )
+from .pnc_map_stability import install_pnc_map_stability
+
+install_pnc_map_stability()
+
 from .prediction import ConstantVelocityPredictor
 from .rollout import TrajectoryRollout
 from .spatiotemporal_planner import SpatiotemporalPlanner
@@ -56,6 +60,7 @@ __all__ = [
     "build_local_planning_context",
     "build_perception_lane_reference",
     "build_reference_lines",
+    "install_pnc_map_stability",
     "local_reference_path_to_world",
     "local_state_to_world",
     "local_trajectory_to_world",
