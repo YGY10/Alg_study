@@ -41,6 +41,13 @@ def perceive_lane_corridors(
             ego,
         )
 
+        # 先用车辆坐标系包围盒做廉价预过滤。只有左右边界都可能进入
+        # 当前感知窗口时，才执行后续横向扫描线和扇形射线求交。
+        if not _polyline_may_intersect_view(left_local, config):
+            continue
+        if not _polyline_may_intersect_view(right_local, config):
+            continue
+
         left_hits = _scan_boundary(left_local, config)
         right_hits = _scan_boundary(right_local, config)
 
@@ -95,11 +102,57 @@ def _world_polyline_to_vehicle(
     )
 
 
+def _polyline_may_intersect_view(
+    polyline: np.ndarray,
+    config: PerceptionConfig,
+) -> bool:
+    """用局部包围盒快速排除完全位于感知窗口外的边界。"""
+    if polyline.ndim != 2 or polyline.shape[1] != 2 or polyline.shape[0] < 2:
+        return False
+
+    minimum = np.min(polyline, axis=0)
+    maximum = np.max(polyline, axis=0)
+
+    if maximum[0] < -config.rear_range:
+        return False
+    if minimum[0] > config.forward_range:
+        return False
+    if maximum[1] < -config.lateral_range:
+        return False
+    if minimum[1] > config.lateral_range:
+        return False
+
+    # 全向感知时，矩形窗口相交已经足够。
+    if config.field_of_view >= 2.0 * math.pi - 1e-9:
+        return True
+
+    # 非全向感知时，再用包围盒角点与线段端点做保守 FOV 过滤。
+    candidates = np.vstack(
+        (
+            polyline,
+            np.array(
+                [
+                    [minimum[0], minimum[1]],
+                    [minimum[0], maximum[1]],
+                    [maximum[0], minimum[1]],
+                    [maximum[0], maximum[1]],
+                ],
+                dtype=np.float64,
+            ),
+        )
+    )
+    return any(
+        _inside_field_of_view(point, config.field_of_view)
+        for point in candidates
+    )
+
+
 def _scan_boundary(
     polyline: np.ndarray,
     config: PerceptionConfig,
 ) -> list[_BoundaryHit]:
     hits: list[_BoundaryHit] = []
+    cumulative = _cumulative_lengths(polyline)
 
     scan_x_values = np.arange(
         -config.rear_range,
@@ -108,7 +161,13 @@ def _scan_boundary(
         dtype=np.float64,
     )
     for scan_x in scan_x_values:
-        hits.extend(_intersections_with_vertical_line(polyline, float(scan_x)))
+        hits.extend(
+            _intersections_with_vertical_line(
+                polyline,
+                cumulative,
+                float(scan_x),
+            )
+        )
 
     angles = np.linspace(
         -config.lane_ray_half_angle,
@@ -123,7 +182,12 @@ def _scan_boundary(
             [math.cos(float(angle)), math.sin(float(angle))],
             dtype=np.float64,
         )
-        hit = _nearest_ray_intersection(polyline, direction, max_distance)
+        hit = _nearest_ray_intersection(
+            polyline,
+            cumulative,
+            direction,
+            max_distance,
+        )
         if hit is not None:
             hits.append(hit)
 
@@ -140,10 +204,10 @@ def _scan_boundary(
 
 def _intersections_with_vertical_line(
     polyline: np.ndarray,
+    cumulative: np.ndarray,
     scan_x: float,
 ) -> list[_BoundaryHit]:
     hits: list[_BoundaryHit] = []
-    cumulative = _cumulative_lengths(polyline)
 
     for index, (start, end) in enumerate(zip(polyline[:-1], polyline[1:])):
         dx = float(end[0] - start[0])
@@ -165,29 +229,33 @@ def _intersections_with_vertical_line(
 
 def _nearest_ray_intersection(
     polyline: np.ndarray,
+    cumulative: np.ndarray,
     direction: np.ndarray,
     max_distance: float,
 ) -> _BoundaryHit | None:
-    cumulative = _cumulative_lengths(polyline)
+    """使用二维叉积计算射线与折线段最近交点。
+
+    射线为 ``t * direction``，线段为 ``start + u * segment``。
+    直接使用二维叉积求 t、u，避免在最内层循环反复创建矩阵并调用
+    ``np.linalg.det`` / ``np.linalg.solve``。
+    """
     best: tuple[float, _BoundaryHit] | None = None
 
     for index, (start, end) in enumerate(zip(polyline[:-1], polyline[1:])):
         segment = end - start
-        matrix = np.column_stack((direction, -segment))
-        determinant = float(np.linalg.det(matrix))
-        if abs(determinant) <= 1e-12:
+        denominator = _cross_2d(direction, segment)
+        if abs(denominator) <= 1e-12:
             continue
 
-        distance, parameter = np.linalg.solve(matrix, start)
-        distance = float(distance)
-        parameter = float(parameter)
+        distance = _cross_2d(start, segment) / denominator
+        parameter = _cross_2d(start, direction) / denominator
 
         if distance < -1e-9 or distance > max_distance + 1e-9:
             continue
         if parameter < -1e-9 or parameter > 1.0 + 1e-9:
             continue
 
-        distance = max(distance, 0.0)
+        distance = max(float(distance), 0.0)
         parameter = float(np.clip(parameter, 0.0, 1.0))
         point = distance * direction
         segment_length = float(np.linalg.norm(segment))
@@ -199,6 +267,10 @@ def _nearest_ray_intersection(
             best = (distance, hit)
 
     return None if best is None else best[1]
+
+
+def _cross_2d(first: np.ndarray, second: np.ndarray) -> float:
+    return float(first[0] * second[1] - first[1] * second[0])
 
 
 def _resample_hits(hits: list[_BoundaryHit], point_count: int) -> np.ndarray:
