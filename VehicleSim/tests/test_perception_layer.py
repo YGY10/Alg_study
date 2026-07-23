@@ -47,9 +47,7 @@ def test_planner_input_is_backward_compatible_and_local():
     assert planning_input.frame == 0
     assert planning_input.goal.state.x == 20.0
     assert planning_input.perception.coordinate_frame == "vehicle"
-    assert [item.obstacle_id for item in planning_input.obstacles] == [
-        "near"
-    ]
+    assert [item.obstacle_id for item in planning_input.obstacles] == ["near"]
     assert [
         item.object_id for item in planning_input.perception.objects
     ] == ["near"]
@@ -95,7 +93,7 @@ def test_perception_noise_interface_is_deterministic():
     assert first_snapshot.objects == second_snapshot.objects
 
 
-def test_local_world_road_is_clipped_around_ego():
+def test_local_world_road_is_published_as_lane_lines():
     env = _make_env()
     points = np.column_stack(
         [
@@ -117,10 +115,11 @@ def test_local_world_road_is_clipped_around_ego():
     )
 
     snapshot = env.get_perception_snapshot()
-    assert len(snapshot.road_segments) == 1
-    segment = snapshot.road_segments[0]
-    assert float(segment.centerline[:, 0].min()) >= -21.0
-    assert float(segment.centerline[:, 0].max()) <= 61.0
+    assert snapshot.road_segments == ()
+    assert len(snapshot.lane_lines) == 2
+    for line in snapshot.lane_lines:
+        assert float(line.points[:, 0].min()) >= -21.0
+        assert float(line.points[:, 0].max()) <= 61.0
 
 
 def test_field_of_view_can_hide_rear_objects():
@@ -167,7 +166,6 @@ def test_objects_are_published_in_rotated_vehicle_frame():
     assert np.isclose(by_id["left"].x, 0.0)
     assert np.isclose(by_id["left"].y, 8.0)
 
-    # 顶层 obstacles 是旧规划器兼容视图，仍恢复为全局坐标。
     legacy_by_id = {
         item.obstacle_id: item
         for item in planning_input.obstacles
@@ -176,7 +174,7 @@ def test_objects_are_published_in_rotated_vehicle_frame():
     assert np.isclose(legacy_by_id["ahead"].y, 17.0)
 
 
-def test_lane_points_are_published_in_vehicle_frame():
+def test_lane_line_points_are_published_in_vehicle_frame():
     env = DrivingEnv(
         vehicle_config=VehicleConfig(),
         environment_config=EnvironmentConfig(),
@@ -211,9 +209,10 @@ def test_lane_points_are_published_in_vehicle_frame():
         ),
     )
 
-    segment = env.get_perception_snapshot().road_segments[0]
-    assert np.allclose(
-        segment.centerline,
-        np.array([[0.0, 0.0], [10.0, 0.0], [20.0, 0.0]]),
-        atol=1e-9,
+    lines = env.get_perception_snapshot().lane_lines
+    assert len(lines) == 2
+    lateral_positions = sorted(
+        float(np.median(line.points[:, 1])) for line in lines
     )
+    assert np.allclose(lateral_positions, [-1.75, 1.75], atol=1e-6)
+    assert all(float(line.points[:, 0].max()) >= 19.0 for line in lines)
