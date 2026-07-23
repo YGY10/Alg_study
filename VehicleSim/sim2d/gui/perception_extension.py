@@ -22,6 +22,7 @@ def install() -> None:
             f"source={snapshot.source} "
             f"objects={len(snapshot.objects)} "
             f"signals={len(snapshot.traffic_signals)} "
+            f"lane_lines={len(snapshot.lane_lines)} "
             f"road_segments={len(snapshot.road_segments)} "
             f"range_front={snapshot.debug['forward_range']:.1f} "
             f"range_rear={snapshot.debug['rear_range']:.1f} "
