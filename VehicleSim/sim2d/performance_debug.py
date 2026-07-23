@@ -325,7 +325,8 @@ def _install_planner_timing() -> None:
             result.reference_path
         )
         debug["pnc_lane_line_summaries"] = tuple(
-            _lane_line_summary(line) for line in planning_input.lane_lines
+            _lane_line_summary(line)
+            for line in planning_input.perception.lane_lines
         )
         return replace(result, debug=debug)
 
