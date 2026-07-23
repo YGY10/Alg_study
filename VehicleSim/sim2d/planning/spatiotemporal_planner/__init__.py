@@ -14,18 +14,19 @@ from .lane_reference import (
     build_perception_lane_reference,
 )
 from .optimizer import SpatiotemporalOptimizer
+from . import pnc_map as _pnc_map
 from .pnc_map import (
     PNCMap,
     PNCMapUpdate,
     PNCReferenceLine,
     build_current_reference_line,
-    build_reference_lines,
     local_reference_path_to_world,
     select_current_reference_line,
 )
 from .pnc_map_stability import install_pnc_map_stability
 
 install_pnc_map_stability()
+build_reference_lines = _pnc_map.build_reference_lines
 
 from .prediction import ConstantVelocityPredictor
 from .rollout import TrajectoryRollout
