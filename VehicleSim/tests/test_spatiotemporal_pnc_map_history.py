@@ -54,7 +54,6 @@ def test_right_angle_lines_keep_turn_direction_when_local_x_is_nearly_constant()
 
 
 def test_lane_width_is_measured_along_local_normal_on_right_angle_exit() -> None:
-    # 弯后两条边界的 y 很接近变化方向，真实宽度主要体现在 x 方向。
     left = _line(
         "left",
         np.array([[0.0, 1.8], [7.0, 1.8], [9.0, 0.0], [9.0, -10.0]]),
@@ -99,13 +98,9 @@ def test_history_keeps_logical_lane_when_ego_drifts_across_boundary() -> None:
         world_origin=VehicleState(0.0, 0.0, 0.0, 2.0),
     )
     assert first.selected is not None
-    first_world_center_y = float(
-        np.median(first.selected.reference_path[:, 1])
-    )
+    first_world_center_y = float(np.median(first.selected.reference_path[:, 1]))
     assert abs(first_world_center_y) < 0.2
 
-    # 自车向右漂移 2 m。瞬时几何上右侧车道已经包围局部原点，但历史中的
-    # 逻辑本车道在世界坐标仍是 y=0，PNC Map 应继续保持它。
     second_lines = (
         _line("left2", np.column_stack((x, np.full_like(x, 3.8)))),
         _line("middle2", np.column_stack((x, np.full_like(x, 0.2)))),
@@ -118,11 +113,53 @@ def test_history_keeps_logical_lane_when_ego_drifts_across_boundary() -> None:
 
     assert second.selected is not None
     assert second.history_used is True
-    selected_world_y = float(
-        np.median(second.selected.reference_path[:, 1]) - 2.0
-    )
+    selected_world_y = float(np.median(second.selected.reference_path[:, 1]) - 2.0)
     assert abs(selected_world_y) < 0.3
     assert second.reference_changed is False
+
+
+def test_history_survives_frame_to_frame_point_order_flip() -> None:
+    pnc_map = PNCMap()
+    left_points = np.array(
+        [
+            [-5.0, 1.8],
+            [5.0, 1.8],
+            [8.0, 1.0],
+            [9.0, -1.0],
+            [9.0, -12.0],
+        ],
+        dtype=np.float64,
+    )
+    right_points = np.array(
+        [
+            [-5.0, -1.8],
+            [4.0, -1.8],
+            [5.5, -2.5],
+            [5.5, -12.0],
+        ],
+        dtype=np.float64,
+    )
+
+    first = pnc_map.update(
+        (_line("left0", left_points), _line("right0", right_points)),
+        world_origin=VehicleState(0.0, 0.0, 0.0, 2.0),
+    )
+    assert first.selected is not None
+    assert first.selected.reference_path[-1, 1] < -8.0
+
+    second = pnc_map.update(
+        (
+            _line("left1", left_points[::-1]),
+            _line("right1", right_points[::-1]),
+        ),
+        world_origin=VehicleState(0.0, 0.0, 0.0, 2.0),
+    )
+
+    assert second.selected is not None
+    assert second.history_used is True
+    assert second.reference_changed is False
+    assert second.selected.reference_path[-1, 1] < -8.0
+    assert second.selected_orientation in {"forward", "reverse"}
 
 
 def test_reset_clears_reference_history() -> None:
