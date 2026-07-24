@@ -48,21 +48,18 @@ class LaneFragmentStitchingDebug:
 
 
 @dataclass(frozen=True)
-class _OrientedFragment:
-    index: int
-    line: PerceivedLaneLine
+class _WorkingLine:
+    fragments: tuple[PerceivedLaneLine, ...]
     points: np.ndarray
-    length: float
-    start_tangent: np.ndarray
-    end_tangent: np.ndarray
 
 
 @dataclass(frozen=True)
-class _JoinCandidate:
-    source: int
-    target: int
+class _MergeCandidate:
+    first_index: int
+    second_index: int
+    first_points: np.ndarray
+    second_points: np.ndarray
     score: float
-    gap: float
 
 
 _ORIGINAL_PNC_UPDATE = None
@@ -101,282 +98,172 @@ def stitch_lane_line_fragments(
 ) -> tuple[tuple[PerceivedLaneLine, ...], LaneFragmentStitchingDebug]:
     """把属于同一物理边界的前后片段拼成 boundary chain。
 
-    该函数只使用车辆坐标系下的点、端点距离和局部切向，不依赖地图 lane id、
-    前驱后继或导航路径。参与链的原始 fragment 会被最大链替代，未参与拼接的
-    车道线原样保留，避免重复 fragment 插在两条真实边界之间。
+    对每一对 fragment 同时尝试四种点序组合，因此直角弯处即使局部 x 几乎
+    不变化，也不依赖单帧按 x 猜方向。每次只合并全局连接代价最低的一对，
+    再继续搜索下一段，最终得到 line1→line3 这样的最大边界链。
     """
     stitch_config = config or LaneFragmentStitchingConfig()
     stitch_config.validate()
-    if len(lane_lines) < 2:
-        debug = LaneFragmentStitchingDebug(
-            input_count=len(lane_lines),
-            output_count=len(lane_lines),
-            stitched_chain_count=0,
-            chains=(),
-        )
-        return tuple(lane_lines), debug
 
-    fragments = tuple(
-        fragment
-        for index, line in enumerate(lane_lines)
-        if (
-            fragment := _prepare_fragment(index, line, stitch_config)
-        )
-        is not None
-    )
-    if len(fragments) < 2:
-        debug = LaneFragmentStitchingDebug(
-            input_count=len(lane_lines),
-            output_count=len(lane_lines),
-            stitched_chain_count=0,
-            chains=(),
-        )
-        return tuple(lane_lines), debug
+    working: list[_WorkingLine] = []
+    for line in lane_lines:
+        points = _remove_duplicate_points(np.asarray(line.points, dtype=np.float64))
+        if points.shape[0] < 2:
+            continue
+        working.append(_WorkingLine((line,), points))
 
-    joins = _select_non_conflicting_joins(fragments, stitch_config)
-    chains = _build_chains(fragments, joins, stitch_config.maximum_chain_fragments)
-    chained_indices = {fragment.index for chain in chains for fragment in chain}
+    maximum_merges = max(0, len(working) - 1)
+    for _ in range(maximum_merges):
+        candidate = _find_best_merge(working, stitch_config)
+        if candidate is None:
+            break
+        first = working[candidate.first_index]
+        second = working[candidate.second_index]
+        bridge = _hermite_bridge(
+            candidate.first_points[-1],
+            _endpoint_tangent(candidate.first_points, at_start=False),
+            candidate.second_points[0],
+            _endpoint_tangent(candidate.second_points, at_start=True),
+            spacing=stitch_config.bridge_point_spacing,
+        )
+        pieces = [candidate.first_points]
+        if bridge.shape[0] > 0:
+            pieces.append(bridge)
+        pieces.append(candidate.second_points)
+        merged_points = _remove_duplicate_points(np.vstack(pieces))
+        merged_fragments = first.fragments + second.fragments
+        merged = _WorkingLine(merged_fragments, merged_points)
+
+        high = max(candidate.first_index, candidate.second_index)
+        low = min(candidate.first_index, candidate.second_index)
+        working.pop(high)
+        working.pop(low)
+        working.append(merged)
 
     output: list[PerceivedLaneLine] = []
-    chain_ids: list[tuple[str, ...]] = []
-    for chain in chains:
-        if len(chain) < 2:
+    chains: list[tuple[str, ...]] = []
+    for item in working:
+        if len(item.fragments) == 1:
+            output.append(item.fragments[0])
             continue
-        stitched = _stitch_chain(chain, stitch_config)
-        if stitched is None:
-            continue
-        output.append(stitched)
-        chain_ids.append(tuple(fragment.line.line_id for fragment in chain))
+        ids = tuple(fragment.line_id for fragment in item.fragments)
+        chains.append(ids)
+        confidence = min(fragment.confidence for fragment in item.fragments)
+        confidence *= 0.97 ** (len(item.fragments) - 1)
+        line_types = {fragment.line_type for fragment in item.fragments}
+        line_type = next(iter(line_types)) if len(line_types) == 1 else "stitched"
+        output.append(
+            PerceivedLaneLine(
+                line_id="stitch[" + "+".join(ids) + "]",
+                points=item.points,
+                confidence=float(confidence),
+                line_type=line_type,
+            )
+        )
 
-    successfully_chained = {
-        fragment.index
-        for chain, ids in zip(chains, chain_ids)
-        for fragment in chain
-        if len(ids) >= 2
-    }
-    if successfully_chained != chained_indices:
-        chained_indices = successfully_chained
-
-    output.extend(
-        line for index, line in enumerate(lane_lines) if index not in chained_indices
-    )
     result = tuple(output)
     debug = LaneFragmentStitchingDebug(
         input_count=len(lane_lines),
         output_count=len(result),
-        stitched_chain_count=len(chain_ids),
-        chains=tuple(chain_ids),
+        stitched_chain_count=len(chains),
+        chains=tuple(chains),
     )
     return result, debug
 
 
-def _prepare_fragment(
-    index: int,
-    line: PerceivedLaneLine,
+def _find_best_merge(
+    working: list[_WorkingLine],
     config: LaneFragmentStitchingConfig,
-) -> _OrientedFragment | None:
-    points = _remove_duplicate_points(np.asarray(line.points, dtype=np.float64))
-    if points.shape[0] < 2:
-        return None
-    length = float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
-    if length < config.minimum_fragment_length:
-        return None
-
-    forward_score = _orientation_score(points)
-    reverse_score = _orientation_score(points[::-1])
-    if reverse_score > forward_score:
-        points = points[::-1].copy()
-
-    start_tangent = _endpoint_tangent(points, at_start=True)
-    end_tangent = _endpoint_tangent(points, at_start=False)
-    if start_tangent is None or end_tangent is None:
-        return None
-    return _OrientedFragment(
-        index=index,
-        line=line,
-        points=points,
-        length=length,
-        start_tangent=start_tangent,
-        end_tangent=end_tangent,
-    )
-
-
-def _orientation_score(points: np.ndarray) -> float:
-    nearest = int(np.argmin(np.linalg.norm(points, axis=1)))
-    future = points[nearest:]
-    if future.shape[0] < 2:
-        return -1e6
-    tangent = _endpoint_tangent(future, at_start=True)
-    if tangent is None:
-        return -1e6
-    future_length = float(np.sum(np.linalg.norm(np.diff(future, axis=0), axis=1)))
-    displacement = future[-1] - future[0]
-    # +x 是自车前方；弯道中 x 可能不再增长，因此弧长只作为较弱的补充项。
-    return (
-        3.0 * float(tangent[0])
-        + 0.35 * float(displacement[0])
-        + 0.05 * future_length
-    )
-
-
-def _select_non_conflicting_joins(
-    fragments: tuple[_OrientedFragment, ...],
-    config: LaneFragmentStitchingConfig,
-) -> dict[int, int]:
-    candidates: list[_JoinCandidate] = []
-    for source in fragments:
-        for target in fragments:
-            if source.index == target.index:
+) -> _MergeCandidate | None:
+    best: _MergeCandidate | None = None
+    for first_index in range(len(working)):
+        first = working[first_index]
+        if len(first.fragments) >= config.maximum_chain_fragments:
+            continue
+        for second_index in range(first_index + 1, len(working)):
+            second = working[second_index]
+            if len(first.fragments) + len(second.fragments) > config.maximum_chain_fragments:
                 continue
-            candidate = _evaluate_join(source, target, config)
-            if candidate is not None:
-                candidates.append(candidate)
-    candidates.sort(key=lambda item: item.score)
+            for first_points in (first.points, first.points[::-1]):
+                for second_points in (second.points, second.points[::-1]):
+                    score = _join_score(first_points, second_points, config)
+                    if score is None:
+                        continue
+                    candidate = _MergeCandidate(
+                        first_index=first_index,
+                        second_index=second_index,
+                        first_points=first_points.copy(),
+                        second_points=second_points.copy(),
+                        score=score,
+                    )
+                    if best is None or candidate.score < best.score:
+                        best = candidate
+    return best
 
-    outgoing: dict[int, int] = {}
-    incoming: dict[int, int] = {}
-    for candidate in candidates:
-        if candidate.source in outgoing or candidate.target in incoming:
-            continue
-        if _would_create_cycle(outgoing, candidate.source, candidate.target):
-            continue
-        outgoing[candidate.source] = candidate.target
-        incoming[candidate.target] = candidate.source
-    return outgoing
 
-
-def _evaluate_join(
-    source: _OrientedFragment,
-    target: _OrientedFragment,
+def _join_score(
+    first: np.ndarray,
+    second: np.ndarray,
     config: LaneFragmentStitchingConfig,
-) -> _JoinCandidate | None:
-    delta = target.points[0] - source.points[-1]
+) -> float | None:
+    first_tangent = _endpoint_tangent(first, at_start=False)
+    second_tangent = _endpoint_tangent(second, at_start=True)
+    if first_tangent is None or second_tangent is None:
+        return None
+
+    delta = second[0] - first[-1]
     gap = float(np.linalg.norm(delta))
     if gap > config.maximum_join_distance:
         return None
 
-    heading_delta = abs(_angle_difference(source.end_tangent, target.start_tangent))
+    heading_delta = abs(_angle_difference(first_tangent, second_tangent))
     if heading_delta > config.maximum_join_heading:
         return None
 
-    if gap > 1e-6:
+    if gap <= 1e-6:
+        first_bridge_angle = 0.0
+        bridge_second_angle = 0.0
+        lateral_error = 0.0
+        effective_curvature = heading_delta / 0.5
+    else:
         bridge_direction = delta / gap
-        source_bridge_angle = abs(_angle_difference(source.end_tangent, bridge_direction))
-        bridge_target_angle = abs(_angle_difference(bridge_direction, target.start_tangent))
-        if max(source_bridge_angle, bridge_target_angle) > config.maximum_join_heading:
+        first_bridge_angle = abs(_angle_difference(first_tangent, bridge_direction))
+        bridge_second_angle = abs(_angle_difference(bridge_direction, second_tangent))
+        if max(first_bridge_angle, bridge_second_angle) > config.maximum_join_heading:
             return None
-        normal = np.array([-source.end_tangent[1], source.end_tangent[0]])
+        normal = np.array([-first_tangent[1], first_tangent[0]], dtype=np.float64)
         lateral_error = abs(float(np.dot(delta, normal)))
         if lateral_error > config.maximum_endpoint_lateral_error:
             return None
-        effective_curvature = max(source_bridge_angle, bridge_target_angle) / max(gap, 0.5)
-        if effective_curvature > config.maximum_join_curvature:
-            return None
-    else:
-        source_bridge_angle = 0.0
-        bridge_target_angle = 0.0
-        lateral_error = 0.0
-        effective_curvature = 0.0
+        effective_curvature = max(first_bridge_angle, bridge_second_angle) / max(gap, 0.5)
 
-    # 禁止把后方片段接到前方片段之后形成明显回折。
-    forward_projection = float(np.dot(delta, source.end_tangent))
+    if effective_curvature > config.maximum_join_curvature:
+        return None
+
+    forward_projection = float(np.dot(delta, first_tangent))
     if gap > 0.5 and forward_projection < -0.25:
         return None
 
-    score = (
+    return float(
         gap
         + 2.0 * heading_delta
-        + source_bridge_angle
-        + bridge_target_angle
-        + 0.5 * lateral_error
+        + first_bridge_angle
+        + bridge_second_angle
+        + 0.75 * lateral_error
         + 2.0 * effective_curvature
-    )
-    return _JoinCandidate(
-        source=source.index,
-        target=target.index,
-        score=float(score),
-        gap=gap,
-    )
-
-
-def _would_create_cycle(outgoing: dict[int, int], source: int, target: int) -> bool:
-    cursor = target
-    visited: set[int] = set()
-    while cursor in outgoing and cursor not in visited:
-        if cursor == source:
-            return True
-        visited.add(cursor)
-        cursor = outgoing[cursor]
-    return cursor == source
-
-
-def _build_chains(
-    fragments: tuple[_OrientedFragment, ...],
-    outgoing: dict[int, int],
-    maximum_chain_fragments: int,
-) -> tuple[tuple[_OrientedFragment, ...], ...]:
-    by_index = {fragment.index: fragment for fragment in fragments}
-    incoming = {target: source for source, target in outgoing.items()}
-    starts = [index for index in outgoing if index not in incoming]
-    chains: list[tuple[_OrientedFragment, ...]] = []
-    consumed: set[int] = set()
-    for start in starts:
-        indices = [start]
-        cursor = start
-        while cursor in outgoing and len(indices) < maximum_chain_fragments:
-            cursor = outgoing[cursor]
-            if cursor in indices:
-                break
-            indices.append(cursor)
-        if len(indices) >= 2:
-            chains.append(tuple(by_index[index] for index in indices))
-            consumed.update(indices)
-    return tuple(chains)
-
-
-def _stitch_chain(
-    chain: tuple[_OrientedFragment, ...],
-    config: LaneFragmentStitchingConfig,
-) -> PerceivedLaneLine | None:
-    points = chain[0].points.copy()
-    for previous, following in zip(chain[:-1], chain[1:]):
-        bridge = _hermite_bridge(
-            previous.points[-1],
-            previous.end_tangent,
-            following.points[0],
-            following.start_tangent,
-            spacing=config.bridge_point_spacing,
-        )
-        pieces = [points]
-        if bridge.shape[0] > 0:
-            pieces.append(bridge)
-        pieces.append(following.points)
-        points = _remove_duplicate_points(np.vstack(pieces))
-    if points.shape[0] < 2:
-        return None
-
-    ids = tuple(fragment.line.line_id for fragment in chain)
-    confidence = min(fragment.line.confidence for fragment in chain)
-    # 片段越多，连接不确定性越大，但不让合理的两段拼接被过度降权。
-    confidence *= 0.97 ** max(0, len(chain) - 1)
-    line_types = {fragment.line.line_type for fragment in chain}
-    line_type = line_types.pop() if len(line_types) == 1 else "stitched"
-    return PerceivedLaneLine(
-        line_id="stitch[" + "+".join(ids) + "]",
-        points=points,
-        confidence=float(confidence),
-        line_type=line_type,
     )
 
 
 def _hermite_bridge(
     start: np.ndarray,
-    start_tangent: np.ndarray,
+    start_tangent: np.ndarray | None,
     end: np.ndarray,
-    end_tangent: np.ndarray,
+    end_tangent: np.ndarray | None,
     *,
     spacing: float,
 ) -> np.ndarray:
+    if start_tangent is None or end_tangent is None:
+        return np.empty((0, 2), dtype=np.float64)
     gap = float(np.linalg.norm(end - start))
     if gap <= max(1e-6, 0.25 * spacing):
         return np.empty((0, 2), dtype=np.float64)
