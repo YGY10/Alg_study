@@ -35,6 +35,9 @@ from sim2d.planning import (
     SpatiotemporalPlanner,
     SpatiotemporalPlannerConfig,
 )
+from sim2d.planning.spatiotemporal_planner.lane_fragment_stitching import (
+    install as install_lane_fragment_stitching,
+)
 
 install_road_layers()
 install_road_compare()
@@ -52,6 +55,9 @@ install_perception_viewer_interaction()
 
 # 最后安装场景编辑器，使其能够覆盖现有 reset 链并使用已完成的主窗口扩展。
 install_traffic_actor_editor()
+
+# PNC Map 在构造候选车道前，先把属于同一物理边界的前后感知片段拼成 chain。
+install_lane_fragment_stitching()
 
 # 性能调试必须在 MainWindow 实例化之前安装，才能覆盖每周期入口。
 install_performance_debug()
